@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -10,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Abdullah1738/juno-scan/internal/api"
 	"github.com/Abdullah1738/juno-scan/internal/config"
 	"github.com/Abdullah1738/juno-scan/internal/db/migrate"
 	"github.com/Abdullah1738/juno-scan/internal/scanner"
@@ -46,15 +46,14 @@ func main() {
 		}
 	}()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = fmt.Fprintln(w, "ok")
-	})
+	apiServer, err := api.New(db)
+	if err != nil {
+		log.Fatalf("api init: %v", err)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           mux,
+		Handler:           apiServer.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
