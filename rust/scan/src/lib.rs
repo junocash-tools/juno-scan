@@ -65,6 +65,7 @@ struct ActionOut {
 struct NoteOut {
     wallet_id: String,
     action_index: u32,
+    diversifier_index: u32,
     recipient_address: String,
     value_zat: String,
     note_nullifier: String,
@@ -144,6 +145,7 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
     let mut fvks = Vec::with_capacity(req.wallets.len());
     let mut ivks = Vec::with_capacity(req.wallets.len() * 2);
     let mut ivk_wallet_index = Vec::with_capacity(req.wallets.len() * 2);
+    let mut ivk_full = Vec::with_capacity(req.wallets.len() * 2);
 
     for w in &req.wallets {
         if w.wallet_id.trim().is_empty() {
@@ -171,13 +173,17 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
         wallet_ids.push(w.wallet_id.trim().to_string());
         fvks.push(fvk);
 
-        let pivk_external = fvks[widx].to_ivk(Scope::External).prepare();
-        let pivk_internal = fvks[widx].to_ivk(Scope::Internal).prepare();
+        let ivk_external = fvks[widx].to_ivk(Scope::External);
+        let ivk_internal = fvks[widx].to_ivk(Scope::Internal);
+        let pivk_external = ivk_external.prepare();
+        let pivk_internal = ivk_internal.prepare();
 
         ivks.push(pivk_external);
         ivk_wallet_index.push(widx);
+        ivk_full.push(ivk_external);
         ivks.push(pivk_internal);
         ivk_wallet_index.push(widx);
+        ivk_full.push(ivk_internal);
     }
 
     let mut actions_out = Vec::new();
@@ -221,6 +227,12 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
             .ok_or(ScanError::Internal)?
             .clone();
 
+        let di = ivk_full
+            .get(ivk_index)
+            .and_then(|ivk| ivk.diversifier_index(&recipient))
+            .and_then(|di| u32::try_from(di).ok())
+            .unwrap_or(0);
+
         let addr_bytes = recipient.to_raw_address_bytes();
         let recipient_address = zip316::encode_unified_container(&ua_hrp, TYPECODE_ORCHARD, &addr_bytes)
             .map_err(|_| ScanError::UAHrpInvalid)?;
@@ -230,6 +242,7 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
         notes_out.push(NoteOut {
             wallet_id,
             action_index: action_index as u32,
+            diversifier_index: di,
             recipient_address,
             value_zat: note.value().inner().to_string(),
             note_nullifier: hex::encode(nf),

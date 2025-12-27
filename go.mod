@@ -2,7 +2,10 @@ module github.com/Abdullah1738/juno-scan
 
 go 1.22
 
-require github.com/jackc/pgx/v5 v5.7.2
+require (
+	github.com/Abdullah1738/juno-sdk-go v0.0.0-20251227230936-cd9c5987addf
+	github.com/jackc/pgx/v5 v5.7.2
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect

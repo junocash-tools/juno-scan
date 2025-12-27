@@ -12,6 +12,8 @@ import (
 
 	"github.com/Abdullah1738/juno-scan/internal/config"
 	"github.com/Abdullah1738/juno-scan/internal/db/migrate"
+	"github.com/Abdullah1738/juno-scan/internal/scanner"
+	sdkjunocashd "github.com/Abdullah1738/juno-sdk-go/junocashd"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -30,6 +32,19 @@ func main() {
 	if err := migrate.Apply(ctx, db); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
+
+	rpc := sdkjunocashd.New(cfg.RPCURL, cfg.RPCUser, cfg.RPCPassword)
+	sc, err := scanner.New(db, rpc, cfg.UAHRP, cfg.PollInterval)
+	if err != nil {
+		log.Fatalf("scanner init: %v", err)
+	}
+
+	go func() {
+		if err := sc.Run(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("scanner stopped: %v", err)
+			cancel()
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {

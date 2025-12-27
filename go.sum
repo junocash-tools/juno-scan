@@ -1,3 +1,5 @@
+github.com/Abdullah1738/juno-sdk-go v0.0.0-20251227230936-cd9c5987addf h1:A+6P02famdCAzgkgPIKNdAXY3zG0H9mcZ2zd2yT+Apw=
+github.com/Abdullah1738/juno-sdk-go v0.0.0-20251227230936-cd9c5987addf/go.mod h1:v8960BvanFwHONGFy7mqoY35NsR5jLQYeC3iWUItRgY=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

@@ -26,6 +26,7 @@ type Action struct {
 type Note struct {
 	WalletID         string
 	ActionIndex      uint32
+	DiversifierIndex uint32
 	RecipientAddress string
 	ValueZat         uint64
 	NoteNullifier    string
@@ -112,6 +113,7 @@ func ScanTx(ctx context.Context, uaHRP string, wallets []Wallet, txHex string) (
 			out.Notes = append(out.Notes, Note{
 				WalletID:         n.WalletID,
 				ActionIndex:      n.ActionIndex,
+				DiversifierIndex: n.DiversifierIndex,
 				RecipientAddress: n.RecipientAddress,
 				ValueZat:         v,
 				NoteNullifier:    n.NoteNullifier,
@@ -157,6 +159,7 @@ type actionOut struct {
 type noteOut struct {
 	WalletID         string `json:"wallet_id"`
 	ActionIndex      uint32 `json:"action_index"`
+	DiversifierIndex uint32 `json:"diversifier_index"`
 	RecipientAddress string `json:"recipient_address"`
 	ValueZat         string `json:"value_zat"`
 	NoteNullifier    string `json:"note_nullifier"`
