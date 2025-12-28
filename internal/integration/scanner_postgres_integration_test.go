@@ -77,6 +77,8 @@ func TestScanner_DepositDetected_Postgres(t *testing.T) {
 		t.Fatalf("confirmed txid mismatch")
 	}
 
+	mustWaitOrchardBalanceForViewingKey(t, ctx, jd, ufvk, 2)
+
 	// Spend.
 	toAddr := mustCreateUnifiedAddress(t, ctx, jd)
 	opid2 := mustSendMany(t, ctx, jd, addr, toAddr, "0.01")

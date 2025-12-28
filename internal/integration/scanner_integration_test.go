@@ -99,6 +99,8 @@ func TestScanner_DepositDetected(t *testing.T) {
 		t.Fatalf("invalid confirmed_height=%d", confirmedPayload.ConfirmedHeight)
 	}
 
+	mustWaitOrchardBalanceForViewingKey(t, ctx, jd, ufvk, 2)
+
 	// Spend the detected note.
 	toAddr := mustCreateUnifiedAddress(t, ctx, jd)
 	opid2 := mustSendMany(t, ctx, jd, addr, toAddr, "0.01")
