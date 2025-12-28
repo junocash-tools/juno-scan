@@ -7,3 +7,7 @@ import "errors"
 func ScanTxJSON(string) (string, error) {
 	return "", errors.New("scan: cgo disabled")
 }
+
+func OrchardWitnessJSON(string) (string, error) {
+	return "", errors.New("scan: cgo disabled")
+}

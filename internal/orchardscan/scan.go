@@ -48,6 +48,7 @@ const (
 	ErrUFVKOrchardFVKLenInvalid   ErrorCode = "ufvk_orchard_fvk_len_invalid"
 	ErrUFVKOrchardFVKBytesInvalid ErrorCode = "ufvk_orchard_fvk_bytes_invalid"
 	ErrUAHrpInvalid               ErrorCode = "ua_hrp_invalid"
+	ErrInvalidRequest             ErrorCode = "invalid_request"
 	ErrInternal                   ErrorCode = "internal"
 	ErrPanic                      ErrorCode = "panic"
 )

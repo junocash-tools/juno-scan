@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Abdullah1738/juno-scan/internal/orchardscan"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -27,6 +28,7 @@ func New(db *pgxpool.Pool) (*Server, error) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", s.handleHealth)
+	mux.HandleFunc("/v1/orchard/witness", s.handleOrchardWitness)
 	mux.HandleFunc("/v1/wallets", s.handleWallets)
 	mux.HandleFunc("/v1/wallets/", s.handleWalletSubroutes)
 	return mux
@@ -295,6 +297,104 @@ WHERE wallet_id = $1
 	}
 
 	writeJSON(w, map[string]any{"notes": notes})
+}
+
+type witnessRequest struct {
+	AnchorHeight *int64   `json:"anchor_height,omitempty"`
+	Positions    []uint32 `json:"positions"`
+}
+
+func (s *Server) handleOrchardWitness(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req witnessRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if len(req.Positions) == 0 || len(req.Positions) > 1000 {
+		http.Error(w, "positions must be between 1 and 1000", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	anchorHeight := int64(0)
+	if req.AnchorHeight != nil {
+		anchorHeight = *req.AnchorHeight
+	} else {
+		if err := s.db.QueryRow(ctx, `SELECT height FROM blocks ORDER BY height DESC LIMIT 1`).Scan(&anchorHeight); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				http.Error(w, "no scanned blocks", http.StatusBadRequest)
+				return
+			}
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+	}
+	if anchorHeight < 0 {
+		http.Error(w, "anchor_height must be >= 0", http.StatusBadRequest)
+		return
+	}
+
+	rows, err := s.db.Query(ctx, `
+SELECT position, cmx
+FROM orchard_commitments
+WHERE height <= $1
+ORDER BY position
+`, anchorHeight)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var expectedPos int64 = 0
+	cmxHex := make([]string, 0, 1024)
+	for rows.Next() {
+		var pos int64
+		var cmx string
+		if err := rows.Scan(&pos, &cmx); err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		if pos != expectedPos {
+			http.Error(w, "invalid commitment positions", http.StatusInternalServerError)
+			return
+		}
+		expectedPos++
+		cmxHex = append(cmxHex, cmx)
+	}
+	if err := rows.Err(); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	if len(cmxHex) == 0 {
+		http.Error(w, "no commitments", http.StatusBadRequest)
+		return
+	}
+
+	res, err := orchardscan.OrchardWitness(ctx, cmxHex, req.Positions)
+	if err != nil {
+		var oe *orchardscan.Error
+		if errors.As(err, &oe) && oe.Code == orchardscan.ErrInvalidRequest {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "witness error", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, map[string]any{
+		"status":        "ok",
+		"anchor_height": anchorHeight,
+		"root":          res.Root,
+		"paths":         res.Paths,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
