@@ -10,6 +10,20 @@ Designed for exchange integrations where recipient data/value are encrypted on-c
 
 Status: work in progress.
 
+## Development
+
+Prereqs:
+
+- Go 1.24+
+- Rust (for `rust/scan`)
+- Docker (for `make test-docker`)
+
+Commands:
+
+- Unit tests: `make test-unit`
+- Full local suite (Rust + unit + integration + e2e): `make test`
+- Docker suite (regtest + DBs + brokers): `make test-docker`
+
 ## Events
 
 Events are available via `GET /v1/wallets/{wallet_id}/events`.
