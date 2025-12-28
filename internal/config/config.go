@@ -7,8 +7,10 @@ import (
 )
 
 type Config struct {
-	DBURL    string
+	DBDriver string
+	DBDSN    string
 	DBSchema string
+	DBPath   string
 
 	RPCURL      string
 	RPCUser     string
@@ -22,8 +24,15 @@ type Config struct {
 func FromFlags() Config {
 	var cfg Config
 
-	flag.StringVar(&cfg.DBURL, "db-url", getenv("JUNO_SCAN_DB_URL", "postgres://localhost:5432/junoscan?sslmode=disable"), "Postgres connection string")
+	flag.StringVar(&cfg.DBDriver, "db-driver", getenv("JUNO_SCAN_DB_DRIVER", "postgres"), "Database driver (postgres, mysql, rocksdb)")
+
+	var dsn string
+	var legacyURL string
+	flag.StringVar(&dsn, "db-dsn", getenv("JUNO_SCAN_DB_DSN", ""), "Database DSN for postgres/mysql")
+	flag.StringVar(&legacyURL, "db-url", getenv("JUNO_SCAN_DB_URL", "postgres://localhost:5432/junoscan?sslmode=disable"), "Deprecated alias for -db-dsn")
+
 	flag.StringVar(&cfg.DBSchema, "db-schema", getenv("JUNO_SCAN_DB_SCHEMA", ""), "Postgres schema for juno-scan tables (optional)")
+	flag.StringVar(&cfg.DBPath, "db-path", getenv("JUNO_SCAN_DB_PATH", ""), "RocksDB (Pebble) path (required when db-driver=rocksdb)")
 
 	flag.StringVar(&cfg.RPCURL, "rpc-url", getenv("JUNO_SCAN_RPC_URL", "http://127.0.0.1:8232"), "junocashd RPC URL")
 	flag.StringVar(&cfg.RPCUser, "rpc-user", getenv("JUNO_SCAN_RPC_USER", ""), "junocashd RPC username")
@@ -34,6 +43,11 @@ func FromFlags() Config {
 	flag.DurationVar(&cfg.PollInterval, "poll-interval", getenvDuration("JUNO_SCAN_POLL_INTERVAL", 2*time.Second), "Poll interval for new blocks (when ZMQ is not used)")
 
 	flag.Parse()
+
+	if dsn == "" {
+		dsn = legacyURL
+	}
+	cfg.DBDSN = dsn
 	return cfg
 }
 

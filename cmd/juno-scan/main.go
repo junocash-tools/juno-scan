@@ -12,8 +12,8 @@ import (
 	"github.com/Abdullah1738/juno-scan/internal/api"
 	"github.com/Abdullah1738/juno-scan/internal/config"
 	"github.com/Abdullah1738/juno-scan/internal/scanner"
+	"github.com/Abdullah1738/juno-scan/internal/storage"
 	"github.com/Abdullah1738/juno-scan/internal/store"
-	"github.com/Abdullah1738/juno-scan/internal/store/postgres"
 	sdkjunocashd "github.com/Abdullah1738/juno-sdk-go/junocashd"
 )
 
@@ -68,7 +68,12 @@ func main() {
 }
 
 func mustOpenStore(ctx context.Context, cfg config.Config) store.Store {
-	s, err := postgres.Open(ctx, cfg.DBURL, cfg.DBSchema)
+	s, err := storage.Open(ctx, storage.Config{
+		Driver: cfg.DBDriver,
+		DSN:    cfg.DBDSN,
+		Schema: cfg.DBSchema,
+		Path:   cfg.DBPath,
+	})
 	if err != nil {
 		log.Fatalf("db connect: %v", err)
 	}
