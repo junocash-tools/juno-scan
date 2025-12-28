@@ -7,7 +7,8 @@ import (
 )
 
 type Config struct {
-	DBURL string
+	DBURL    string
+	DBSchema string
 
 	RPCURL      string
 	RPCUser     string
@@ -22,6 +23,7 @@ func FromFlags() Config {
 	var cfg Config
 
 	flag.StringVar(&cfg.DBURL, "db-url", getenv("JUNO_SCAN_DB_URL", "postgres://localhost:5432/junoscan?sslmode=disable"), "Postgres connection string")
+	flag.StringVar(&cfg.DBSchema, "db-schema", getenv("JUNO_SCAN_DB_SCHEMA", ""), "Postgres schema for juno-scan tables (optional)")
 
 	flag.StringVar(&cfg.RPCURL, "rpc-url", getenv("JUNO_SCAN_RPC_URL", "http://127.0.0.1:8232"), "junocashd RPC URL")
 	flag.StringVar(&cfg.RPCUser, "rpc-user", getenv("JUNO_SCAN_RPC_USER", ""), "junocashd RPC username")
