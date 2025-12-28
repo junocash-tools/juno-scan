@@ -60,7 +60,16 @@ func TestScanner_DepositDetected_Postgres(t *testing.T) {
 		t.Fatalf("scanner.New: %v", err)
 	}
 
-	go func() { _ = sc.Run(ctx) }()
+	runCtx, runCancel := context.WithCancel(ctx)
+	scErrCh := make(chan error, 1)
+	go func() { scErrCh <- sc.Run(runCtx) }()
+	defer func() {
+		runCancel()
+		select {
+		case <-scErrCh:
+		case <-time.After(5 * time.Second):
+		}
+	}()
 
 	mustRun(t, jd.CLICommand(ctx, "generate", "101"))
 	fromAddr := mustCoinbaseAddress(t, ctx, jd)
