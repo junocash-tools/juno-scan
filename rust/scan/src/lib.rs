@@ -92,6 +92,20 @@ enum ScanTxResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ValidateUFVKRequest {
+    ufvk: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ValidateUFVKResponse {
+    Ok,
+    Err {
+        error: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
 struct WitnessRequest {
     cmx_hex: Vec<String>,
     positions: Vec<u32>,
@@ -145,6 +159,20 @@ pub extern "C" fn juno_scan_scan_tx_json(req_json: *const c_char) -> *mut c_char
 }
 
 #[no_mangle]
+pub extern "C" fn juno_scan_validate_ufvk_json(req_json: *const c_char) -> *mut c_char {
+    let res = std::panic::catch_unwind(|| validate_ufvk_json_inner(req_json));
+    match res {
+        Ok(Ok(v)) => to_c_string(v),
+        Ok(Err(e)) => to_c_string(ValidateUFVKResponse::Err {
+            error: e.to_string(),
+        }),
+        Err(_) => to_c_string(ValidateUFVKResponse::Err {
+            error: ScanError::Panic.to_string(),
+        }),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn juno_scan_orchard_witness_json(req_json: *const c_char) -> *mut c_char {
     let res = std::panic::catch_unwind(|| orchard_witness_json_inner(req_json));
     match res {
@@ -156,6 +184,52 @@ pub extern "C" fn juno_scan_orchard_witness_json(req_json: *const c_char) -> *mu
             error: ScanError::Panic.to_string(),
         }),
     }
+}
+
+fn parse_orchard_fvk_from_ufvk(ufvk: &str) -> Result<FullViewingKey, ScanError> {
+    let ufvk = ufvk.trim();
+    if ufvk.is_empty() {
+        return Err(ScanError::UFVKInvalid);
+    }
+
+    let (ufvk_hrp, _) = ufvk.split_once('1').ok_or(ScanError::UFVKInvalid)?;
+    if !ufvk_hrp.starts_with(HRP_JUNO_UFVK_PREFIX) {
+        return Err(ScanError::UFVKInvalid);
+    }
+
+    let items =
+        zip316::decode_tlv_container(ufvk_hrp, ufvk).map_err(|_| ScanError::UFVKInvalid)?;
+    let orchard_item = items
+        .into_iter()
+        .find(|(typecode, _)| *typecode == TYPECODE_ORCHARD)
+        .ok_or(ScanError::UFVKMissingOrchardReceiver)?;
+
+    if orchard_item.1.len() != ORCHARD_FVK_LEN {
+        return Err(ScanError::UFVKOrchardFVKLenInvalid);
+    }
+
+    let mut fvk_bytes = [0u8; ORCHARD_FVK_LEN];
+    fvk_bytes.copy_from_slice(&orchard_item.1);
+
+    let fvk =
+        FullViewingKey::from_bytes(&fvk_bytes).ok_or(ScanError::UFVKOrchardFVKBytesInvalid)?;
+    fvk_bytes.zeroize();
+
+    Ok(fvk)
+}
+
+fn validate_ufvk_json_inner(req_json: *const c_char) -> Result<ValidateUFVKResponse, ScanError> {
+    if req_json.is_null() {
+        return Err(ScanError::ReqJSONInvalid);
+    }
+
+    let s = unsafe { std::ffi::CStr::from_ptr(req_json) }
+        .to_string_lossy()
+        .to_string();
+    let req: ValidateUFVKRequest = serde_json::from_str(&s).map_err(|_| ScanError::ReqJSONInvalid)?;
+
+    let _ = parse_orchard_fvk_from_ufvk(&req.ufvk)?;
+    Ok(ValidateUFVKResponse::Ok)
 }
 
 fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanError> {
@@ -199,29 +273,7 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
             return Err(ScanError::UFVKInvalid);
         }
 
-        let ufvk = w.ufvk.trim();
-        let (ufvk_hrp, _) = ufvk.split_once('1').ok_or(ScanError::UFVKInvalid)?;
-        if !ufvk_hrp.starts_with(HRP_JUNO_UFVK_PREFIX) {
-            return Err(ScanError::UFVKInvalid);
-        }
-
-        let items =
-            zip316::decode_tlv_container(ufvk_hrp, ufvk).map_err(|_| ScanError::UFVKInvalid)?;
-        let orchard_item = items
-            .into_iter()
-            .find(|(typecode, _)| *typecode == TYPECODE_ORCHARD)
-            .ok_or(ScanError::UFVKMissingOrchardReceiver)?;
-
-        if orchard_item.1.len() != ORCHARD_FVK_LEN {
-            return Err(ScanError::UFVKOrchardFVKLenInvalid);
-        }
-
-        let mut fvk_bytes = [0u8; ORCHARD_FVK_LEN];
-        fvk_bytes.copy_from_slice(&orchard_item.1);
-
-        let fvk =
-            FullViewingKey::from_bytes(&fvk_bytes).ok_or(ScanError::UFVKOrchardFVKBytesInvalid)?;
-        fvk_bytes.zeroize();
+        let fvk = parse_orchard_fvk_from_ufvk(&w.ufvk)?;
 
         let widx = wallet_ids.len();
         wallet_ids.push(w.wallet_id.trim().to_string());

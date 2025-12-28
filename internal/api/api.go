@@ -112,6 +112,25 @@ func (s *Server) handleUpsertWallet(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	if err := orchardscan.ValidateUFVK(ctx, req.UFVK); err != nil {
+		var oe *orchardscan.Error
+		if errors.As(err, &oe) {
+			switch oe.Code {
+			case orchardscan.ErrUFVKInvalid,
+				orchardscan.ErrUFVKMissingOrchardReceiver,
+				orchardscan.ErrUFVKOrchardFVKLenInvalid,
+				orchardscan.ErrUFVKOrchardFVKBytesInvalid:
+				http.Error(w, string(oe.Code), http.StatusBadRequest)
+				return
+			default:
+				http.Error(w, "ufvk validation error", http.StatusInternalServerError)
+				return
+			}
+		}
+		http.Error(w, "ufvk validation error", http.StatusInternalServerError)
+		return
+	}
+
 	if err := s.st.UpsertWallet(ctx, req.WalletID, req.UFVK); err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
