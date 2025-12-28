@@ -48,8 +48,11 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			continue
 		}
 
-		if _, err := db.ExecContext(ctx, m.sql); err != nil {
-			return fmt.Errorf("mysql: apply %s: %w", m.name, err)
+		stmts := splitSQLStatements(m.sql)
+		for _, stmt := range stmts {
+			if _, err := db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("mysql: apply %s: %w", m.name, err)
+			}
 		}
 		if _, err := db.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (?)`, m.version); err != nil {
 			return fmt.Errorf("mysql: record %s: %w", m.name, err)
@@ -57,6 +60,89 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 	}
 
 	return nil
+}
+
+func splitSQLStatements(sql string) []string {
+	var out []string
+
+	start := 0
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	inLineComment := false
+	inBlockComment := false
+
+	b := []byte(sql)
+	for i := 0; i < len(b); i++ {
+		ch := b[i]
+		next := byte(0)
+		if i+1 < len(b) {
+			next = b[i+1]
+		}
+
+		if inLineComment {
+			if ch == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			if ch == '*' && next == '/' {
+				inBlockComment = false
+				i++
+			}
+			continue
+		}
+
+		if !inSingle && !inDouble && !inBacktick {
+			if ch == '-' && next == '-' {
+				inLineComment = true
+				i++
+				continue
+			}
+			if ch == '#' {
+				inLineComment = true
+				continue
+			}
+			if ch == '/' && next == '*' {
+				inBlockComment = true
+				i++
+				continue
+			}
+		}
+
+		if ch == '\'' && !inDouble && !inBacktick {
+			if inSingle && next == '\'' {
+				i++
+				continue
+			}
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle && !inBacktick {
+			inDouble = !inDouble
+			continue
+		}
+		if ch == '`' && !inSingle && !inDouble {
+			inBacktick = !inBacktick
+			continue
+		}
+
+		if ch == ';' && !inSingle && !inDouble && !inBacktick {
+			stmt := strings.TrimSpace(string(b[start:i]))
+			if stmt != "" {
+				out = append(out, stmt)
+			}
+			start = i + 1
+			continue
+		}
+	}
+
+	stmt := strings.TrimSpace(string(b[start:]))
+	if stmt != "" {
+		out = append(out, stmt)
+	}
+	return out
 }
 
 func loadMigrations() ([]migration, error) {
