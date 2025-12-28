@@ -606,6 +606,7 @@ dependencies = [
  "bech32",
  "f4jumble",
  "hex",
+ "incrementalmerkletree",
  "orchard",
  "serde",
  "serde_json",

@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 char *juno_scan_scan_tx_json(const char *req_json);
+char *juno_scan_orchard_witness_json(const char *req_json);
 void juno_scan_string_free(char *s);
 
 #ifdef __cplusplus
@@ -13,4 +14,3 @@ void juno_scan_string_free(char *s);
 #endif
 
 #endif // JUNO_SCAN_H
-

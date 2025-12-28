@@ -28,3 +28,16 @@ func ScanTxJSON(req string) (string, error) {
 
 	return C.GoString(out), nil
 }
+
+func OrchardWitnessJSON(req string) (string, error) {
+	cReq := C.CString(req)
+	defer C.free(unsafe.Pointer(cReq))
+
+	out := C.juno_scan_orchard_witness_json(cReq)
+	if out == nil {
+		return "", errNull
+	}
+	defer C.juno_scan_string_free(out)
+
+	return C.GoString(out), nil
+}
