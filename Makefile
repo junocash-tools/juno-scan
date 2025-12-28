@@ -21,8 +21,8 @@ rust-build:
 rust-test:
 	cargo test --manifest-path $(RUST_MANIFEST)
 
-test-unit: rust-test
-	go test $(TESTFLAGS) ./internal/...
+test-unit:
+	CGO_ENABLED=0 go test $(TESTFLAGS) ./...
 
 test-integration: rust-build
 	go test $(TESTFLAGS) -tags=integration ./...
@@ -30,7 +30,7 @@ test-integration: rust-build
 test-e2e: build
 	go test $(TESTFLAGS) -tags=e2e ./...
 
-test: test-unit test-integration test-e2e
+test: rust-test test-unit test-integration test-e2e
 
 fmt:
 	gofmt -w .
@@ -41,4 +41,3 @@ tidy:
 clean:
 	rm -rf $(BIN_DIR)
 	rm -rf rust/scan/target
-
