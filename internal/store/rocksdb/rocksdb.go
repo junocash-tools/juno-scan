@@ -77,7 +77,7 @@ func (s *Store) WithTx(ctx context.Context, fn func(store.Tx) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	batch := s.db.NewBatch()
+	batch := s.db.NewIndexedBatch()
 	defer batch.Close()
 
 	tx := &rocksTx{
@@ -125,7 +125,7 @@ func (s *Store) UpsertWallet(ctx context.Context, walletID, ufvk string) error {
 		return fmt.Errorf("rocksdb: encode wallet: %w", err)
 	}
 
-	batch := s.db.NewBatch()
+	batch := s.db.NewIndexedBatch()
 	defer batch.Close()
 	if err := batch.Set(key, b, pebble.NoSync); err != nil {
 		return fmt.Errorf("rocksdb: upsert wallet: %w", err)
@@ -273,8 +273,8 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 		return nil
 	}
 
-	batch := s.db.NewBatch()
-	defer batch.Close()
+		batch := s.db.NewIndexedBatch()
+		defer batch.Close()
 
 	// Delete blocks above height.
 	if err := deleteRangeByFixed20(batch, blockPrefix, uint64(height+1)); err != nil {
@@ -328,6 +328,12 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 	if err := unspendNotesAboveHeight(batch, s.db, uint64(height)); err != nil {
 		return err
 	}
+
+	// Unconfirm notes confirmed above height (via confirmed height index).
+	if err := unconfirmNotesAboveHeight(batch, s.db, uint64(height)); err != nil {
+		return err
+	}
+	_ = batch.Delete(keyMeta("confirmed_upto_note_height"), pebble.NoSync)
 
 	// Delete commitments above height and fix next position.
 	if err := rollbackCommitments(batch, s.db, uint64(height)); err != nil {
@@ -445,11 +451,13 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 			ActionIndex:      rec.ActionIndex,
 			Height:           rec.Height,
 			Position:         posPtr,
+			DiversifierIndex: rec.DiversifierIndex,
 			RecipientAddress: rec.RecipientAddress,
 			ValueZat:         rec.ValueZat,
 			NoteNullifier:    rec.NoteNullifier,
 			SpentHeight:      rec.SpentHeight,
 			SpentTxID:        rec.SpentTxID,
+			ConfirmedHeight:  rec.ConfirmedHeight,
 			CreatedAt:        time.Unix(rec.CreatedAtUnix, 0).UTC(),
 		})
 	}
@@ -695,6 +703,120 @@ func (t *rocksTx) MarkNotesSpent(ctx context.Context, height int64, txid string,
 	return nil
 }
 
+func (t *rocksTx) ConfirmNotes(ctx context.Context, confirmationHeight int64, maxNoteHeight int64) ([]store.Note, error) {
+	_ = ctx
+	if confirmationHeight < 0 {
+		return nil, errors.New("rocksdb: negative confirmation height")
+	}
+	if maxNoteHeight < 0 {
+		return nil, nil
+	}
+
+	var startHeight uint64 = 0
+	v, closer, err := t.batch.Get(keyMeta("confirmed_upto_note_height"))
+	if err == nil {
+		if len(v) != 8 {
+			_ = closer.Close()
+			return nil, errors.New("rocksdb: confirmed_upto_note_height corrupt")
+		}
+		startHeight = binary.BigEndian.Uint64(v) + 1
+		_ = closer.Close()
+	} else if !errors.Is(err, pebble.ErrNotFound) {
+		return nil, fmt.Errorf("rocksdb: get confirmed_upto_note_height: %w", err)
+	}
+
+	if startHeight > uint64(maxNoteHeight) {
+		startHeight = 0
+	}
+
+	lower := make([]byte, 0, len(noteHeightPrefix)+20)
+	lower = append(lower, noteHeightPrefix...)
+	lower = appendUint64Fixed20(lower, startHeight)
+
+	iter, err := t.batch.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: prefixUpperBound(noteHeightPrefix),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("rocksdb: iter: %w", err)
+	}
+	defer iter.Close()
+
+	var out []store.Note
+	for iter.First(); iter.Valid(); iter.Next() {
+		walletID, height, txid, actionIndex, err := parseNoteHeightIndexKey(iter.Key())
+		if err != nil {
+			return nil, err
+		}
+		if height > maxNoteHeight {
+			break
+		}
+
+		noteKey := keyNote(walletID, txid, actionIndex)
+		v, closer, err := t.batch.Get(noteKey)
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("rocksdb: get note: %w", err)
+		}
+		var rec noteRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			_ = closer.Close()
+			return nil, fmt.Errorf("rocksdb: decode note: %w", err)
+		}
+		_ = closer.Close()
+
+		if rec.ConfirmedHeight != nil {
+			continue
+		}
+		rec.ConfirmedHeight = &confirmationHeight
+
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return nil, fmt.Errorf("rocksdb: encode note: %w", err)
+		}
+		if err := t.batch.Set(noteKey, b, pebble.NoSync); err != nil {
+			return nil, fmt.Errorf("rocksdb: confirm note: %w", err)
+		}
+		if rec.NoteNullifier != "" {
+			if err := t.batch.Set(keyConfirmedHeightIndex(uint64(confirmationHeight), rec.NoteNullifier), nil, pebble.NoSync); err != nil {
+				return nil, fmt.Errorf("rocksdb: confirm note index: %w", err)
+			}
+		}
+
+		var posPtr *int64
+		if rec.Position != nil {
+			p := int64(*rec.Position)
+			posPtr = &p
+		}
+		out = append(out, store.Note{
+			WalletID:         walletID,
+			TxID:             rec.TxID,
+			ActionIndex:      rec.ActionIndex,
+			Height:           rec.Height,
+			Position:         posPtr,
+			DiversifierIndex: rec.DiversifierIndex,
+			RecipientAddress: rec.RecipientAddress,
+			ValueZat:         rec.ValueZat,
+			NoteNullifier:    rec.NoteNullifier,
+			SpentHeight:      rec.SpentHeight,
+			SpentTxID:        rec.SpentTxID,
+			ConfirmedHeight:  &confirmationHeight,
+			CreatedAt:        time.Unix(rec.CreatedAtUnix, 0).UTC(),
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("rocksdb: confirm notes iter: %w", err)
+	}
+
+	if err := t.batch.Set(keyMeta("confirmed_upto_note_height"), uint64To8(uint64(maxNoteHeight)), pebble.NoSync); err != nil {
+		return nil, fmt.Errorf("rocksdb: set confirmed_upto_note_height: %w", err)
+	}
+
+	return out, nil
+}
+
 func (t *rocksTx) InsertNote(ctx context.Context, n store.Note) error {
 	_ = ctx
 	if n.Height < 0 {
@@ -714,6 +836,7 @@ func (t *rocksTx) InsertNote(ctx context.Context, n store.Note) error {
 		TxID:             n.TxID,
 		ActionIndex:      n.ActionIndex,
 		Height:           n.Height,
+		DiversifierIndex: n.DiversifierIndex,
 		RecipientAddress: n.RecipientAddress,
 		ValueZat:         n.ValueZat,
 		NoteNullifier:    n.NoteNullifier,
@@ -826,11 +949,13 @@ type noteRecord struct {
 	ActionIndex      int32   `json:"action_index"`
 	Height           int64   `json:"height"`
 	Position         *uint64 `json:"position,omitempty"`
+	DiversifierIndex uint32  `json:"diversifier_index,omitempty"`
 	RecipientAddress string  `json:"recipient_address"`
 	ValueZat         int64   `json:"value_zat"`
 	NoteNullifier    string  `json:"note_nullifier"`
 	SpentHeight      *int64  `json:"spent_height,omitempty"`
 	SpentTxID        *string `json:"spent_txid,omitempty"`
+	ConfirmedHeight  *int64  `json:"confirmed_height,omitempty"`
 	CreatedAtUnix    int64   `json:"created_at_unix"`
 }
 
@@ -853,6 +978,7 @@ var (
 	walletNotePrefix          = []byte("nwh/")
 	nullifierPrefix           = []byte("nn/")
 	noteSpentHeightPrefix     = []byte("nsh/")
+	noteConfirmedHeightPrefix = []byte("nch/")
 	eventPrefix               = []byte("e/")
 	eventHeightPrefix         = []byte("eh/")
 	eventSeqPrefix            = []byte("es/")
@@ -982,6 +1108,15 @@ func keyWalletNoteIndex(height uint64, walletID, txid string, actionIndex int32)
 func keySpentHeightIndex(height uint64, nullifier string) []byte {
 	b := make([]byte, 0, len(noteSpentHeightPrefix)+20+1+len(nullifier))
 	b = append(b, noteSpentHeightPrefix...)
+	b = appendUint64Fixed20(b, height)
+	b = append(b, '/')
+	b = append(b, nullifier...)
+	return b
+}
+
+func keyConfirmedHeightIndex(height uint64, nullifier string) []byte {
+	b := make([]byte, 0, len(noteConfirmedHeightPrefix)+20+1+len(nullifier))
+	b = append(b, noteConfirmedHeightPrefix...)
 	b = appendUint64Fixed20(b, height)
 	b = append(b, '/')
 	b = append(b, nullifier...)
@@ -1153,7 +1288,7 @@ func unspendNotesAboveHeight(batch *pebble.Batch, db *pebble.DB, height uint64) 
 		}
 		nullifier := string(parts[2])
 
-		locBytes, closer, err := db.Get(keyNullifier(nullifier))
+		locBytes, closer, err := batch.Get(keyNullifier(nullifier))
 		if err != nil {
 			if errors.Is(err, pebble.ErrNotFound) {
 				_ = batch.Delete(k, pebble.NoSync)
@@ -1164,7 +1299,7 @@ func unspendNotesAboveHeight(batch *pebble.Batch, db *pebble.DB, height uint64) 
 		noteKey := append([]byte{}, locBytes...)
 		_ = closer.Close()
 
-		v, closer, err := db.Get(noteKey)
+		v, closer, err := batch.Get(noteKey)
 		if err != nil {
 			_ = batch.Delete(k, pebble.NoSync)
 			continue
@@ -1192,6 +1327,71 @@ func unspendNotesAboveHeight(batch *pebble.Batch, db *pebble.DB, height uint64) 
 	}
 	if err := iter.Error(); err != nil {
 		return fmt.Errorf("rocksdb: unspend iter: %w", err)
+	}
+	return nil
+}
+
+func unconfirmNotesAboveHeight(batch *pebble.Batch, db *pebble.DB, height uint64) error {
+	lower := make([]byte, 0, len(noteConfirmedHeightPrefix)+20)
+	lower = append(lower, noteConfirmedHeightPrefix...)
+	lower = appendUint64Fixed20(lower, height+1)
+
+	iter, err := db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: prefixUpperBound(noteConfirmedHeightPrefix),
+	})
+	if err != nil {
+		return fmt.Errorf("rocksdb: iter: %w", err)
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		k := append([]byte{}, iter.Key()...)
+
+		parts := bytes.Split(k, []byte("/"))
+		if len(parts) != 3 {
+			continue
+		}
+		nullifier := string(parts[2])
+
+		locBytes, closer, err := batch.Get(keyNullifier(nullifier))
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				_ = batch.Delete(k, pebble.NoSync)
+				continue
+			}
+			return fmt.Errorf("rocksdb: unconfirm get nullifier: %w", err)
+		}
+		noteKey := append([]byte{}, locBytes...)
+		_ = closer.Close()
+
+		v, closer, err := batch.Get(noteKey)
+		if err != nil {
+			_ = batch.Delete(k, pebble.NoSync)
+			continue
+		}
+		var rec noteRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			_ = closer.Close()
+			return fmt.Errorf("rocksdb: unconfirm decode note: %w", err)
+		}
+		_ = closer.Close()
+
+		rec.ConfirmedHeight = nil
+
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return fmt.Errorf("rocksdb: unconfirm encode note: %w", err)
+		}
+		if err := batch.Set(noteKey, b, pebble.NoSync); err != nil {
+			return fmt.Errorf("rocksdb: unconfirm set note: %w", err)
+		}
+		if err := batch.Delete(k, pebble.NoSync); err != nil {
+			return fmt.Errorf("rocksdb: unconfirm delete index: %w", err)
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("rocksdb: unconfirm iter: %w", err)
 	}
 	return nil
 }

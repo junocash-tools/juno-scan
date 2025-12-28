@@ -3,6 +3,7 @@ package config
 import (
 	"flag"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -19,6 +20,7 @@ type Config struct {
 	ListenAddr   string
 	UAHRP        string
 	PollInterval time.Duration
+	Confirmations int64
 }
 
 func FromFlags() Config {
@@ -41,6 +43,7 @@ func FromFlags() Config {
 	flag.StringVar(&cfg.ListenAddr, "listen", getenv("JUNO_SCAN_LISTEN", "127.0.0.1:8080"), "HTTP listen address")
 	flag.StringVar(&cfg.UAHRP, "ua-hrp", getenv("JUNO_SCAN_UA_HRP", "j"), "Unified address HRP (e.g. j, jregtest)")
 	flag.DurationVar(&cfg.PollInterval, "poll-interval", getenvDuration("JUNO_SCAN_POLL_INTERVAL", 2*time.Second), "Poll interval for new blocks (when ZMQ is not used)")
+	flag.Int64Var(&cfg.Confirmations, "confirmations", getenvInt64("JUNO_SCAN_CONFIRMATIONS", 100), "Confirmations required for DepositConfirmed event")
 
 	flag.Parse()
 
@@ -62,6 +65,15 @@ func getenvDuration(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
+		}
+	}
+	return def
+}
+
+func getenvInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
 		}
 	}
 	return def

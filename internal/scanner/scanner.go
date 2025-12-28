@@ -11,6 +11,7 @@ import (
 	"github.com/Abdullah1738/juno-scan/internal/orchardscan"
 	"github.com/Abdullah1738/juno-scan/internal/store"
 	sdkjunocashd "github.com/Abdullah1738/juno-sdk-go/junocashd"
+	"github.com/Abdullah1738/juno-sdk-go/types"
 )
 
 type Scanner struct {
@@ -19,9 +20,10 @@ type Scanner struct {
 	uaHRP string
 
 	pollInterval time.Duration
+	confirmations int64
 }
 
-func New(st store.Store, rpc *sdkjunocashd.Client, uaHRP string, pollInterval time.Duration) (*Scanner, error) {
+func New(st store.Store, rpc *sdkjunocashd.Client, uaHRP string, pollInterval time.Duration, confirmations int64) (*Scanner, error) {
 	if st == nil {
 		return nil, errors.New("scanner: store is nil")
 	}
@@ -34,11 +36,15 @@ func New(st store.Store, rpc *sdkjunocashd.Client, uaHRP string, pollInterval ti
 	if pollInterval <= 0 {
 		pollInterval = 2 * time.Second
 	}
+	if confirmations <= 0 {
+		confirmations = 100
+	}
 	return &Scanner{
 		st:           st,
 		rpc:          rpc,
 		uaHRP:        uaHRP,
 		pollInterval: pollInterval,
+		confirmations: confirmations,
 	}, nil
 }
 
@@ -213,6 +219,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 					ActionIndex:      int32(n.ActionIndex),
 					Height:           blk.Height,
 					Position:         &posCopy,
+					DiversifierIndex: n.DiversifierIndex,
 					RecipientAddress: n.RecipientAddress,
 					ValueZat:         int64(n.ValueZat),
 					NoteNullifier:    n.NoteNullifier,
@@ -220,23 +227,30 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 					return err
 				}
 
-				payload := map[string]any{
-					"version":           "v1",
-					"wallet_id":         n.WalletID,
-					"diversifier_index": n.DiversifierIndex,
-					"recipient_address": n.RecipientAddress,
-					"txid":              t.TxID,
-					"height":            blk.Height,
-					"action_index":      n.ActionIndex,
-					"amount_zatoshis":   n.ValueZat,
-					"note_nullifier":    n.NoteNullifier,
+				payload := depositEventPayload{
+					DepositEvent: types.DepositEvent{
+						Version:          types.V1,
+						WalletID:         n.WalletID,
+						DiversifierIndex: n.DiversifierIndex,
+						TxID:             t.TxID,
+						Height:           blk.Height,
+						ActionIndex:      n.ActionIndex,
+						AmountZatoshis:   n.ValueZat,
+						Status: types.TxStatus{
+							State:         types.TxStateConfirmed,
+							Height:        blk.Height,
+							Confirmations: 1,
+						},
+					},
+					RecipientAddress: n.RecipientAddress,
+					NoteNullifier:    n.NoteNullifier,
 				}
 				payloadBytes, err := json.Marshal(payload)
 				if err != nil {
 					return fmt.Errorf("scanner: marshal event payload: %w", err)
 				}
 				if err := tx.InsertEvent(ctx, store.Event{
-					Kind:     "deposit",
+					Kind:     "DepositEvent",
 					WalletID: n.WalletID,
 					Height:   blk.Height,
 					Payload:  payloadBytes,
@@ -246,8 +260,78 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 			}
 		}
 
+		if err := s.confirmDepositConfirmations(ctx, tx, blk.Height); err != nil {
+			return err
+		}
+
 		return nil
 	})
+}
+
+func (s *Scanner) confirmDepositConfirmations(ctx context.Context, tx store.Tx, scanHeight int64) error {
+	maxNoteHeight := scanHeight - s.confirmations + 1
+	if maxNoteHeight < 0 {
+		return nil
+	}
+
+	notes, err := tx.ConfirmNotes(ctx, scanHeight, maxNoteHeight)
+	if err != nil {
+		return err
+	}
+
+	for _, n := range notes {
+		confirmations := scanHeight - n.Height + 1
+		if confirmations < 1 {
+			confirmations = 1
+			}
+			payload := depositConfirmedPayload{
+				depositEventPayload: depositEventPayload{
+					DepositEvent: types.DepositEvent{
+						Version:          types.V1,
+						WalletID:         n.WalletID,
+						DiversifierIndex: n.DiversifierIndex,
+					TxID:             n.TxID,
+					Height:           n.Height,
+					ActionIndex:      uint32(n.ActionIndex),
+					AmountZatoshis:   uint64(n.ValueZat),
+					Status: types.TxStatus{
+						State:         types.TxStateConfirmed,
+						Height:        n.Height,
+						Confirmations: confirmations,
+					},
+				},
+				RecipientAddress: n.RecipientAddress,
+				NoteNullifier:    n.NoteNullifier,
+			},
+			ConfirmedHeight:       scanHeight,
+			RequiredConfirmations: s.confirmations,
+		}
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("scanner: marshal confirmed payload: %w", err)
+		}
+		if err := tx.InsertEvent(ctx, store.Event{
+			Kind:     "DepositConfirmed",
+			WalletID: n.WalletID,
+			Height:   scanHeight,
+			Payload:  payloadBytes,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type depositEventPayload struct {
+	types.DepositEvent
+	RecipientAddress string `json:"recipient_address,omitempty"`
+	NoteNullifier    string `json:"note_nullifier,omitempty"`
+}
+
+type depositConfirmedPayload struct {
+	depositEventPayload
+	ConfirmedHeight       int64 `json:"confirmed_height"`
+	RequiredConfirmations int64 `json:"required_confirmations"`
 }
 
 func (s *Scanner) loadWallets(ctx context.Context) ([]orchardscan.Wallet, error) {

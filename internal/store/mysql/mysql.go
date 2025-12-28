@@ -169,6 +169,9 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 		if _, err := mytx.tx.ExecContext(ctx, `UPDATE notes SET spent_height = NULL, spent_txid = NULL WHERE spent_height > ?`, height); err != nil {
 			return fmt.Errorf("mysql: rollback unspend: %w", err)
 		}
+		if _, err := mytx.tx.ExecContext(ctx, `UPDATE notes SET confirmed_height = NULL WHERE confirmed_height > ?`, height); err != nil {
+			return fmt.Errorf("mysql: rollback unconfirm: %w", err)
+		}
 		if _, err := mytx.tx.ExecContext(ctx, `DELETE FROM blocks WHERE height > ?`, height); err != nil {
 			return fmt.Errorf("mysql: rollback blocks: %w", err)
 		}
@@ -218,7 +221,7 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 	}
 
 	query := `
-SELECT txid, action_index, height, position, recipient_address, value_zat, note_nullifier, spent_height, spent_txid, created_at
+SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, note_nullifier, spent_height, spent_txid, confirmed_height, created_at
 FROM notes
 WHERE wallet_id = ?
 `
@@ -237,19 +240,23 @@ WHERE wallet_id = ?
 	for rows.Next() {
 		var n store.Note
 		var position sql.NullInt64
+		var divIdx sql.NullInt64
 		var spentHeight sql.NullInt64
 		var spentTxid sql.NullString
+		var confirmedHeight sql.NullInt64
 		n.WalletID = walletID
 		if err := rows.Scan(
 			&n.TxID,
 			&n.ActionIndex,
 			&n.Height,
 			&position,
+			&divIdx,
 			&n.RecipientAddress,
 			&n.ValueZat,
 			&n.NoteNullifier,
 			&spentHeight,
 			&spentTxid,
+			&confirmedHeight,
 			&n.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("mysql: list notes: %w", err)
@@ -257,11 +264,17 @@ WHERE wallet_id = ?
 		if position.Valid {
 			n.Position = &position.Int64
 		}
+		if divIdx.Valid {
+			n.DiversifierIndex = uint32(divIdx.Int64)
+		}
 		if spentHeight.Valid {
 			n.SpentHeight = &spentHeight.Int64
 		}
 		if spentTxid.Valid {
 			n.SpentTxID = &spentTxid.String
+		}
+		if confirmedHeight.Valid {
+			n.ConfirmedHeight = &confirmedHeight.Int64
 		}
 		out = append(out, n)
 	}
@@ -373,14 +386,83 @@ WHERE spent_height IS NULL AND note_nullifier IN (`)
 func (t *myTx) InsertNote(ctx context.Context, n store.Note) error {
 	_, err := t.tx.ExecContext(ctx, `
 INSERT IGNORE INTO notes (
-  wallet_id, txid, action_index, height, position, recipient_address, value_zat, note_nullifier
+  wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, note_nullifier
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-`, n.WalletID, n.TxID, n.ActionIndex, n.Height, n.Position, n.RecipientAddress, n.ValueZat, n.NoteNullifier)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`, n.WalletID, n.TxID, n.ActionIndex, n.Height, n.Position, int64(n.DiversifierIndex), n.RecipientAddress, n.ValueZat, n.NoteNullifier)
 	if err != nil {
 		return fmt.Errorf("mysql: insert note: %w", err)
 	}
 	return nil
+}
+
+func (t *myTx) ConfirmNotes(ctx context.Context, confirmationHeight int64, maxNoteHeight int64) ([]store.Note, error) {
+	rows, err := t.tx.QueryContext(ctx, `
+SELECT wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, note_nullifier, spent_height, spent_txid, created_at
+FROM notes
+WHERE confirmed_height IS NULL AND height <= ?
+ORDER BY height, wallet_id, txid, action_index
+`, maxNoteHeight)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: confirm notes list: %w", err)
+	}
+	defer rows.Close()
+
+	var out []store.Note
+	for rows.Next() {
+		var n store.Note
+		var position sql.NullInt64
+		var divIdx sql.NullInt64
+		var spentHeight sql.NullInt64
+		var spentTxid sql.NullString
+		if err := rows.Scan(
+			&n.WalletID,
+			&n.TxID,
+			&n.ActionIndex,
+			&n.Height,
+			&position,
+			&divIdx,
+			&n.RecipientAddress,
+			&n.ValueZat,
+			&n.NoteNullifier,
+			&spentHeight,
+			&spentTxid,
+			&n.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("mysql: confirm notes list: %w", err)
+		}
+		if position.Valid {
+			n.Position = &position.Int64
+		}
+		if divIdx.Valid {
+			n.DiversifierIndex = uint32(divIdx.Int64)
+		}
+		if spentHeight.Valid {
+			n.SpentHeight = &spentHeight.Int64
+		}
+		if spentTxid.Valid {
+			n.SpentTxID = &spentTxid.String
+		}
+		n.ConfirmedHeight = &confirmationHeight
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql: confirm notes list: %w", err)
+	}
+
+	if len(out) == 0 {
+		return nil, nil
+	}
+
+	if _, err := t.tx.ExecContext(ctx, `
+UPDATE notes
+SET confirmed_height = ?
+WHERE confirmed_height IS NULL AND height <= ?
+`, confirmationHeight, maxNoteHeight); err != nil {
+		return nil, fmt.Errorf("mysql: confirm notes update: %w", err)
+	}
+
+	return out, nil
 }
 
 func (t *myTx) InsertEvent(ctx context.Context, e store.Event) error {

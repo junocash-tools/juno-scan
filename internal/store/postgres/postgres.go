@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -180,6 +181,9 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 		if _, err := pgtx.tx.Exec(ctx, `UPDATE notes SET spent_height = NULL, spent_txid = NULL WHERE spent_height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback unspend: %w", err)
 		}
+		if _, err := pgtx.tx.Exec(ctx, `UPDATE notes SET confirmed_height = NULL WHERE confirmed_height > $1`, height); err != nil {
+			return fmt.Errorf("postgres: rollback unconfirm: %w", err)
+		}
 		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM blocks WHERE height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback blocks: %w", err)
 		}
@@ -227,7 +231,7 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 	}
 
 	query := `
-SELECT txid, action_index, height, position, recipient_address, value_zat, note_nullifier, spent_height, spent_txid, created_at
+SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, note_nullifier, spent_height, spent_txid, confirmed_height, created_at
 FROM notes
 WHERE wallet_id = $1
 `
@@ -245,20 +249,28 @@ WHERE wallet_id = $1
 	var out []store.Note
 	for rows.Next() {
 		var n store.Note
+		var divIdx int64
+		var confirmedHeight sql.NullInt64
 		n.WalletID = walletID
 		if err := rows.Scan(
 			&n.TxID,
 			&n.ActionIndex,
 			&n.Height,
 			&n.Position,
+			&divIdx,
 			&n.RecipientAddress,
 			&n.ValueZat,
 			&n.NoteNullifier,
 			&n.SpentHeight,
 			&n.SpentTxID,
+			&confirmedHeight,
 			&n.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("postgres: list notes: %w", err)
+		}
+		n.DiversifierIndex = uint32(divIdx)
+		if confirmedHeight.Valid {
+			n.ConfirmedHeight = &confirmedHeight.Int64
 		}
 		out = append(out, n)
 	}
@@ -357,15 +369,61 @@ WHERE spent_height IS NULL AND note_nullifier = ANY($3::text[])
 func (t *pgTx) InsertNote(ctx context.Context, n store.Note) error {
 	_, err := t.tx.Exec(ctx, `
 INSERT INTO notes (
-  wallet_id, txid, action_index, height, position, recipient_address, value_zat, note_nullifier
+  wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, note_nullifier
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (wallet_id, txid, action_index) DO NOTHING
-`, n.WalletID, n.TxID, n.ActionIndex, n.Height, n.Position, n.RecipientAddress, n.ValueZat, n.NoteNullifier)
+`, n.WalletID, n.TxID, n.ActionIndex, n.Height, n.Position, int64(n.DiversifierIndex), n.RecipientAddress, n.ValueZat, n.NoteNullifier)
 	if err != nil {
 		return fmt.Errorf("postgres: insert note: %w", err)
 	}
 	return nil
+}
+
+func (t *pgTx) ConfirmNotes(ctx context.Context, confirmationHeight int64, maxNoteHeight int64) ([]store.Note, error) {
+	rows, err := t.tx.Query(ctx, `
+UPDATE notes
+SET confirmed_height = $1
+WHERE confirmed_height IS NULL AND height <= $2
+RETURNING wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, note_nullifier, spent_height, spent_txid, confirmed_height, created_at
+`, confirmationHeight, maxNoteHeight)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: confirm notes: %w", err)
+	}
+	defer rows.Close()
+
+	var out []store.Note
+	for rows.Next() {
+		var n store.Note
+		var divIdx int64
+		var confirmed sql.NullInt64
+		if err := rows.Scan(
+			&n.WalletID,
+			&n.TxID,
+			&n.ActionIndex,
+			&n.Height,
+			&n.Position,
+			&divIdx,
+			&n.RecipientAddress,
+			&n.ValueZat,
+			&n.NoteNullifier,
+			&n.SpentHeight,
+			&n.SpentTxID,
+			&confirmed,
+			&n.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("postgres: confirm notes: %w", err)
+		}
+		n.DiversifierIndex = uint32(divIdx)
+		if confirmed.Valid {
+			n.ConfirmedHeight = &confirmed.Int64
+		}
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: confirm notes: %w", err)
+	}
+	return out, nil
 }
 
 func (t *pgTx) InsertEvent(ctx context.Context, e store.Event) error {
