@@ -158,6 +158,23 @@ func TestStore_RollbackUnspendsAndDeletes(t *testing.T) {
 		t.Fatalf("expected 1 unspent note after rollback, got %+v", unspent)
 	}
 
+	eventsAfterRollback, _, err := st.ListWalletEvents(ctx, "hot", 0, 100)
+	if err != nil {
+		t.Fatalf("ListWalletEvents(after rollback): %v", err)
+	}
+	var sawDepositUnconfirmed, sawSpendOrphaned bool
+	for _, e := range eventsAfterRollback {
+		if e.Kind == "DepositUnconfirmed" {
+			sawDepositUnconfirmed = true
+		}
+		if e.Kind == "SpendOrphaned" {
+			sawSpendOrphaned = true
+		}
+	}
+	if !sawDepositUnconfirmed || !sawSpendOrphaned {
+		t.Fatalf("expected DepositUnconfirmed and SpendOrphaned after rollback, got %+v", eventsAfterRollback)
+	}
+
 	if err := st.RollbackToHeight(ctx, 0); err != nil {
 		t.Fatalf("RollbackToHeight(0): %v", err)
 	}
@@ -174,8 +191,15 @@ func TestStore_RollbackUnspendsAndDeletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListWalletEvents: %v", err)
 	}
-	if len(events) != 0 {
-		t.Fatalf("expected 0 events after rollback to 0, got %d", len(events))
+	foundOrphaned := false
+	for _, e := range events {
+		if e.Kind == "DepositOrphaned" {
+			foundOrphaned = true
+			break
+		}
+	}
+	if !foundOrphaned {
+		t.Fatalf("expected DepositOrphaned after rollback to 0, got %+v", events)
 	}
 
 	commitments, err := st.ListOrchardCommitmentsUpToHeight(ctx, 100)

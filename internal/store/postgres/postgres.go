@@ -3,12 +3,15 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/Abdullah1738/juno-scan/internal/db/migrate"
+	"github.com/Abdullah1738/juno-scan/internal/events"
 	"github.com/Abdullah1738/juno-scan/internal/store"
+	"github.com/Abdullah1738/juno-sdk-go/types"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -166,6 +169,91 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 	return s.WithTx(ctx, func(tx store.Tx) error {
 		pgtx := tx.(*pgTx)
 
+		var orphanDeposits []store.Note
+		var unconfirmedDeposits []store.Note
+		var orphanSpends []store.Note
+		var unconfirmedSpends []store.Note
+
+		if height >= 0 {
+			fetchNotes := func(query string, args ...any) ([]store.Note, error) {
+				rows, err := pgtx.tx.Query(ctx, query, args...)
+				if err != nil {
+					return nil, err
+				}
+				defer rows.Close()
+
+				var out []store.Note
+				for rows.Next() {
+					var n store.Note
+					var divIdx int64
+					var memo sql.NullString
+					var confirmed sql.NullInt64
+					var spentConfirmed sql.NullInt64
+					if err := rows.Scan(
+						&n.WalletID,
+						&n.TxID,
+						&n.ActionIndex,
+						&n.Height,
+						&n.Position,
+						&divIdx,
+						&n.RecipientAddress,
+						&n.ValueZat,
+						&memo,
+						&n.NoteNullifier,
+						&n.SpentHeight,
+						&n.SpentTxID,
+						&confirmed,
+						&spentConfirmed,
+						&n.CreatedAt,
+					); err != nil {
+						return nil, err
+					}
+					n.DiversifierIndex = uint32(divIdx)
+					if memo.Valid {
+						n.MemoHex = &memo.String
+					}
+					if confirmed.Valid {
+						n.ConfirmedHeight = &confirmed.Int64
+					}
+					if spentConfirmed.Valid {
+						n.SpentConfirmedHeight = &spentConfirmed.Int64
+					}
+					out = append(out, n)
+				}
+				if err := rows.Err(); err != nil {
+					return nil, err
+				}
+				return out, nil
+			}
+
+			baseSelect := `
+SELECT wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
+FROM notes
+`
+
+			var err error
+
+			orphanDeposits, err = fetchNotes(baseSelect+`WHERE height > $1`, height)
+			if err != nil {
+				return fmt.Errorf("postgres: rollback list orphan deposits: %w", err)
+			}
+
+			unconfirmedDeposits, err = fetchNotes(baseSelect+`WHERE height <= $1 AND confirmed_height IS NOT NULL AND confirmed_height > $1`, height)
+			if err != nil {
+				return fmt.Errorf("postgres: rollback list unconfirmed deposits: %w", err)
+			}
+
+			orphanSpends, err = fetchNotes(baseSelect+`WHERE height <= $1 AND spent_height IS NOT NULL AND spent_height > $1`, height)
+			if err != nil {
+				return fmt.Errorf("postgres: rollback list orphan spends: %w", err)
+			}
+
+			unconfirmedSpends, err = fetchNotes(baseSelect+`WHERE height <= $1 AND spent_height IS NOT NULL AND spent_height <= $1 AND spent_confirmed_height IS NOT NULL AND spent_confirmed_height > $1`, height)
+			if err != nil {
+				return fmt.Errorf("postgres: rollback list unconfirmed spends: %w", err)
+			}
+		}
+
 		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM events WHERE height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback events: %w", err)
 		}
@@ -189,6 +277,179 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 		}
 		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM blocks WHERE height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback blocks: %w", err)
+		}
+
+		if height >= 0 {
+			for _, n := range orphanDeposits {
+				memoHex := ""
+				if n.MemoHex != nil {
+					memoHex = *n.MemoHex
+				}
+				payload := events.DepositOrphanedPayload{
+					DepositEventPayload: events.DepositEventPayload{
+						DepositEvent: types.DepositEvent{
+							Version:          types.V1,
+							WalletID:         n.WalletID,
+							DiversifierIndex: n.DiversifierIndex,
+							TxID:             n.TxID,
+							Height:           n.Height,
+							ActionIndex:      uint32(n.ActionIndex),
+							AmountZatoshis:   uint64(n.ValueZat),
+							MemoHex:          memoHex,
+							Status: types.TxStatus{
+								State:  types.TxStateOrphaned,
+								Height: n.Height,
+							},
+						},
+						RecipientAddress: n.RecipientAddress,
+						NoteNullifier:    n.NoteNullifier,
+					},
+					OrphanedAtHeight: height,
+				}
+				b, err := json.Marshal(payload)
+				if err != nil {
+					return fmt.Errorf("postgres: rollback marshal deposit orphaned: %w", err)
+				}
+				if err := pgtx.InsertEvent(ctx, store.Event{
+					Kind:     events.KindDepositOrphaned,
+					WalletID: n.WalletID,
+					Height:   height,
+					Payload:  b,
+				}); err != nil {
+					return err
+				}
+			}
+
+			for _, n := range unconfirmedDeposits {
+				if n.ConfirmedHeight == nil {
+					continue
+				}
+				memoHex := ""
+				if n.MemoHex != nil {
+					memoHex = *n.MemoHex
+				}
+				confirmations := height - n.Height + 1
+				if confirmations < 0 {
+					confirmations = 0
+				}
+				payload := events.DepositUnconfirmedPayload{
+					DepositEventPayload: events.DepositEventPayload{
+						DepositEvent: types.DepositEvent{
+							Version:          types.V1,
+							WalletID:         n.WalletID,
+							DiversifierIndex: n.DiversifierIndex,
+							TxID:             n.TxID,
+							Height:           n.Height,
+							ActionIndex:      uint32(n.ActionIndex),
+							AmountZatoshis:   uint64(n.ValueZat),
+							MemoHex:          memoHex,
+							Status: types.TxStatus{
+								State:         types.TxStateConfirmed,
+								Height:        n.Height,
+								Confirmations: confirmations,
+							},
+						},
+						RecipientAddress: n.RecipientAddress,
+						NoteNullifier:    n.NoteNullifier,
+					},
+					RollbackHeight:          height,
+					PreviousConfirmedHeight: *n.ConfirmedHeight,
+				}
+				b, err := json.Marshal(payload)
+				if err != nil {
+					return fmt.Errorf("postgres: rollback marshal deposit unconfirmed: %w", err)
+				}
+				if err := pgtx.InsertEvent(ctx, store.Event{
+					Kind:     events.KindDepositUnconfirmed,
+					WalletID: n.WalletID,
+					Height:   height,
+					Payload:  b,
+				}); err != nil {
+					return err
+				}
+			}
+
+			for _, n := range orphanSpends {
+				if n.SpentHeight == nil || n.SpentTxID == nil {
+					continue
+				}
+				payload := events.SpendOrphanedPayload{
+					SpendEventPayload: events.SpendEventPayload{
+						Version:          types.V1,
+						WalletID:         n.WalletID,
+						DiversifierIndex: n.DiversifierIndex,
+						TxID:             *n.SpentTxID,
+						Height:           *n.SpentHeight,
+						NoteTxID:         n.TxID,
+						NoteActionIndex:  uint32(n.ActionIndex),
+						NoteHeight:       n.Height,
+						AmountZatoshis:   uint64(n.ValueZat),
+						NoteNullifier:    n.NoteNullifier,
+						RecipientAddress: n.RecipientAddress,
+						Status: types.TxStatus{
+							State:  types.TxStateOrphaned,
+							Height: *n.SpentHeight,
+						},
+					},
+					OrphanedAtHeight: height,
+				}
+				b, err := json.Marshal(payload)
+				if err != nil {
+					return fmt.Errorf("postgres: rollback marshal spend orphaned: %w", err)
+				}
+				if err := pgtx.InsertEvent(ctx, store.Event{
+					Kind:     events.KindSpendOrphaned,
+					WalletID: n.WalletID,
+					Height:   height,
+					Payload:  b,
+				}); err != nil {
+					return err
+				}
+			}
+
+			for _, n := range unconfirmedSpends {
+				if n.SpentHeight == nil || n.SpentTxID == nil || n.SpentConfirmedHeight == nil {
+					continue
+				}
+				confirmations := height - *n.SpentHeight + 1
+				if confirmations < 0 {
+					confirmations = 0
+				}
+				payload := events.SpendUnconfirmedPayload{
+					SpendEventPayload: events.SpendEventPayload{
+						Version:          types.V1,
+						WalletID:         n.WalletID,
+						DiversifierIndex: n.DiversifierIndex,
+						TxID:             *n.SpentTxID,
+						Height:           *n.SpentHeight,
+						NoteTxID:         n.TxID,
+						NoteActionIndex:  uint32(n.ActionIndex),
+						NoteHeight:       n.Height,
+						AmountZatoshis:   uint64(n.ValueZat),
+						NoteNullifier:    n.NoteNullifier,
+						RecipientAddress: n.RecipientAddress,
+						Status: types.TxStatus{
+							State:         types.TxStateConfirmed,
+							Height:        *n.SpentHeight,
+							Confirmations: confirmations,
+						},
+					},
+					RollbackHeight:          height,
+					PreviousConfirmedHeight: *n.SpentConfirmedHeight,
+				}
+				b, err := json.Marshal(payload)
+				if err != nil {
+					return fmt.Errorf("postgres: rollback marshal spend unconfirmed: %w", err)
+				}
+				if err := pgtx.InsertEvent(ctx, store.Event{
+					Kind:     events.KindSpendUnconfirmed,
+					WalletID: n.WalletID,
+					Height:   height,
+					Payload:  b,
+				}); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	})

@@ -13,7 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Abdullah1738/juno-scan/internal/events"
 	"github.com/Abdullah1738/juno-scan/internal/store"
+	"github.com/Abdullah1738/juno-sdk-go/types"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -276,6 +278,262 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 	batch := s.db.NewIndexedBatch()
 	defer batch.Close()
 
+	now := time.Now().UTC()
+	rtx := &rocksTx{
+		db:    s.db,
+		batch: batch,
+		now:   now,
+	}
+
+	var orphanDeposits []store.Note
+	var unconfirmedDeposits []store.Note
+	var orphanSpends []store.Note
+	var unconfirmedSpends []store.Note
+
+	noteFromRecord := func(rec noteRecord) store.Note {
+		var posPtr *int64
+		if rec.Position != nil {
+			p := int64(*rec.Position)
+			posPtr = &p
+		}
+		return store.Note{
+			WalletID:             rec.WalletID,
+			TxID:                 rec.TxID,
+			ActionIndex:          rec.ActionIndex,
+			Height:               rec.Height,
+			Position:             posPtr,
+			DiversifierIndex:     rec.DiversifierIndex,
+			RecipientAddress:     rec.RecipientAddress,
+			ValueZat:             rec.ValueZat,
+			MemoHex:              rec.MemoHex,
+			NoteNullifier:        rec.NoteNullifier,
+			SpentHeight:          rec.SpentHeight,
+			SpentTxID:            rec.SpentTxID,
+			ConfirmedHeight:      rec.ConfirmedHeight,
+			SpentConfirmedHeight: rec.SpentConfirmedHeight,
+			CreatedAt:            time.Unix(rec.CreatedAtUnix, 0).UTC(),
+		}
+	}
+
+	if height >= 0 {
+		// Notes created above height.
+		{
+			lower := make([]byte, 0, len(noteHeightPrefix)+20)
+			lower = append(lower, noteHeightPrefix...)
+			lower = appendUint64Fixed20(lower, uint64(height+1))
+
+			iter, err := s.db.NewIter(&pebble.IterOptions{
+				LowerBound: lower,
+				UpperBound: prefixUpperBound(noteHeightPrefix),
+			})
+			if err != nil {
+				return fmt.Errorf("rocksdb: rollback iter notes: %w", err)
+			}
+			for iter.First(); iter.Valid(); iter.Next() {
+				walletID, _, txid, actionIndex, err := parseNoteHeightIndexKey(iter.Key())
+				if err != nil {
+					_ = iter.Close()
+					return err
+				}
+				noteKey := keyNote(walletID, txid, actionIndex)
+				v, closer, err := s.db.Get(noteKey)
+				if err != nil {
+					if errors.Is(err, pebble.ErrNotFound) {
+						continue
+					}
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback get note: %w", err)
+				}
+				var rec noteRecord
+				if err := json.Unmarshal(v, &rec); err != nil {
+					_ = closer.Close()
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback decode note: %w", err)
+				}
+				_ = closer.Close()
+				orphanDeposits = append(orphanDeposits, noteFromRecord(rec))
+			}
+			if err := iter.Error(); err != nil {
+				_ = iter.Close()
+				return fmt.Errorf("rocksdb: rollback iter notes: %w", err)
+			}
+			_ = iter.Close()
+		}
+
+		// Notes that were previously deposit-confirmed above height.
+		{
+			lower := make([]byte, 0, len(noteConfirmedHeightPrefix)+20)
+			lower = append(lower, noteConfirmedHeightPrefix...)
+			lower = appendUint64Fixed20(lower, uint64(height+1))
+
+			iter, err := s.db.NewIter(&pebble.IterOptions{
+				LowerBound: lower,
+				UpperBound: prefixUpperBound(noteConfirmedHeightPrefix),
+			})
+			if err != nil {
+				return fmt.Errorf("rocksdb: rollback iter confirmed notes: %w", err)
+			}
+			for iter.First(); iter.Valid(); iter.Next() {
+				parts := bytes.Split(iter.Key(), []byte("/"))
+				if len(parts) != 3 {
+					continue
+				}
+				nullifier := string(parts[2])
+				locBytes, closer, err := s.db.Get(keyNullifier(nullifier))
+				if err != nil {
+					if errors.Is(err, pebble.ErrNotFound) {
+						continue
+					}
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback get nullifier: %w", err)
+				}
+				noteKey := append([]byte{}, locBytes...)
+				_ = closer.Close()
+
+				v, closer, err := s.db.Get(noteKey)
+				if err != nil {
+					if errors.Is(err, pebble.ErrNotFound) {
+						continue
+					}
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback get note: %w", err)
+				}
+				var rec noteRecord
+				if err := json.Unmarshal(v, &rec); err != nil {
+					_ = closer.Close()
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback decode note: %w", err)
+				}
+				_ = closer.Close()
+
+				if rec.Height <= height && rec.ConfirmedHeight != nil && *rec.ConfirmedHeight > height {
+					unconfirmedDeposits = append(unconfirmedDeposits, noteFromRecord(rec))
+				}
+			}
+			if err := iter.Error(); err != nil {
+				_ = iter.Close()
+				return fmt.Errorf("rocksdb: rollback iter confirmed notes: %w", err)
+			}
+			_ = iter.Close()
+		}
+
+		// Notes that were spent above height.
+		{
+			lower := make([]byte, 0, len(noteSpentHeightPrefix)+20)
+			lower = append(lower, noteSpentHeightPrefix...)
+			lower = appendUint64Fixed20(lower, uint64(height+1))
+
+			iter, err := s.db.NewIter(&pebble.IterOptions{
+				LowerBound: lower,
+				UpperBound: prefixUpperBound(noteSpentHeightPrefix),
+			})
+			if err != nil {
+				return fmt.Errorf("rocksdb: rollback iter spent notes: %w", err)
+			}
+			for iter.First(); iter.Valid(); iter.Next() {
+				parts := bytes.Split(iter.Key(), []byte("/"))
+				if len(parts) != 3 {
+					continue
+				}
+				nullifier := string(parts[2])
+				locBytes, closer, err := s.db.Get(keyNullifier(nullifier))
+				if err != nil {
+					if errors.Is(err, pebble.ErrNotFound) {
+						continue
+					}
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback get nullifier: %w", err)
+				}
+				noteKey := append([]byte{}, locBytes...)
+				_ = closer.Close()
+
+				v, closer, err := s.db.Get(noteKey)
+				if err != nil {
+					if errors.Is(err, pebble.ErrNotFound) {
+						continue
+					}
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback get note: %w", err)
+				}
+				var rec noteRecord
+				if err := json.Unmarshal(v, &rec); err != nil {
+					_ = closer.Close()
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback decode note: %w", err)
+				}
+				_ = closer.Close()
+
+				if rec.Height <= height && rec.SpentHeight != nil && *rec.SpentHeight > height {
+					orphanSpends = append(orphanSpends, noteFromRecord(rec))
+				}
+			}
+			if err := iter.Error(); err != nil {
+				_ = iter.Close()
+				return fmt.Errorf("rocksdb: rollback iter spent notes: %w", err)
+			}
+			_ = iter.Close()
+		}
+
+		// Spends that were confirmed above height.
+		{
+			lower := make([]byte, 0, len(noteSpentConfirmedHeightPrefix)+20)
+			lower = append(lower, noteSpentConfirmedHeightPrefix...)
+			lower = appendUint64Fixed20(lower, uint64(height+1))
+
+			iter, err := s.db.NewIter(&pebble.IterOptions{
+				LowerBound: lower,
+				UpperBound: prefixUpperBound(noteSpentConfirmedHeightPrefix),
+			})
+			if err != nil {
+				return fmt.Errorf("rocksdb: rollback iter confirmed spends: %w", err)
+			}
+			for iter.First(); iter.Valid(); iter.Next() {
+				parts := bytes.Split(iter.Key(), []byte("/"))
+				if len(parts) != 3 {
+					continue
+				}
+				nullifier := string(parts[2])
+				locBytes, closer, err := s.db.Get(keyNullifier(nullifier))
+				if err != nil {
+					if errors.Is(err, pebble.ErrNotFound) {
+						continue
+					}
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback get nullifier: %w", err)
+				}
+				noteKey := append([]byte{}, locBytes...)
+				_ = closer.Close()
+
+				v, closer, err := s.db.Get(noteKey)
+				if err != nil {
+					if errors.Is(err, pebble.ErrNotFound) {
+						continue
+					}
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback get note: %w", err)
+				}
+				var rec noteRecord
+				if err := json.Unmarshal(v, &rec); err != nil {
+					_ = closer.Close()
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback decode note: %w", err)
+				}
+				_ = closer.Close()
+
+				if rec.Height <= height &&
+					rec.SpentHeight != nil && *rec.SpentHeight <= height &&
+					rec.SpentConfirmedHeight != nil && *rec.SpentConfirmedHeight > height {
+					unconfirmedSpends = append(unconfirmedSpends, noteFromRecord(rec))
+				}
+			}
+			if err := iter.Error(); err != nil {
+				_ = iter.Close()
+				return fmt.Errorf("rocksdb: rollback iter confirmed spends: %w", err)
+			}
+			_ = iter.Close()
+		}
+	}
+
 	// Delete blocks above height.
 	if err := deleteRangeByFixed20(batch, blockPrefix, uint64(height+1)); err != nil {
 		return err
@@ -344,6 +602,179 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 	// Delete commitments above height and fix next position.
 	if err := rollbackCommitments(batch, s.db, uint64(height)); err != nil {
 		return err
+	}
+
+	if height >= 0 {
+		for _, n := range orphanDeposits {
+			memoHex := ""
+			if n.MemoHex != nil {
+				memoHex = *n.MemoHex
+			}
+			payload := events.DepositOrphanedPayload{
+				DepositEventPayload: events.DepositEventPayload{
+					DepositEvent: types.DepositEvent{
+						Version:          types.V1,
+						WalletID:         n.WalletID,
+						DiversifierIndex: n.DiversifierIndex,
+						TxID:             n.TxID,
+						Height:           n.Height,
+						ActionIndex:      uint32(n.ActionIndex),
+						AmountZatoshis:   uint64(n.ValueZat),
+						MemoHex:          memoHex,
+						Status: types.TxStatus{
+							State:  types.TxStateOrphaned,
+							Height: n.Height,
+						},
+					},
+					RecipientAddress: n.RecipientAddress,
+					NoteNullifier:    n.NoteNullifier,
+				},
+				OrphanedAtHeight: height,
+			}
+			b, err := json.Marshal(payload)
+			if err != nil {
+				return fmt.Errorf("rocksdb: rollback marshal deposit orphaned: %w", err)
+			}
+			if err := rtx.InsertEvent(ctx, store.Event{
+				Kind:     events.KindDepositOrphaned,
+				WalletID: n.WalletID,
+				Height:   height,
+				Payload:  b,
+			}); err != nil {
+				return err
+			}
+		}
+
+		for _, n := range unconfirmedDeposits {
+			if n.ConfirmedHeight == nil {
+				continue
+			}
+			memoHex := ""
+			if n.MemoHex != nil {
+				memoHex = *n.MemoHex
+			}
+			confirmations := height - n.Height + 1
+			if confirmations < 0 {
+				confirmations = 0
+			}
+			payload := events.DepositUnconfirmedPayload{
+				DepositEventPayload: events.DepositEventPayload{
+					DepositEvent: types.DepositEvent{
+						Version:          types.V1,
+						WalletID:         n.WalletID,
+						DiversifierIndex: n.DiversifierIndex,
+						TxID:             n.TxID,
+						Height:           n.Height,
+						ActionIndex:      uint32(n.ActionIndex),
+						AmountZatoshis:   uint64(n.ValueZat),
+						MemoHex:          memoHex,
+						Status: types.TxStatus{
+							State:         types.TxStateConfirmed,
+							Height:        n.Height,
+							Confirmations: confirmations,
+						},
+					},
+					RecipientAddress: n.RecipientAddress,
+					NoteNullifier:    n.NoteNullifier,
+				},
+				RollbackHeight:          height,
+				PreviousConfirmedHeight: *n.ConfirmedHeight,
+			}
+			b, err := json.Marshal(payload)
+			if err != nil {
+				return fmt.Errorf("rocksdb: rollback marshal deposit unconfirmed: %w", err)
+			}
+			if err := rtx.InsertEvent(ctx, store.Event{
+				Kind:     events.KindDepositUnconfirmed,
+				WalletID: n.WalletID,
+				Height:   height,
+				Payload:  b,
+			}); err != nil {
+				return err
+			}
+		}
+
+		for _, n := range orphanSpends {
+			if n.SpentHeight == nil || n.SpentTxID == nil {
+				continue
+			}
+			payload := events.SpendOrphanedPayload{
+				SpendEventPayload: events.SpendEventPayload{
+					Version:          types.V1,
+					WalletID:         n.WalletID,
+					DiversifierIndex: n.DiversifierIndex,
+					TxID:             *n.SpentTxID,
+					Height:           *n.SpentHeight,
+					NoteTxID:         n.TxID,
+					NoteActionIndex:  uint32(n.ActionIndex),
+					NoteHeight:       n.Height,
+					AmountZatoshis:   uint64(n.ValueZat),
+					NoteNullifier:    n.NoteNullifier,
+					RecipientAddress: n.RecipientAddress,
+					Status: types.TxStatus{
+						State:  types.TxStateOrphaned,
+						Height: *n.SpentHeight,
+					},
+				},
+				OrphanedAtHeight: height,
+			}
+			b, err := json.Marshal(payload)
+			if err != nil {
+				return fmt.Errorf("rocksdb: rollback marshal spend orphaned: %w", err)
+			}
+			if err := rtx.InsertEvent(ctx, store.Event{
+				Kind:     events.KindSpendOrphaned,
+				WalletID: n.WalletID,
+				Height:   height,
+				Payload:  b,
+			}); err != nil {
+				return err
+			}
+		}
+
+		for _, n := range unconfirmedSpends {
+			if n.SpentHeight == nil || n.SpentTxID == nil || n.SpentConfirmedHeight == nil {
+				continue
+			}
+			confirmations := height - *n.SpentHeight + 1
+			if confirmations < 0 {
+				confirmations = 0
+			}
+			payload := events.SpendUnconfirmedPayload{
+				SpendEventPayload: events.SpendEventPayload{
+					Version:          types.V1,
+					WalletID:         n.WalletID,
+					DiversifierIndex: n.DiversifierIndex,
+					TxID:             *n.SpentTxID,
+					Height:           *n.SpentHeight,
+					NoteTxID:         n.TxID,
+					NoteActionIndex:  uint32(n.ActionIndex),
+					NoteHeight:       n.Height,
+					AmountZatoshis:   uint64(n.ValueZat),
+					NoteNullifier:    n.NoteNullifier,
+					RecipientAddress: n.RecipientAddress,
+					Status: types.TxStatus{
+						State:         types.TxStateConfirmed,
+						Height:        *n.SpentHeight,
+						Confirmations: confirmations,
+					},
+				},
+				RollbackHeight:          height,
+				PreviousConfirmedHeight: *n.SpentConfirmedHeight,
+			}
+			b, err := json.Marshal(payload)
+			if err != nil {
+				return fmt.Errorf("rocksdb: rollback marshal spend unconfirmed: %w", err)
+			}
+			if err := rtx.InsertEvent(ctx, store.Event{
+				Kind:     events.KindSpendUnconfirmed,
+				WalletID: n.WalletID,
+				Height:   height,
+				Payload:  b,
+			}); err != nil {
+				return err
+			}
+		}
 	}
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
@@ -1094,7 +1525,7 @@ func (t *rocksTx) InsertEvent(ctx context.Context, e store.Event) error {
 
 	seqKey := keyEventSeq(walletID)
 	var nextID uint64 = 1
-	v, closer, err := t.db.Get(seqKey)
+	v, closer, err := t.batch.Get(seqKey)
 	if err == nil {
 		if len(v) != 8 {
 			_ = closer.Close()

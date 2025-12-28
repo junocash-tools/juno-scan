@@ -8,6 +8,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/Abdullah1738/juno-scan/internal/events"
 	"github.com/Abdullah1738/juno-scan/internal/orchardscan"
 	"github.com/Abdullah1738/juno-scan/internal/store"
 	sdkjunocashd "github.com/Abdullah1738/juno-sdk-go/junocashd"
@@ -210,7 +211,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 				return err
 			}
 			for _, n := range spentNotes {
-				payload := spendEventPayload{
+				payload := events.SpendEventPayload{
 					Version:          types.V1,
 					WalletID:         n.WalletID,
 					DiversifierIndex: n.DiversifierIndex,
@@ -233,7 +234,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 					return fmt.Errorf("scanner: marshal spend payload: %w", err)
 				}
 				if err := tx.InsertEvent(ctx, store.Event{
-					Kind:     "SpendEvent",
+					Kind:     events.KindSpendEvent,
 					WalletID: n.WalletID,
 					Height:   blk.Height,
 					Payload:  payloadBytes,
@@ -266,7 +267,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 					return err
 				}
 
-				payload := depositEventPayload{
+				payload := events.DepositEventPayload{
 					DepositEvent: types.DepositEvent{
 						Version:          types.V1,
 						WalletID:         n.WalletID,
@@ -290,7 +291,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 					return fmt.Errorf("scanner: marshal event payload: %w", err)
 				}
 				if err := tx.InsertEvent(ctx, store.Event{
-					Kind:     "DepositEvent",
+					Kind:     events.KindDepositEvent,
 					WalletID: n.WalletID,
 					Height:   blk.Height,
 					Payload:  payloadBytes,
@@ -332,8 +333,8 @@ func (s *Scanner) confirmDepositConfirmations(ctx context.Context, tx store.Tx, 
 			confirmations = 1
 		}
 
-		payload := depositConfirmedPayload{
-			depositEventPayload: depositEventPayload{
+		payload := events.DepositConfirmedPayload{
+			DepositEventPayload: events.DepositEventPayload{
 				DepositEvent: types.DepositEvent{
 					Version:          types.V1,
 					WalletID:         n.WalletID,
@@ -360,7 +361,7 @@ func (s *Scanner) confirmDepositConfirmations(ctx context.Context, tx store.Tx, 
 			return fmt.Errorf("scanner: marshal confirmed payload: %w", err)
 		}
 		if err := tx.InsertEvent(ctx, store.Event{
-			Kind:     "DepositConfirmed",
+			Kind:     events.KindDepositConfirmed,
 			WalletID: n.WalletID,
 			Height:   scanHeight,
 			Payload:  payloadBytes,
@@ -391,8 +392,8 @@ func (s *Scanner) confirmSpendConfirmations(ctx context.Context, tx store.Tx, sc
 			confirmations = 1
 		}
 
-		payload := spendConfirmedPayload{
-			spendEventPayload: spendEventPayload{
+		payload := events.SpendConfirmedPayload{
+			SpendEventPayload: events.SpendEventPayload{
 				Version:          types.V1,
 				WalletID:         n.WalletID,
 				DiversifierIndex: n.DiversifierIndex,
@@ -418,7 +419,7 @@ func (s *Scanner) confirmSpendConfirmations(ctx context.Context, tx store.Tx, sc
 			return fmt.Errorf("scanner: marshal spend confirmed payload: %w", err)
 		}
 		if err := tx.InsertEvent(ctx, store.Event{
-			Kind:     "SpendConfirmed",
+			Kind:     events.KindSpendConfirmed,
 			WalletID: n.WalletID,
 			Height:   scanHeight,
 			Payload:  payloadBytes,
@@ -427,41 +428,6 @@ func (s *Scanner) confirmSpendConfirmations(ctx context.Context, tx store.Tx, sc
 		}
 	}
 	return nil
-}
-
-type depositEventPayload struct {
-	types.DepositEvent
-	RecipientAddress string `json:"recipient_address,omitempty"`
-	NoteNullifier    string `json:"note_nullifier,omitempty"`
-}
-
-type depositConfirmedPayload struct {
-	depositEventPayload
-	ConfirmedHeight       int64 `json:"confirmed_height"`
-	RequiredConfirmations int64 `json:"required_confirmations"`
-}
-
-type spendEventPayload struct {
-	Version          types.Version `json:"version"`
-	WalletID         string        `json:"wallet_id"`
-	DiversifierIndex uint32        `json:"diversifier_index,omitempty"`
-	TxID             string        `json:"txid"`
-	Height           int64         `json:"height"`
-
-	NoteTxID        string `json:"note_txid"`
-	NoteActionIndex uint32 `json:"note_action_index"`
-	NoteHeight      int64  `json:"note_height"`
-	AmountZatoshis  uint64 `json:"amount_zatoshis"`
-	NoteNullifier   string `json:"note_nullifier,omitempty"`
-
-	RecipientAddress string         `json:"recipient_address,omitempty"`
-	Status           types.TxStatus `json:"status"`
-}
-
-type spendConfirmedPayload struct {
-	spendEventPayload
-	ConfirmedHeight       int64 `json:"confirmed_height"`
-	RequiredConfirmations int64 `json:"required_confirmations"`
 }
 
 func (s *Scanner) loadWallets(ctx context.Context) ([]orchardscan.Wallet, error) {
