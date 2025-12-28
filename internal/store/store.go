@@ -33,8 +33,9 @@ type Tx interface {
 	NextOrchardCommitmentPosition(ctx context.Context) (int64, error)
 	InsertOrchardAction(ctx context.Context, a OrchardAction) error
 	InsertOrchardCommitment(ctx context.Context, c OrchardCommitment) error
-	MarkNotesSpent(ctx context.Context, height int64, txid string, nullifiers []string) error
+	MarkNotesSpent(ctx context.Context, height int64, txid string, nullifiers []string) ([]Note, error)
 	ConfirmNotes(ctx context.Context, confirmationHeight int64, maxNoteHeight int64) ([]Note, error)
+	ConfirmSpends(ctx context.Context, confirmationHeight int64, maxSpentHeight int64) ([]Note, error)
 	InsertNote(ctx context.Context, n Note) error
 	InsertEvent(ctx context.Context, e Event) error
 }
@@ -81,19 +82,21 @@ type OrchardCommitment struct {
 }
 
 type Note struct {
-	WalletID         string
-	TxID             string
-	ActionIndex      int32
-	Height           int64
-	Position         *int64
-	DiversifierIndex uint32
-	RecipientAddress string
-	ValueZat         int64
-	NoteNullifier    string
-	SpentHeight      *int64
-	SpentTxID        *string
-	ConfirmedHeight  *int64
-	CreatedAt        time.Time
+	WalletID             string
+	TxID                 string
+	ActionIndex          int32
+	Height               int64
+	Position             *int64
+	DiversifierIndex     uint32
+	RecipientAddress     string
+	ValueZat             int64
+	MemoHex              *string
+	NoteNullifier        string
+	SpentHeight          *int64
+	SpentTxID            *string
+	ConfirmedHeight      *int64
+	SpentConfirmedHeight *int64
+	CreatedAt            time.Time
 }
 
 type Event struct {

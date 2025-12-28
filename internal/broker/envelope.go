@@ -9,4 +9,3 @@ type Envelope struct {
 	Height  int64           `json:"height"`
 	Payload json.RawMessage `json:"payload"`
 }
-

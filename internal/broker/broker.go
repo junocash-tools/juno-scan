@@ -45,4 +45,3 @@ func Open(ctx context.Context, cfg Config) (Broker, error) {
 		return nil, fmt.Errorf("broker: unsupported driver %q", cfg.Driver)
 	}
 }
-

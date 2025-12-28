@@ -17,16 +17,16 @@ type Config struct {
 	RPCUser     string
 	RPCPassword string
 
-	ListenAddr   string
-	UAHRP        string
-	PollInterval time.Duration
+	ListenAddr    string
+	UAHRP         string
+	PollInterval  time.Duration
 	Confirmations int64
 
-	BrokerDriver      string
-	BrokerURL         string
-	BrokerTopic       string
+	BrokerDriver       string
+	BrokerURL          string
+	BrokerTopic        string
 	BrokerPollInterval time.Duration
-	BrokerBatchSize   int
+	BrokerBatchSize    int
 }
 
 func FromFlags() Config {

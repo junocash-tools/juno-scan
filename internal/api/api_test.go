@@ -24,4 +24,3 @@ func TestIsSafeWalletID(t *testing.T) {
 		}
 	}
 }
-

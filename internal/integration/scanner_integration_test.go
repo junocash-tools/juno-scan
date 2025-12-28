@@ -73,10 +73,10 @@ func TestScanner_DepositDetected(t *testing.T) {
 	confirmed := waitForEventKind(t, ctx, st, "hot", "DepositConfirmed")
 
 	var confirmedPayload struct {
-		TxID                 string `json:"txid"`
+		TxID                  string `json:"txid"`
 		RequiredConfirmations int64  `json:"required_confirmations"`
-		ConfirmedHeight      int64  `json:"confirmed_height"`
-		Status               struct {
+		ConfirmedHeight       int64  `json:"confirmed_height"`
+		Status                struct {
 			Confirmations int64 `json:"confirmations"`
 		} `json:"status"`
 	}
@@ -97,6 +97,45 @@ func TestScanner_DepositDetected(t *testing.T) {
 	}
 	if confirmedPayload.ConfirmedHeight <= 0 {
 		t.Fatalf("invalid confirmed_height=%d", confirmedPayload.ConfirmedHeight)
+	}
+
+	// Spend the detected note.
+	toAddr := mustCreateUnifiedAddress(t, ctx, jd)
+	opid2 := mustSendMany(t, ctx, jd, addr, toAddr, 1)
+	mustWaitOpSuccess(t, ctx, jd, opid2)
+
+	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
+	waitForEventKind(t, ctx, st, "hot", "SpendEvent")
+
+	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
+	spendConfirmed := waitForEventKind(t, ctx, st, "hot", "SpendConfirmed")
+
+	var spendConfirmedPayload struct {
+		TxID                  string `json:"txid"`
+		NoteTxID              string `json:"note_txid"`
+		RequiredConfirmations int64  `json:"required_confirmations"`
+		ConfirmedHeight       int64  `json:"confirmed_height"`
+		Status                struct {
+			Confirmations int64 `json:"confirmations"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(spendConfirmed.Payload, &spendConfirmedPayload); err != nil {
+		t.Fatalf("unmarshal spend confirmed payload: %v", err)
+	}
+	if spendConfirmedPayload.TxID == "" {
+		t.Fatalf("missing txid in spend confirmed payload")
+	}
+	if spendConfirmedPayload.NoteTxID != mustTxIDFromPayload(t, deposit.Payload) {
+		t.Fatalf("spend confirmed note_txid mismatch")
+	}
+	if spendConfirmedPayload.RequiredConfirmations != 2 {
+		t.Fatalf("required_confirmations=%d want 2", spendConfirmedPayload.RequiredConfirmations)
+	}
+	if spendConfirmedPayload.Status.Confirmations != 2 {
+		t.Fatalf("status.confirmations=%d want 2", spendConfirmedPayload.Status.Confirmations)
+	}
+	if spendConfirmedPayload.ConfirmedHeight <= 0 {
+		t.Fatalf("invalid confirmed_height=%d", spendConfirmedPayload.ConfirmedHeight)
 	}
 }
 
@@ -124,6 +163,24 @@ func mustCreateWalletAndUFVK(t *testing.T, ctx context.Context, jd *testutil.Run
 	return addrResp.Address, ufvk
 }
 
+func mustCreateUnifiedAddress(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd) (addr string) {
+	t.Helper()
+
+	var acc struct {
+		Account int `json:"account"`
+	}
+	mustRunJSON(t, jd.CLICommand(ctx, "z_getnewaccount"), &acc)
+
+	var addrResp struct {
+		Address string `json:"address"`
+	}
+	mustRunJSON(t, jd.CLICommand(ctx, "z_getaddressforaccount", strconvI(acc.Account)), &addrResp)
+	if addrResp.Address == "" {
+		t.Fatalf("missing address")
+	}
+	return addrResp.Address
+}
+
 func mustCoinbaseAddress(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd) string {
 	t.Helper()
 
@@ -147,6 +204,20 @@ func mustShieldCoinbase(t *testing.T, ctx context.Context, jd *testutil.RunningJ
 		OpID string `json:"opid"`
 	}
 	mustRunJSON(t, jd.CLICommand(ctx, "z_shieldcoinbase", fromAddr, toAddr), &resp)
+	if resp.OpID == "" {
+		t.Fatalf("missing opid")
+	}
+	return resp.OpID
+}
+
+func mustSendMany(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string, amount int) string {
+	t.Helper()
+
+	var resp struct {
+		OpID string `json:"opid"`
+	}
+	recipients := `[{"address":"` + toAddr + `","amount":` + strconvI(amount) + `}]`
+	mustRunJSON(t, jd.CLICommand(ctx, "z_sendmany", fromAddr, recipients), &resp)
 	if resp.OpID == "" {
 		t.Fatalf("missing opid")
 	}

@@ -11,8 +11,8 @@ import (
 )
 
 type TestPostgres struct {
-	Pool   *pgxpool.Pool
-	Schema string
+	Pool    *pgxpool.Pool
+	Schema  string
 	BaseURL string
 }
 
@@ -49,8 +49,8 @@ func OpenTestPostgres(ctx context.Context, baseURL string) (*TestPostgres, error
 	}
 
 	return &TestPostgres{
-		Pool:   pool,
-		Schema: schema,
+		Pool:    pool,
+		Schema:  schema,
 		BaseURL: baseURL,
 	}, nil
 }
@@ -81,4 +81,3 @@ func randHex(n int) (string, error) {
 	}
 	return hex.EncodeToString(b), nil
 }
-

@@ -178,11 +178,14 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM notes WHERE height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback notes: %w", err)
 		}
-		if _, err := pgtx.tx.Exec(ctx, `UPDATE notes SET spent_height = NULL, spent_txid = NULL WHERE spent_height > $1`, height); err != nil {
+		if _, err := pgtx.tx.Exec(ctx, `UPDATE notes SET spent_height = NULL, spent_txid = NULL, spent_confirmed_height = NULL WHERE spent_height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback unspend: %w", err)
 		}
 		if _, err := pgtx.tx.Exec(ctx, `UPDATE notes SET confirmed_height = NULL WHERE confirmed_height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback unconfirm: %w", err)
+		}
+		if _, err := pgtx.tx.Exec(ctx, `UPDATE notes SET spent_confirmed_height = NULL WHERE spent_confirmed_height > $1`, height); err != nil {
+			return fmt.Errorf("postgres: rollback unconfirm spend: %w", err)
 		}
 		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM blocks WHERE height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback blocks: %w", err)
@@ -255,7 +258,7 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 	}
 
 	query := `
-SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, note_nullifier, spent_height, spent_txid, confirmed_height, created_at
+SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
 FROM notes
 WHERE wallet_id = $1
 `
@@ -274,7 +277,9 @@ WHERE wallet_id = $1
 	for rows.Next() {
 		var n store.Note
 		var divIdx int64
+		var memo sql.NullString
 		var confirmedHeight sql.NullInt64
+		var spentConfirmedHeight sql.NullInt64
 		n.WalletID = walletID
 		if err := rows.Scan(
 			&n.TxID,
@@ -284,17 +289,25 @@ WHERE wallet_id = $1
 			&divIdx,
 			&n.RecipientAddress,
 			&n.ValueZat,
+			&memo,
 			&n.NoteNullifier,
 			&n.SpentHeight,
 			&n.SpentTxID,
 			&confirmedHeight,
+			&spentConfirmedHeight,
 			&n.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("postgres: list notes: %w", err)
 		}
 		n.DiversifierIndex = uint32(divIdx)
+		if memo.Valid {
+			n.MemoHex = &memo.String
+		}
 		if confirmedHeight.Valid {
 			n.ConfirmedHeight = &confirmedHeight.Int64
+		}
+		if spentConfirmedHeight.Valid {
+			n.SpentConfirmedHeight = &spentConfirmedHeight.Int64
 		}
 		out = append(out, n)
 	}
@@ -378,26 +391,70 @@ ON CONFLICT (position) DO NOTHING
 	return nil
 }
 
-func (t *pgTx) MarkNotesSpent(ctx context.Context, height int64, txid string, nullifiers []string) error {
-	_, err := t.tx.Exec(ctx, `
+func (t *pgTx) MarkNotesSpent(ctx context.Context, height int64, txid string, nullifiers []string) ([]store.Note, error) {
+	rows, err := t.tx.Query(ctx, `
 UPDATE notes
-SET spent_height = $1, spent_txid = $2
+SET spent_height = $1, spent_txid = $2, spent_confirmed_height = NULL
 WHERE spent_height IS NULL AND note_nullifier = ANY($3::text[])
+RETURNING wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
 `, height, txid, nullifiers)
 	if err != nil {
-		return fmt.Errorf("postgres: mark spent: %w", err)
+		return nil, fmt.Errorf("postgres: mark spent: %w", err)
 	}
-	return nil
+	defer rows.Close()
+
+	var out []store.Note
+	for rows.Next() {
+		var n store.Note
+		var divIdx int64
+		var memo sql.NullString
+		var confirmed sql.NullInt64
+		var spentConfirmed sql.NullInt64
+		if err := rows.Scan(
+			&n.WalletID,
+			&n.TxID,
+			&n.ActionIndex,
+			&n.Height,
+			&n.Position,
+			&divIdx,
+			&n.RecipientAddress,
+			&n.ValueZat,
+			&memo,
+			&n.NoteNullifier,
+			&n.SpentHeight,
+			&n.SpentTxID,
+			&confirmed,
+			&spentConfirmed,
+			&n.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("postgres: mark spent: %w", err)
+		}
+		n.DiversifierIndex = uint32(divIdx)
+		if memo.Valid {
+			n.MemoHex = &memo.String
+		}
+		if confirmed.Valid {
+			n.ConfirmedHeight = &confirmed.Int64
+		}
+		if spentConfirmed.Valid {
+			n.SpentConfirmedHeight = &spentConfirmed.Int64
+		}
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: mark spent: %w", err)
+	}
+	return out, nil
 }
 
 func (t *pgTx) InsertNote(ctx context.Context, n store.Note) error {
 	_, err := t.tx.Exec(ctx, `
 INSERT INTO notes (
-  wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, note_nullifier
+  wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 ON CONFLICT (wallet_id, txid, action_index) DO NOTHING
-`, n.WalletID, n.TxID, n.ActionIndex, n.Height, n.Position, int64(n.DiversifierIndex), n.RecipientAddress, n.ValueZat, n.NoteNullifier)
+`, n.WalletID, n.TxID, n.ActionIndex, n.Height, n.Position, int64(n.DiversifierIndex), n.RecipientAddress, n.ValueZat, n.MemoHex, n.NoteNullifier)
 	if err != nil {
 		return fmt.Errorf("postgres: insert note: %w", err)
 	}
@@ -409,7 +466,7 @@ func (t *pgTx) ConfirmNotes(ctx context.Context, confirmationHeight int64, maxNo
 UPDATE notes
 SET confirmed_height = $1
 WHERE confirmed_height IS NULL AND height <= $2
-RETURNING wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, note_nullifier, spent_height, spent_txid, confirmed_height, created_at
+RETURNING wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
 `, confirmationHeight, maxNoteHeight)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: confirm notes: %w", err)
@@ -420,7 +477,9 @@ RETURNING wallet_id, txid, action_index, height, position, diversifier_index, re
 	for rows.Next() {
 		var n store.Note
 		var divIdx int64
+		var memo sql.NullString
 		var confirmed sql.NullInt64
+		var spentConfirmed sql.NullInt64
 		if err := rows.Scan(
 			&n.WalletID,
 			&n.TxID,
@@ -430,22 +489,86 @@ RETURNING wallet_id, txid, action_index, height, position, diversifier_index, re
 			&divIdx,
 			&n.RecipientAddress,
 			&n.ValueZat,
+			&memo,
 			&n.NoteNullifier,
 			&n.SpentHeight,
 			&n.SpentTxID,
 			&confirmed,
+			&spentConfirmed,
 			&n.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("postgres: confirm notes: %w", err)
 		}
 		n.DiversifierIndex = uint32(divIdx)
+		if memo.Valid {
+			n.MemoHex = &memo.String
+		}
 		if confirmed.Valid {
 			n.ConfirmedHeight = &confirmed.Int64
+		}
+		if spentConfirmed.Valid {
+			n.SpentConfirmedHeight = &spentConfirmed.Int64
 		}
 		out = append(out, n)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("postgres: confirm notes: %w", err)
+	}
+	return out, nil
+}
+
+func (t *pgTx) ConfirmSpends(ctx context.Context, confirmationHeight int64, maxSpentHeight int64) ([]store.Note, error) {
+	rows, err := t.tx.Query(ctx, `
+UPDATE notes
+SET spent_confirmed_height = $1
+WHERE spent_height IS NOT NULL AND spent_confirmed_height IS NULL AND spent_height <= $2
+RETURNING wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
+`, confirmationHeight, maxSpentHeight)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: confirm spends: %w", err)
+	}
+	defer rows.Close()
+
+	var out []store.Note
+	for rows.Next() {
+		var n store.Note
+		var divIdx int64
+		var memo sql.NullString
+		var confirmed sql.NullInt64
+		var spentConfirmed sql.NullInt64
+		if err := rows.Scan(
+			&n.WalletID,
+			&n.TxID,
+			&n.ActionIndex,
+			&n.Height,
+			&n.Position,
+			&divIdx,
+			&n.RecipientAddress,
+			&n.ValueZat,
+			&memo,
+			&n.NoteNullifier,
+			&n.SpentHeight,
+			&n.SpentTxID,
+			&confirmed,
+			&spentConfirmed,
+			&n.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("postgres: confirm spends: %w", err)
+		}
+		n.DiversifierIndex = uint32(divIdx)
+		if memo.Valid {
+			n.MemoHex = &memo.String
+		}
+		if confirmed.Valid {
+			n.ConfirmedHeight = &confirmed.Int64
+		}
+		if spentConfirmed.Valid {
+			n.SpentConfirmedHeight = &spentConfirmed.Int64
+		}
+		out = append(out, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: confirm spends: %w", err)
 	}
 	return out, nil
 }

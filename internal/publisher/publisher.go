@@ -127,4 +127,3 @@ func eventKey(walletID string, payload json.RawMessage) string {
 	}
 	return walletID
 }
-

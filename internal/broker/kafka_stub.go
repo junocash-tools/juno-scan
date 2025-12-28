@@ -9,4 +9,3 @@ import (
 func openKafka(Config) (Broker, error) {
 	return nil, errors.New("broker: kafka adapter is not built; rebuild with -tags=kafka")
 }
-

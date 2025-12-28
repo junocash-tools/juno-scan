@@ -100,4 +100,3 @@ func TestPublisher_PublishesAndAdvancesCursor(t *testing.T) {
 		t.Fatalf("expected no additional publishes, got %d", len(br.msgs))
 	}
 }
-

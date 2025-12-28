@@ -19,7 +19,7 @@ type Scanner struct {
 	rpc   *sdkjunocashd.Client
 	uaHRP string
 
-	pollInterval time.Duration
+	pollInterval  time.Duration
 	confirmations int64
 }
 
@@ -40,10 +40,10 @@ func New(st store.Store, rpc *sdkjunocashd.Client, uaHRP string, pollInterval ti
 		confirmations = 100
 	}
 	return &Scanner{
-		st:           st,
-		rpc:          rpc,
-		uaHRP:        uaHRP,
-		pollInterval: pollInterval,
+		st:            st,
+		rpc:           rpc,
+		uaHRP:         uaHRP,
+		pollInterval:  pollInterval,
 		confirmations: confirmations,
 	}, nil
 }
@@ -205,8 +205,41 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 			for _, a := range res.Actions {
 				nullifiers = append(nullifiers, a.ActionNullifier)
 			}
-			if err := tx.MarkNotesSpent(ctx, blk.Height, t.TxID, nullifiers); err != nil {
+			spentNotes, err := tx.MarkNotesSpent(ctx, blk.Height, t.TxID, nullifiers)
+			if err != nil {
 				return err
+			}
+			for _, n := range spentNotes {
+				payload := spendEventPayload{
+					Version:          types.V1,
+					WalletID:         n.WalletID,
+					DiversifierIndex: n.DiversifierIndex,
+					TxID:             t.TxID,
+					Height:           blk.Height,
+					NoteTxID:         n.TxID,
+					NoteActionIndex:  uint32(n.ActionIndex),
+					NoteHeight:       n.Height,
+					AmountZatoshis:   uint64(n.ValueZat),
+					NoteNullifier:    n.NoteNullifier,
+					RecipientAddress: n.RecipientAddress,
+					Status: types.TxStatus{
+						State:         types.TxStateConfirmed,
+						Height:        blk.Height,
+						Confirmations: 1,
+					},
+				}
+				payloadBytes, err := json.Marshal(payload)
+				if err != nil {
+					return fmt.Errorf("scanner: marshal spend payload: %w", err)
+				}
+				if err := tx.InsertEvent(ctx, store.Event{
+					Kind:     "SpendEvent",
+					WalletID: n.WalletID,
+					Height:   blk.Height,
+					Payload:  payloadBytes,
+				}); err != nil {
+					return err
+				}
 			}
 
 			// Record deposits.
@@ -263,6 +296,9 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 		if err := s.confirmDepositConfirmations(ctx, tx, blk.Height); err != nil {
 			return err
 		}
+		if err := s.confirmSpendConfirmations(ctx, tx, blk.Height); err != nil {
+			return err
+		}
 
 		return nil
 	})
@@ -283,13 +319,14 @@ func (s *Scanner) confirmDepositConfirmations(ctx context.Context, tx store.Tx, 
 		confirmations := scanHeight - n.Height + 1
 		if confirmations < 1 {
 			confirmations = 1
-			}
-			payload := depositConfirmedPayload{
-				depositEventPayload: depositEventPayload{
-					DepositEvent: types.DepositEvent{
-						Version:          types.V1,
-						WalletID:         n.WalletID,
-						DiversifierIndex: n.DiversifierIndex,
+		}
+
+		payload := depositConfirmedPayload{
+			depositEventPayload: depositEventPayload{
+				DepositEvent: types.DepositEvent{
+					Version:          types.V1,
+					WalletID:         n.WalletID,
+					DiversifierIndex: n.DiversifierIndex,
 					TxID:             n.TxID,
 					Height:           n.Height,
 					ActionIndex:      uint32(n.ActionIndex),
@@ -322,6 +359,64 @@ func (s *Scanner) confirmDepositConfirmations(ctx context.Context, tx store.Tx, 
 	return nil
 }
 
+func (s *Scanner) confirmSpendConfirmations(ctx context.Context, tx store.Tx, scanHeight int64) error {
+	maxSpentHeight := scanHeight - s.confirmations + 1
+	if maxSpentHeight < 0 {
+		return nil
+	}
+
+	notes, err := tx.ConfirmSpends(ctx, scanHeight, maxSpentHeight)
+	if err != nil {
+		return err
+	}
+
+	for _, n := range notes {
+		if n.SpentHeight == nil || n.SpentTxID == nil {
+			continue
+		}
+		confirmations := scanHeight - *n.SpentHeight + 1
+		if confirmations < 1 {
+			confirmations = 1
+		}
+
+		payload := spendConfirmedPayload{
+			spendEventPayload: spendEventPayload{
+				Version:          types.V1,
+				WalletID:         n.WalletID,
+				DiversifierIndex: n.DiversifierIndex,
+				TxID:             *n.SpentTxID,
+				Height:           *n.SpentHeight,
+				NoteTxID:         n.TxID,
+				NoteActionIndex:  uint32(n.ActionIndex),
+				NoteHeight:       n.Height,
+				AmountZatoshis:   uint64(n.ValueZat),
+				NoteNullifier:    n.NoteNullifier,
+				RecipientAddress: n.RecipientAddress,
+				Status: types.TxStatus{
+					State:         types.TxStateConfirmed,
+					Height:        *n.SpentHeight,
+					Confirmations: confirmations,
+				},
+			},
+			ConfirmedHeight:       scanHeight,
+			RequiredConfirmations: s.confirmations,
+		}
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("scanner: marshal spend confirmed payload: %w", err)
+		}
+		if err := tx.InsertEvent(ctx, store.Event{
+			Kind:     "SpendConfirmed",
+			WalletID: n.WalletID,
+			Height:   scanHeight,
+			Payload:  payloadBytes,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type depositEventPayload struct {
 	types.DepositEvent
 	RecipientAddress string `json:"recipient_address,omitempty"`
@@ -330,6 +425,29 @@ type depositEventPayload struct {
 
 type depositConfirmedPayload struct {
 	depositEventPayload
+	ConfirmedHeight       int64 `json:"confirmed_height"`
+	RequiredConfirmations int64 `json:"required_confirmations"`
+}
+
+type spendEventPayload struct {
+	Version          types.Version `json:"version"`
+	WalletID         string        `json:"wallet_id"`
+	DiversifierIndex uint32        `json:"diversifier_index,omitempty"`
+	TxID             string        `json:"txid"`
+	Height           int64         `json:"height"`
+
+	NoteTxID        string `json:"note_txid"`
+	NoteActionIndex uint32 `json:"note_action_index"`
+	NoteHeight      int64  `json:"note_height"`
+	AmountZatoshis  uint64 `json:"amount_zatoshis"`
+	NoteNullifier   string `json:"note_nullifier,omitempty"`
+
+	RecipientAddress string         `json:"recipient_address,omitempty"`
+	Status           types.TxStatus `json:"status"`
+}
+
+type spendConfirmedPayload struct {
+	spendEventPayload
 	ConfirmedHeight       int64 `json:"confirmed_height"`
 	RequiredConfirmations int64 `json:"required_confirmations"`
 }

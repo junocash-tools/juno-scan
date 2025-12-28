@@ -113,6 +113,27 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 	if len(wit.Paths[0].AuthPath) != 32 {
 		t.Fatalf("expected auth_path length 32, got %d", len(wit.Paths[0].AuthPath))
 	}
+
+	// Spend.
+	toAddr := mustCreateUnifiedAddress(t, ctx, jd)
+	opid2 := mustSendMany(t, ctx, jd, addr, toAddr, 1)
+	mustWaitOpSuccess(t, ctx, jd, opid2)
+	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
+	mustWaitForEventKind(t, ctx, baseURL, "hot", "SpendEvent")
+	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
+	mustWaitForEventKind(t, ctx, baseURL, "hot", "SpendConfirmed")
+
+	allNotes := mustGetNotes(t, ctx, baseURL, "hot", true)
+	foundSpent := false
+	for _, n := range allNotes {
+		if n.SpentHeight != nil {
+			foundSpent = true
+			break
+		}
+	}
+	if !foundSpent {
+		t.Fatalf("expected at least 1 spent note")
+	}
 }
 
 func mustWaitHTTP(t *testing.T, ctx context.Context, url string) {
@@ -175,6 +196,7 @@ type apiNote struct {
 	TxID        string `json:"txid"`
 	ActionIndex int32  `json:"action_index"`
 	Position    *int64 `json:"position,omitempty"`
+	SpentHeight *int64 `json:"spent_height,omitempty"`
 }
 
 func mustGetNotes(t *testing.T, ctx context.Context, baseURL, walletID string, spent bool) []apiNote {
@@ -273,6 +295,24 @@ func mustCreateWalletAndUFVK(t *testing.T, ctx context.Context, jd *testutil.Run
 	return addrResp.Address, ufvk
 }
 
+func mustCreateUnifiedAddress(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd) (addr string) {
+	t.Helper()
+
+	var acc struct {
+		Account int `json:"account"`
+	}
+	mustRunJSON(t, jd.CLICommand(ctx, "z_getnewaccount"), &acc)
+
+	var addrResp struct {
+		Address string `json:"address"`
+	}
+	mustRunJSON(t, jd.CLICommand(ctx, "z_getaddressforaccount", fmt.Sprint(acc.Account)), &addrResp)
+	if addrResp.Address == "" {
+		t.Fatalf("missing address")
+	}
+	return addrResp.Address
+}
+
 func mustCoinbaseAddress(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd) string {
 	t.Helper()
 
@@ -296,6 +336,20 @@ func mustShieldCoinbase(t *testing.T, ctx context.Context, jd *testutil.RunningJ
 		OpID string `json:"opid"`
 	}
 	mustRunJSON(t, jd.CLICommand(ctx, "z_shieldcoinbase", fromAddr, toAddr), &resp)
+	if resp.OpID == "" {
+		t.Fatalf("missing opid")
+	}
+	return resp.OpID
+}
+
+func mustSendMany(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string, amount int) string {
+	t.Helper()
+
+	var resp struct {
+		OpID string `json:"opid"`
+	}
+	recipients := `[{"address":"` + toAddr + `","amount":` + fmt.Sprint(amount) + `}]`
+	mustRunJSON(t, jd.CLICommand(ctx, "z_sendmany", fromAddr, recipients), &resp)
 	if resp.OpID == "" {
 		t.Fatalf("missing opid")
 	}

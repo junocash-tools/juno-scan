@@ -116,11 +116,16 @@ func TestStore_RollbackUnspendsAndDeletes(t *testing.T) {
 		}); err != nil {
 			return err
 		}
-		if err := tx.MarkNotesSpent(ctx, 2, "tx2", []string{"nf_note_1"}); err != nil {
+		if _, err := tx.MarkNotesSpent(ctx, 2, "tx2", []string{"nf_note_1"}); err != nil {
 			return err
 		}
-		_, err := tx.ConfirmNotes(ctx, 2, 1)
-		return err
+		if _, err := tx.ConfirmNotes(ctx, 2, 1); err != nil {
+			return err
+		}
+		if _, err := tx.ConfirmSpends(ctx, 2, 2); err != nil {
+			return err
+		}
+		return nil
 	}); err != nil {
 		t.Fatalf("WithTx spend: %v", err)
 	}
@@ -137,7 +142,7 @@ func TestStore_RollbackUnspendsAndDeletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListWalletNotes(all): %v", err)
 	}
-	if len(allNotes) != 1 || allNotes[0].SpentHeight == nil || *allNotes[0].SpentHeight != 2 || allNotes[0].ConfirmedHeight == nil || *allNotes[0].ConfirmedHeight != 2 {
+	if len(allNotes) != 1 || allNotes[0].SpentHeight == nil || *allNotes[0].SpentHeight != 2 || allNotes[0].ConfirmedHeight == nil || *allNotes[0].ConfirmedHeight != 2 || allNotes[0].SpentConfirmedHeight == nil || *allNotes[0].SpentConfirmedHeight != 2 {
 		t.Fatalf("expected 1 spent note, got %+v", allNotes)
 	}
 
@@ -149,7 +154,7 @@ func TestStore_RollbackUnspendsAndDeletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListWalletNotes(unspent after rollback): %v", err)
 	}
-	if len(unspent) != 1 || unspent[0].SpentHeight != nil || unspent[0].ConfirmedHeight != nil {
+	if len(unspent) != 1 || unspent[0].SpentHeight != nil || unspent[0].ConfirmedHeight != nil || unspent[0].SpentConfirmedHeight != nil {
 		t.Fatalf("expected 1 unspent note after rollback, got %+v", unspent)
 	}
 
