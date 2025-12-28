@@ -182,3 +182,31 @@ pub fn decode_tlv_container(hrp_expected: &str, s: &str) -> Result<Vec<(u64, Vec
     Ok(out)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unified_container_roundtrip_orchard_fvk_len96() {
+        let hrp = "jviewregtest";
+        let typecode = 3u64;
+        let value = [7u8; 96];
+        let s = encode_unified_container(hrp, typecode, &value).expect("encode");
+        let items = decode_tlv_container(hrp, &s).expect("decode");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, typecode);
+        assert_eq!(items[0].1, value.to_vec());
+    }
+
+    #[test]
+    fn unified_container_roundtrip_orchard_addr_len43() {
+        let hrp = "jregtest";
+        let typecode = 3u64;
+        let value = [9u8; 43];
+        let s = encode_unified_container(hrp, typecode, &value).expect("encode");
+        let items = decode_tlv_container(hrp, &s).expect("decode");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, typecode);
+        assert_eq!(items[0].1, value.to_vec());
+    }
+}

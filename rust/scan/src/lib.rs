@@ -11,7 +11,7 @@ use zeroize::Zeroize;
 
 mod zip316;
 
-const HRP_JUNO_UFVK: &str = "jview";
+const HRP_JUNO_UFVK_PREFIX: &str = "jview";
 const TYPECODE_ORCHARD: u64 = 3;
 const ORCHARD_FVK_LEN: usize = 96;
 
@@ -152,7 +152,13 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
             return Err(ScanError::UFVKInvalid);
         }
 
-        let items = zip316::decode_tlv_container(HRP_JUNO_UFVK, w.ufvk.trim())
+        let ufvk = w.ufvk.trim();
+        let (ufvk_hrp, _) = ufvk.split_once('1').ok_or(ScanError::UFVKInvalid)?;
+        if !ufvk_hrp.starts_with(HRP_JUNO_UFVK_PREFIX) {
+            return Err(ScanError::UFVKInvalid);
+        }
+
+        let items = zip316::decode_tlv_container(ufvk_hrp, ufvk)
             .map_err(|_| ScanError::UFVKInvalid)?;
         let orchard_item = items
             .into_iter()
