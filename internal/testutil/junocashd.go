@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -30,6 +31,8 @@ type JunocashdConfig struct {
 
 	RPCUser     string
 	RPCPassword string
+
+	EnableZMQHashBlock bool
 }
 
 type RunningJunocashd struct {
@@ -43,6 +46,8 @@ type RunningJunocashd struct {
 	RPCPassword string
 
 	cliPath string
+
+	ZMQHashBlockEndpoint string
 
 	dockerContainer string
 	dockerDatadir   string
@@ -96,6 +101,15 @@ func StartJunocashd(ctx context.Context, cfg JunocashdConfig) (*RunningJunocashd
 		return nil, err
 	}
 
+	zmqHashBlockEndpoint := ""
+	if cfg.EnableZMQHashBlock {
+		zmqPort, err := freePort()
+		if err != nil {
+			return nil, err
+		}
+		zmqHashBlockEndpoint = fmt.Sprintf("tcp://127.0.0.1:%d", zmqPort)
+	}
+
 	datadir, err := os.MkdirTemp("", "junocashd-regtest-*")
 	if err != nil {
 		return nil, fmt.Errorf("mkdtemp: %w", err)
@@ -116,6 +130,9 @@ func StartJunocashd(ctx context.Context, cfg JunocashdConfig) (*RunningJunocashd
 		fmt.Sprintf("-rpcpassword=%s", rpcPass),
 		fmt.Sprintf("-port=%d", p2pPort),
 	}
+	if zmqHashBlockEndpoint != "" {
+		args = append(args, fmt.Sprintf("-zmqpubhashblock=%s", zmqHashBlockEndpoint))
+	}
 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = datadir
@@ -133,13 +150,14 @@ func StartJunocashd(ctx context.Context, cfg JunocashdConfig) (*RunningJunocashd
 	}
 
 	r := &RunningJunocashd{
-		cmd:         cmd,
-		Datadir:     datadir,
-		RPCURL:      fmt.Sprintf("http://127.0.0.1:%d", rpcPort),
-		RPCPort:     rpcPort,
-		RPCUser:     rpcUser,
-		RPCPassword: rpcPass,
-		cliPath:     cli,
+		cmd:                  cmd,
+		Datadir:              datadir,
+		RPCURL:               fmt.Sprintf("http://127.0.0.1:%d", rpcPort),
+		RPCPort:              rpcPort,
+		RPCUser:              rpcUser,
+		RPCPassword:          rpcPass,
+		cliPath:              cli,
+		ZMQHashBlockEndpoint: zmqHashBlockEndpoint,
 	}
 
 	if err := r.waitForRPC(ctx, 25*time.Second); err != nil {
@@ -189,16 +207,17 @@ func connectExternalJunocashd(ctx context.Context, rpcURL string) (*RunningJunoc
 	}
 
 	r := &RunningJunocashd{
-		cmd:             nil,
-		Datadir:         datadir,
-		RPCURL:          (&url.URL{Scheme: parsed.Scheme, Host: hostPort}).String(),
-		RPCPort:         rpcPort,
-		RPCUser:         rpcUser,
-		RPCPassword:     rpcPass,
-		cliPath:         "junocash-cli",
-		dockerContainer: container,
-		dockerDatadir:   datadir,
-		dockerRPCPort:   internalRPCPort,
+		cmd:                  nil,
+		Datadir:              datadir,
+		RPCURL:               (&url.URL{Scheme: parsed.Scheme, Host: hostPort}).String(),
+		RPCPort:              rpcPort,
+		RPCUser:              rpcUser,
+		RPCPassword:          rpcPass,
+		cliPath:              "junocash-cli",
+		ZMQHashBlockEndpoint: strings.TrimSpace(os.Getenv("JUNO_TEST_ZMQ_HASHBLOCK")),
+		dockerContainer:      container,
+		dockerDatadir:        datadir,
+		dockerRPCPort:        internalRPCPort,
 	}
 
 	if err := r.waitForRPC(ctx, 25*time.Second); err != nil {
