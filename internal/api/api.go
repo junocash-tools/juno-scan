@@ -10,19 +10,18 @@ import (
 	"time"
 
 	"github.com/Abdullah1738/juno-scan/internal/orchardscan"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/Abdullah1738/juno-scan/internal/store"
 )
 
 type Server struct {
-	db *pgxpool.Pool
+	st store.Store
 }
 
-func New(db *pgxpool.Pool) (*Server, error) {
-	if db == nil {
-		return nil, errors.New("api: db is nil")
+func New(st store.Store) (*Server, error) {
+	if st == nil {
+		return nil, errors.New("api: store is nil")
 	}
-	return &Server{db: db}, nil
+	return &Server{st: st}, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -47,16 +46,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status": "ok",
 	}
 
-	var tipHeight int64
-	var tipHash string
-	if err := s.db.QueryRow(ctx, `SELECT height, hash FROM blocks ORDER BY height DESC LIMIT 1`).Scan(&tipHeight, &tipHash); err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			http.Error(w, "db error", http.StatusInternalServerError)
-			return
-		}
-	} else {
-		resp["scanned_height"] = tipHeight
-		resp["scanned_hash"] = tipHash
+	if tip, ok, err := s.st.Tip(ctx); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	} else if ok {
+		resp["scanned_height"] = tip.Height
+		resp["scanned_hash"] = tip.Hash
 	}
 
 	writeJSON(w, resp)
@@ -117,13 +112,7 @@ func (s *Server) handleUpsertWallet(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	_, err := s.db.Exec(ctx, `
-INSERT INTO wallets (wallet_id, ufvk, disabled_at)
-VALUES ($1, $2, NULL)
-ON CONFLICT (wallet_id)
-DO UPDATE SET ufvk = EXCLUDED.ufvk, disabled_at = NULL
-`, req.WalletID, req.UFVK)
-	if err != nil {
+	if err := s.st.UpsertWallet(ctx, req.WalletID, req.UFVK); err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
@@ -135,30 +124,25 @@ func (s *Server) handleListWallets(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	rows, err := s.db.Query(ctx, `SELECT wallet_id, created_at, disabled_at FROM wallets ORDER BY wallet_id`)
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
 	type wallet struct {
 		WalletID   string     `json:"wallet_id"`
 		CreatedAt  time.Time  `json:"created_at"`
 		DisabledAt *time.Time `json:"disabled_at,omitempty"`
 	}
-	var out []wallet
-	for rows.Next() {
-		var w0 wallet
-		if err := rows.Scan(&w0.WalletID, &w0.CreatedAt, &w0.DisabledAt); err != nil {
-			http.Error(w, "db error", http.StatusInternalServerError)
-			return
-		}
-		out = append(out, w0)
-	}
-	if err := rows.Err(); err != nil {
+
+	wallets, err := s.st.ListWallets(ctx)
+	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
+	}
+
+	out := make([]wallet, 0, len(wallets))
+	for _, w0 := range wallets {
+		out = append(out, wallet{
+			WalletID:   w0.WalletID,
+			CreatedAt:  w0.CreatedAt,
+			DisabledAt: w0.DisabledAt,
+		})
 	}
 
 	writeJSON(w, map[string]any{"wallets": out})
@@ -183,19 +167,6 @@ func (s *Server) handleListWalletEvents(w http.ResponseWriter, r *http.Request, 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	rows, err := s.db.Query(ctx, `
-SELECT id, kind, height, payload, created_at
-FROM events
-WHERE wallet_id = $1 AND id > $2
-ORDER BY id
-LIMIT $3
-`, walletID, cursor, limit)
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
 	type event struct {
 		ID        int64           `json:"id"`
 		Kind      string          `json:"kind"`
@@ -203,20 +174,22 @@ LIMIT $3
 		Payload   json.RawMessage `json:"payload"`
 		CreatedAt time.Time       `json:"created_at"`
 	}
-	var events []event
-	var nextCursor int64 = cursor
-	for rows.Next() {
-		var e event
-		if err := rows.Scan(&e.ID, &e.Kind, &e.Height, &e.Payload, &e.CreatedAt); err != nil {
-			http.Error(w, "db error", http.StatusInternalServerError)
-			return
-		}
-		nextCursor = e.ID
-		events = append(events, e)
-	}
-	if err := rows.Err(); err != nil {
+
+	evs, nextCursor, err := s.st.ListWalletEvents(ctx, walletID, cursor, int(limit))
+	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
+	}
+
+	events := make([]event, 0, len(evs))
+	for _, e := range evs {
+		events = append(events, event{
+			ID:        e.ID,
+			Kind:      e.Kind,
+			Height:    e.Height,
+			Payload:   e.Payload,
+			CreatedAt: e.CreatedAt,
+		})
 	}
 
 	writeJSON(w, map[string]any{
@@ -241,23 +214,6 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	query := `
-SELECT txid, action_index, height, position, recipient_address, value_zat, note_nullifier, spent_height, spent_txid, created_at
-FROM notes
-WHERE wallet_id = $1
-`
-	if onlyUnspent {
-		query += " AND spent_height IS NULL"
-	}
-	query += " ORDER BY height, txid, action_index LIMIT 1000"
-
-	rows, err := s.db.Query(ctx, query, walletID)
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
 	type note struct {
 		TxID          string    `json:"txid"`
 		ActionIndex   int32     `json:"action_index"`
@@ -271,29 +227,26 @@ WHERE wallet_id = $1
 		CreatedAt     time.Time `json:"created_at"`
 	}
 
-	var notes []note
-	for rows.Next() {
-		var n note
-		if err := rows.Scan(
-			&n.TxID,
-			&n.ActionIndex,
-			&n.Height,
-			&n.Position,
-			&n.Recipient,
-			&n.ValueZat,
-			&n.NoteNullifier,
-			&n.SpentHeight,
-			&n.SpentTxID,
-			&n.CreatedAt,
-		); err != nil {
-			http.Error(w, "db error", http.StatusInternalServerError)
-			return
-		}
-		notes = append(notes, n)
-	}
-	if err := rows.Err(); err != nil {
+	ns, err := s.st.ListWalletNotes(ctx, walletID, onlyUnspent, 1000)
+	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
+	}
+
+	notes := make([]note, 0, len(ns))
+	for _, n := range ns {
+		notes = append(notes, note{
+			TxID:          n.TxID,
+			ActionIndex:   n.ActionIndex,
+			Height:        n.Height,
+			Position:      n.Position,
+			Recipient:     n.RecipientAddress,
+			ValueZat:      n.ValueZat,
+			NoteNullifier: n.NoteNullifier,
+			SpentHeight:   n.SpentHeight,
+			SpentTxID:     n.SpentTxID,
+			CreatedAt:     n.CreatedAt,
+		})
 	}
 
 	writeJSON(w, map[string]any{"notes": notes})
@@ -327,55 +280,42 @@ func (s *Server) handleOrchardWitness(w http.ResponseWriter, r *http.Request) {
 	if req.AnchorHeight != nil {
 		anchorHeight = *req.AnchorHeight
 	} else {
-		if err := s.db.QueryRow(ctx, `SELECT height FROM blocks ORDER BY height DESC LIMIT 1`).Scan(&anchorHeight); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				http.Error(w, "no scanned blocks", http.StatusBadRequest)
-				return
-			}
+		tip, ok, err := s.st.Tip(ctx)
+		if err != nil {
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
 		}
+		if !ok {
+			http.Error(w, "no scanned blocks", http.StatusBadRequest)
+			return
+		}
+		anchorHeight = tip.Height
 	}
 	if anchorHeight < 0 {
 		http.Error(w, "anchor_height must be >= 0", http.StatusBadRequest)
 		return
 	}
 
-	rows, err := s.db.Query(ctx, `
-SELECT position, cmx
-FROM orchard_commitments
-WHERE height <= $1
-ORDER BY position
-`, anchorHeight)
+	commitments, err := s.st.ListOrchardCommitmentsUpToHeight(ctx, anchorHeight)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
-	defer rows.Close()
+
+	if len(commitments) == 0 {
+		http.Error(w, "no commitments", http.StatusBadRequest)
+		return
+	}
 
 	var expectedPos int64 = 0
-	cmxHex := make([]string, 0, 1024)
-	for rows.Next() {
-		var pos int64
-		var cmx string
-		if err := rows.Scan(&pos, &cmx); err != nil {
-			http.Error(w, "db error", http.StatusInternalServerError)
-			return
-		}
-		if pos != expectedPos {
+	cmxHex := make([]string, 0, len(commitments))
+	for _, c := range commitments {
+		if c.Position != expectedPos {
 			http.Error(w, "invalid commitment positions", http.StatusInternalServerError)
 			return
 		}
 		expectedPos++
-		cmxHex = append(cmxHex, cmx)
-	}
-	if err := rows.Err(); err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-	if len(cmxHex) == 0 {
-		http.Error(w, "no commitments", http.StatusBadRequest)
-		return
+		cmxHex = append(cmxHex, c.CMX)
 	}
 
 	res, err := orchardscan.OrchardWitness(ctx, cmxHex, req.Positions)
