@@ -59,13 +59,13 @@ type Block struct {
 }
 
 type OrchardAction struct {
-	Height         int64
-	TxID           string
-	ActionIndex    int32
+	Height          int64
+	TxID            string
+	ActionIndex     int32
 	ActionNullifier string
-	CMX            string
-	EphemeralKey   string
-	EncCiphertext  string
+	CMX             string
+	EphemeralKey    string
+	EncCiphertext   string
 }
 
 type OrchardCommitment struct {
@@ -98,4 +98,3 @@ type Event struct {
 	Payload   json.RawMessage
 	CreatedAt time.Time
 }
-
