@@ -66,7 +66,38 @@ func TestScanner_DepositDetected(t *testing.T) {
 
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 
-	waitForEvent(t, ctx, st, "hot")
+	deposit := waitForEventKind(t, ctx, st, "hot", "DepositEvent")
+
+	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
+
+	confirmed := waitForEventKind(t, ctx, st, "hot", "DepositConfirmed")
+
+	var confirmedPayload struct {
+		TxID                 string `json:"txid"`
+		RequiredConfirmations int64  `json:"required_confirmations"`
+		ConfirmedHeight      int64  `json:"confirmed_height"`
+		Status               struct {
+			Confirmations int64 `json:"confirmations"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(confirmed.Payload, &confirmedPayload); err != nil {
+		t.Fatalf("unmarshal confirmed payload: %v", err)
+	}
+	if confirmedPayload.TxID == "" {
+		t.Fatalf("missing txid in confirmed payload")
+	}
+	if confirmedPayload.TxID != mustTxIDFromPayload(t, deposit.Payload) {
+		t.Fatalf("confirmed txid mismatch")
+	}
+	if confirmedPayload.RequiredConfirmations != 2 {
+		t.Fatalf("required_confirmations=%d want 2", confirmedPayload.RequiredConfirmations)
+	}
+	if confirmedPayload.Status.Confirmations != 2 {
+		t.Fatalf("status.confirmations=%d want 2", confirmedPayload.Status.Confirmations)
+	}
+	if confirmedPayload.ConfirmedHeight <= 0 {
+		t.Fatalf("invalid confirmed_height=%d", confirmedPayload.ConfirmedHeight)
+	}
 }
 
 func mustCreateWalletAndUFVK(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd) (addr string, ufvk string) {
@@ -144,7 +175,7 @@ func mustWaitOpSuccess(t *testing.T, ctx context.Context, jd *testutil.RunningJu
 	t.Fatalf("operation did not succeed: %s", opid)
 }
 
-func waitForEvent(t *testing.T, ctx context.Context, st store.Store, walletID string) {
+func waitForEventKind(t *testing.T, ctx context.Context, st store.Store, walletID string, kind string) store.Event {
 	t.Helper()
 
 	deadline, ok := ctx.Deadline()
@@ -154,12 +185,29 @@ func waitForEvent(t *testing.T, ctx context.Context, st store.Store, walletID st
 
 	for time.Now().Before(deadline) {
 		events, _, err := st.ListWalletEvents(ctx, walletID, 0, 10)
-		if err == nil && len(events) > 0 {
-			return
+		if err == nil {
+			for _, e := range events {
+				if e.Kind == kind {
+					return e
+				}
+			}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("deposit event not found")
+	t.Fatalf("%s not found", kind)
+	return store.Event{}
+}
+
+func mustTxIDFromPayload(t *testing.T, payload json.RawMessage) string {
+	t.Helper()
+
+	var out struct {
+		TxID string `json:"txid"`
+	}
+	if err := json.Unmarshal(payload, &out); err != nil || out.TxID == "" {
+		t.Fatalf("missing txid in payload: %v", err)
+	}
+	return out.TxID
 }
 
 func mustRun(t *testing.T, cmd *exec.Cmd) []byte {

@@ -55,6 +55,7 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 		"-rpc-pass", jd.RPCPassword,
 		"-ua-hrp", uaHRP,
 		"-poll-interval", "100ms",
+		"-confirmations", "2",
 	)
 	cmd.Env = append(os.Environ(), "JUNO_TEST_LOG="+os.Getenv("JUNO_TEST_LOG"))
 	if os.Getenv("JUNO_TEST_LOG") != "" {
@@ -89,7 +90,10 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 	mustWaitOpSuccess(t, ctx, jd, opid)
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 
-	mustWaitForDepositEvent(t, ctx, baseURL, "hot")
+	mustWaitForEventKind(t, ctx, baseURL, "hot", "DepositEvent")
+
+	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
+	mustWaitForEventKind(t, ctx, baseURL, "hot", "DepositConfirmed")
 
 	notes := mustGetNotes(t, ctx, baseURL, "hot", false)
 	if len(notes) == 0 || notes[0].Position == nil {
@@ -133,7 +137,7 @@ func mustWaitHTTP(t *testing.T, ctx context.Context, url string) {
 	t.Fatalf("timeout waiting for %s", url)
 }
 
-func mustWaitForDepositEvent(t *testing.T, ctx context.Context, baseURL, walletID string) {
+func mustWaitForEventKind(t *testing.T, ctx context.Context, baseURL, walletID, kind string) {
 	t.Helper()
 
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -154,7 +158,7 @@ func mustWaitForDepositEvent(t *testing.T, ctx context.Context, baseURL, walletI
 			_ = json.NewDecoder(resp.Body).Decode(&payload)
 			_ = resp.Body.Close()
 			for _, e := range payload.Events {
-				if e.Kind == "deposit" {
+				if e.Kind == kind {
 					return
 				}
 			}
@@ -164,7 +168,7 @@ func mustWaitForDepositEvent(t *testing.T, ctx context.Context, baseURL, walletI
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	t.Fatalf("deposit event not found via API")
+	t.Fatalf("%s not found via API", kind)
 }
 
 type apiNote struct {
