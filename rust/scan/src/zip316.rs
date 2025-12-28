@@ -125,8 +125,8 @@ fn encode_zip316_bech32m(hrp: &str, raw_items_tlv: &[u8]) -> Result<String, Zip3
 }
 
 fn decode_zip316_bech32m(hrp_expected: &str, s: &str) -> Result<Vec<u8>, Zip316Error> {
-    let checked =
-        CheckedHrpstring::new::<Bech32mUnlimited>(s).map_err(|_| Zip316Error::Bech32DecodeFailed)?;
+    let checked = CheckedHrpstring::new::<Bech32mUnlimited>(s)
+        .map_err(|_| Zip316Error::Bech32DecodeFailed)?;
 
     if checked.hrp().as_str() != hrp_expected {
         return Err(Zip316Error::HrpMismatch);
@@ -160,12 +160,19 @@ pub fn encode_tlv_container(hrp: &str, items: &[Tlv<'_>]) -> Result<String, Zip3
     encode_zip316_bech32m(hrp, &payload)
 }
 
-pub fn encode_unified_container(hrp: &str, typecode: u64, value: &[u8]) -> Result<String, Zip316Error> {
+pub fn encode_unified_container(
+    hrp: &str,
+    typecode: u64,
+    value: &[u8],
+) -> Result<String, Zip316Error> {
     let items = [Tlv { typecode, value }];
     encode_tlv_container(hrp, &items)
 }
 
-pub fn decode_tlv_container(hrp_expected: &str, s: &str) -> Result<Vec<(u64, Vec<u8>)>, Zip316Error> {
+pub fn decode_tlv_container(
+    hrp_expected: &str,
+    s: &str,
+) -> Result<Vec<(u64, Vec<u8>)>, Zip316Error> {
     let bytes = decode_zip316_bech32m(hrp_expected, s)?;
     let mut rest = bytes.as_slice();
     let mut out = Vec::new();

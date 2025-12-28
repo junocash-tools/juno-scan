@@ -29,6 +29,7 @@ type Note struct {
 	DiversifierIndex uint32
 	RecipientAddress string
 	ValueZat         uint64
+	MemoHex          string
 	NoteNullifier    string
 }
 
@@ -117,6 +118,7 @@ func ScanTx(ctx context.Context, uaHRP string, wallets []Wallet, txHex string) (
 				DiversifierIndex: n.DiversifierIndex,
 				RecipientAddress: n.RecipientAddress,
 				ValueZat:         v,
+				MemoHex:          n.MemoHex,
 				NoteNullifier:    n.NoteNullifier,
 			})
 		}
@@ -163,5 +165,6 @@ type noteOut struct {
 	DiversifierIndex uint32 `json:"diversifier_index"`
 	RecipientAddress string `json:"recipient_address"`
 	ValueZat         string `json:"value_zat"`
+	MemoHex          string `json:"memo_hex,omitempty"`
 	NoteNullifier    string `json:"note_nullifier"`
 }

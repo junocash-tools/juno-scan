@@ -246,6 +246,11 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 			for _, n := range res.Notes {
 				pos := posByTxAction[t.TxID][n.ActionIndex]
 				posCopy := pos
+				var memoHexPtr *string
+				if n.MemoHex != "" {
+					memo := n.MemoHex
+					memoHexPtr = &memo
+				}
 				if err := tx.InsertNote(ctx, store.Note{
 					WalletID:         n.WalletID,
 					TxID:             t.TxID,
@@ -255,6 +260,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 					DiversifierIndex: n.DiversifierIndex,
 					RecipientAddress: n.RecipientAddress,
 					ValueZat:         int64(n.ValueZat),
+					MemoHex:          memoHexPtr,
 					NoteNullifier:    n.NoteNullifier,
 				}); err != nil {
 					return err
@@ -269,6 +275,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 						Height:           blk.Height,
 						ActionIndex:      n.ActionIndex,
 						AmountZatoshis:   n.ValueZat,
+						MemoHex:          n.MemoHex,
 						Status: types.TxStatus{
 							State:         types.TxStateConfirmed,
 							Height:        blk.Height,
@@ -316,6 +323,10 @@ func (s *Scanner) confirmDepositConfirmations(ctx context.Context, tx store.Tx, 
 	}
 
 	for _, n := range notes {
+		memoHex := ""
+		if n.MemoHex != nil {
+			memoHex = *n.MemoHex
+		}
 		confirmations := scanHeight - n.Height + 1
 		if confirmations < 1 {
 			confirmations = 1
@@ -331,6 +342,7 @@ func (s *Scanner) confirmDepositConfirmations(ctx context.Context, tx store.Tx, 
 					Height:           n.Height,
 					ActionIndex:      uint32(n.ActionIndex),
 					AmountZatoshis:   uint64(n.ValueZat),
+					MemoHex:          memoHex,
 					Status: types.TxStatus{
 						State:         types.TxStateConfirmed,
 						Height:        n.Height,

@@ -139,6 +139,77 @@ func TestScanner_DepositDetected(t *testing.T) {
 	}
 }
 
+func TestScanner_DepositMemoExtracted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	st, err := rocksdb.Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	jd, err := testutil.StartJunocashd(ctx, testutil.JunocashdConfig{})
+	if err != nil {
+		if errors.Is(err, testutil.ErrJunocashdNotFound) || errors.Is(err, testutil.ErrJunocashCLIOnPath) || errors.Is(err, testutil.ErrListenNotAllowed) {
+			t.Skip(err.Error())
+		}
+		t.Fatalf("StartJunocashd: %v", err)
+	}
+	defer func() { _ = jd.Stop(context.Background()) }()
+
+	addr, ufvk := mustCreateWalletAndUFVK(t, ctx, jd)
+	uaHRP := strings.SplitN(addr, "1", 2)[0]
+
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if err := st.UpsertWallet(ctx, "hot", ufvk); err != nil {
+		t.Fatalf("UpsertWallet: %v", err)
+	}
+
+	rpc := sdkjunocashd.New(jd.RPCURL, jd.RPCUser, jd.RPCPassword)
+	sc, err := scanner.New(st, rpc, uaHRP, 100*time.Millisecond, 1)
+	if err != nil {
+		t.Fatalf("scanner.New: %v", err)
+	}
+	go func() { _ = sc.Run(ctx) }()
+
+	mustRun(t, jd.CLICommand(ctx, "generate", "101"))
+	fromAddr := mustCoinbaseAddress(t, ctx, jd)
+
+	// A memo of "00" (padded by the node) should be detectable (not the "no memo" marker 0xF6).
+	opid := mustSendManyWithMemo(t, ctx, jd, fromAddr, addr, 1, "00")
+	mustWaitOpSuccess(t, ctx, jd, opid)
+	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
+
+	deposit := waitForEventKind(t, ctx, st, "hot", "DepositEvent")
+
+	var payload struct {
+		MemoHex string `json:"memo_hex"`
+	}
+	if err := json.Unmarshal(deposit.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal deposit payload: %v", err)
+	}
+	if payload.MemoHex == "" {
+		t.Fatalf("expected memo_hex in deposit payload")
+	}
+	if !strings.HasPrefix(payload.MemoHex, "00") {
+		t.Fatalf("unexpected memo_hex prefix: %q", payload.MemoHex[:min(8, len(payload.MemoHex))])
+	}
+
+	confirmed := waitForEventKind(t, ctx, st, "hot", "DepositConfirmed")
+	var confirmedPayload struct {
+		MemoHex string `json:"memo_hex"`
+	}
+	if err := json.Unmarshal(confirmed.Payload, &confirmedPayload); err != nil {
+		t.Fatalf("unmarshal confirmed payload: %v", err)
+	}
+	if confirmedPayload.MemoHex != payload.MemoHex {
+		t.Fatalf("confirmed memo mismatch")
+	}
+}
+
 func mustCreateWalletAndUFVK(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd) (addr string, ufvk string) {
 	t.Helper()
 
@@ -217,6 +288,20 @@ func mustSendMany(t *testing.T, ctx context.Context, jd *testutil.RunningJunocas
 		OpID string `json:"opid"`
 	}
 	recipients := `[{"address":"` + toAddr + `","amount":` + strconvI(amount) + `}]`
+	mustRunJSON(t, jd.CLICommand(ctx, "z_sendmany", fromAddr, recipients), &resp)
+	if resp.OpID == "" {
+		t.Fatalf("missing opid")
+	}
+	return resp.OpID
+}
+
+func mustSendManyWithMemo(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string, amount int, memoHex string) string {
+	t.Helper()
+
+	var resp struct {
+		OpID string `json:"opid"`
+	}
+	recipients := `[{"address":"` + toAddr + `","amount":` + strconvI(amount) + `,"memo":"` + memoHex + `"}]`
 	mustRunJSON(t, jd.CLICommand(ctx, "z_sendmany", fromAddr, recipients), &resp)
 	if resp.OpID == "" {
 		t.Fatalf("missing opid")

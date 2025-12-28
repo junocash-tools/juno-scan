@@ -1,14 +1,14 @@
 use core::ffi::c_char;
 
-use orchard::keys::{FullViewingKey, Scope};
-use orchard::note_encryption::{CompactAction, OrchardDomain};
-use orchard::note::ExtractedNoteCommitment;
-use orchard::tree::MerkleHashOrchard;
 use incrementalmerkletree::frontier::CommitmentTree;
 use incrementalmerkletree::witness::IncrementalWitness;
+use orchard::keys::{FullViewingKey, Scope};
+use orchard::note::ExtractedNoteCommitment;
+use orchard::note_encryption::{CompactAction, OrchardDomain};
+use orchard::tree::MerkleHashOrchard;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use zcash_note_encryption::{batch, ShieldedOutput};
+use zcash_note_encryption::{batch, try_note_decryption, ShieldedOutput};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::BranchId;
 use zeroize::Zeroize;
@@ -74,6 +74,8 @@ struct NoteOut {
     diversifier_index: u32,
     recipient_address: String,
     value_zat: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memo_hex: Option<String>,
     note_nullifier: String,
 }
 
@@ -172,7 +174,8 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
     }
 
     let mut tx_bytes = hex::decode(req.tx_hex.trim()).map_err(|_| ScanError::TxHexInvalid)?;
-    let tx = Transaction::read(&tx_bytes[..], BranchId::Nu6_1).map_err(|_| ScanError::TxParseFailed)?;
+    let tx =
+        Transaction::read(&tx_bytes[..], BranchId::Nu6_1).map_err(|_| ScanError::TxParseFailed)?;
     tx_bytes.zeroize();
 
     let orchard_bundle = match tx.orchard_bundle() {
@@ -202,8 +205,8 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
             return Err(ScanError::UFVKInvalid);
         }
 
-        let items = zip316::decode_tlv_container(ufvk_hrp, ufvk)
-            .map_err(|_| ScanError::UFVKInvalid)?;
+        let items =
+            zip316::decode_tlv_container(ufvk_hrp, ufvk).map_err(|_| ScanError::UFVKInvalid)?;
         let orchard_item = items
             .into_iter()
             .find(|(typecode, _)| *typecode == TYPECODE_ORCHARD)
@@ -216,7 +219,8 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
         let mut fvk_bytes = [0u8; ORCHARD_FVK_LEN];
         fvk_bytes.copy_from_slice(&orchard_item.1);
 
-        let fvk = FullViewingKey::from_bytes(&fvk_bytes).ok_or(ScanError::UFVKOrchardFVKBytesInvalid)?;
+        let fvk =
+            FullViewingKey::from_bytes(&fvk_bytes).ok_or(ScanError::UFVKOrchardFVKBytesInvalid)?;
         fvk_bytes.zeroize();
 
         let widx = wallet_ids.len();
@@ -269,9 +273,7 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
             continue;
         };
 
-        let wallet_index = *ivk_wallet_index
-            .get(ivk_index)
-            .ok_or(ScanError::Internal)?;
+        let wallet_index = *ivk_wallet_index.get(ivk_index).ok_or(ScanError::Internal)?;
         let wallet_id = wallet_ids
             .get(wallet_index)
             .ok_or(ScanError::Internal)?
@@ -284,10 +286,20 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
             .unwrap_or(0);
 
         let addr_bytes = recipient.to_raw_address_bytes();
-        let recipient_address = zip316::encode_unified_container(&ua_hrp, TYPECODE_ORCHARD, &addr_bytes)
-            .map_err(|_| ScanError::UAHrpInvalid)?;
+        let recipient_address =
+            zip316::encode_unified_container(&ua_hrp, TYPECODE_ORCHARD, &addr_bytes)
+                .map_err(|_| ScanError::UAHrpInvalid)?;
 
         let nf = note.nullifier(&fvks[wallet_index]).to_bytes();
+        let action = orchard_bundle
+            .actions()
+            .get(action_index)
+            .ok_or(ScanError::Internal)?;
+        let domain = OrchardDomain::for_action(action);
+        let memo_hex = match try_note_decryption(&domain, &ivks[ivk_index], action) {
+            Some((_, _, memo)) if !is_empty_memo(&memo) => Some(hex::encode(memo)),
+            _ => None,
+        };
 
         notes_out.push(NoteOut {
             wallet_id,
@@ -295,6 +307,7 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
             diversifier_index: di,
             recipient_address,
             value_zat: note.value().inner().to_string(),
+            memo_hex,
             note_nullifier: hex::encode(nf),
         });
     }
@@ -397,4 +410,8 @@ fn parse_hex_32(s: &str) -> Result<[u8; 32], ()> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&b);
     Ok(out)
+}
+
+fn is_empty_memo(memo: &[u8; 512]) -> bool {
+    memo[0] == 0xF6 && memo[1..].iter().all(|b| *b == 0)
 }
