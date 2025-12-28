@@ -1,4 +1,4 @@
-.PHONY: build rust-build rust-test test test-unit test-integration test-e2e fmt tidy clean docker-up docker-down test-docker
+.PHONY: build rust-build rust-test test test-unit test-integration test-integration-docker test-e2e fmt tidy clean docker-up docker-down test-docker
 
 BIN_DIR := bin
 BIN := $(BIN_DIR)/juno-scan
@@ -29,6 +29,9 @@ test-unit:
 
 test-integration: rust-build
 	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=integration ./...
+
+test-integration-docker: rust-build
+	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=integration,kafka,nats,rabbitmq ./...
 
 test-e2e: build
 	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=e2e ./...
