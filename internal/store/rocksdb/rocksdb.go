@@ -346,6 +346,52 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 	return nil
 }
 
+func (s *Store) WalletEventPublishCursor(ctx context.Context, walletID string) (int64, error) {
+	_ = ctx
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	v, closer, err := s.db.Get(keyMeta("publish_cursor/" + walletID))
+	if err == nil {
+		if len(v) != 8 {
+			_ = closer.Close()
+			return 0, errors.New("rocksdb: publish cursor corrupt")
+		}
+		n := binary.BigEndian.Uint64(v)
+		_ = closer.Close()
+		if n > uint64(^uint64(0)>>1) {
+			return 0, errors.New("rocksdb: publish cursor overflow")
+		}
+		return int64(n), nil
+	}
+	if errors.Is(err, pebble.ErrNotFound) {
+		return 0, nil
+	}
+	return 0, fmt.Errorf("rocksdb: get publish cursor: %w", err)
+}
+
+func (s *Store) SetWalletEventPublishCursor(ctx context.Context, walletID string, cursor int64) error {
+	_ = ctx
+	if cursor < 0 {
+		cursor = 0
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	b := s.db.NewBatch()
+	defer b.Close()
+
+	if err := b.Set(keyMeta("publish_cursor/"+walletID), uint64To8(uint64(cursor)), pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: set publish cursor: %w", err)
+	}
+	if err := b.Commit(pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: set publish cursor commit: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int) ([]store.Event, int64, error) {
 	_ = ctx
 	if limit <= 0 || limit > 1000 {

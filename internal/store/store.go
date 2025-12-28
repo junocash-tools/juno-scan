@@ -20,6 +20,9 @@ type Store interface {
 	HashAtHeight(ctx context.Context, height int64) (string, bool, error)
 	RollbackToHeight(ctx context.Context, height int64) error
 
+	WalletEventPublishCursor(ctx context.Context, walletID string) (int64, error)
+	SetWalletEventPublishCursor(ctx context.Context, walletID string, cursor int64) error
+
 	ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int) (events []Event, nextCursor int64, err error)
 	ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]Note, error)
 	ListOrchardCommitmentsUpToHeight(ctx context.Context, height int64) ([]OrchardCommitment, error)

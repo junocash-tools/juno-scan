@@ -191,6 +191,30 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 	})
 }
 
+func (s *Store) WalletEventPublishCursor(ctx context.Context, walletID string) (int64, error) {
+	var cursor int64
+	if err := s.pool.QueryRow(ctx, `SELECT cursor FROM wallet_event_publish_cursors WHERE wallet_id = $1`, walletID).Scan(&cursor); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("postgres: get publish cursor: %w", err)
+	}
+	return cursor, nil
+}
+
+func (s *Store) SetWalletEventPublishCursor(ctx context.Context, walletID string, cursor int64) error {
+	_, err := s.pool.Exec(ctx, `
+INSERT INTO wallet_event_publish_cursors (wallet_id, cursor)
+VALUES ($1, $2)
+ON CONFLICT (wallet_id)
+DO UPDATE SET cursor = EXCLUDED.cursor, updated_at = now()
+`, walletID, cursor)
+	if err != nil {
+		return fmt.Errorf("postgres: set publish cursor: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int) ([]store.Event, int64, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100

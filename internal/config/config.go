@@ -21,6 +21,12 @@ type Config struct {
 	UAHRP        string
 	PollInterval time.Duration
 	Confirmations int64
+
+	BrokerDriver      string
+	BrokerURL         string
+	BrokerTopic       string
+	BrokerPollInterval time.Duration
+	BrokerBatchSize   int
 }
 
 func FromFlags() Config {
@@ -44,6 +50,12 @@ func FromFlags() Config {
 	flag.StringVar(&cfg.UAHRP, "ua-hrp", getenv("JUNO_SCAN_UA_HRP", "j"), "Unified address HRP (e.g. j, jregtest)")
 	flag.DurationVar(&cfg.PollInterval, "poll-interval", getenvDuration("JUNO_SCAN_POLL_INTERVAL", 2*time.Second), "Poll interval for new blocks (when ZMQ is not used)")
 	flag.Int64Var(&cfg.Confirmations, "confirmations", getenvInt64("JUNO_SCAN_CONFIRMATIONS", 100), "Confirmations required for DepositConfirmed event")
+
+	flag.StringVar(&cfg.BrokerDriver, "broker-driver", getenv("JUNO_SCAN_BROKER_DRIVER", "none"), "Message broker driver (none, kafka, nats, rabbitmq)")
+	flag.StringVar(&cfg.BrokerURL, "broker-url", getenv("JUNO_SCAN_BROKER_URL", ""), "Message broker URL/DSN")
+	flag.StringVar(&cfg.BrokerTopic, "broker-topic", getenv("JUNO_SCAN_BROKER_TOPIC", "juno.scan.events"), "Message broker topic/subject/queue name")
+	flag.DurationVar(&cfg.BrokerPollInterval, "broker-poll-interval", getenvDuration("JUNO_SCAN_BROKER_POLL_INTERVAL", 500*time.Millisecond), "Broker outbox poll interval")
+	flag.IntVar(&cfg.BrokerBatchSize, "broker-batch-size", getenvInt("JUNO_SCAN_BROKER_BATCH_SIZE", 1000), "Broker outbox batch size")
 
 	flag.Parse()
 
@@ -73,6 +85,15 @@ func getenvDuration(key string, def time.Duration) time.Duration {
 func getenvInt64(key string, def int64) int64 {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func getenvInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
 	}

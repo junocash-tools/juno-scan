@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/Abdullah1738/juno-scan/internal/api"
+	"github.com/Abdullah1738/juno-scan/internal/broker"
 	"github.com/Abdullah1738/juno-scan/internal/config"
+	"github.com/Abdullah1738/juno-scan/internal/publisher"
 	"github.com/Abdullah1738/juno-scan/internal/scanner"
 	"github.com/Abdullah1738/juno-scan/internal/storage"
 	"github.com/Abdullah1738/juno-scan/internal/store"
@@ -28,6 +30,37 @@ func main() {
 
 	if err := st.Migrate(ctx); err != nil {
 		log.Fatalf("migrate: %v", err)
+	}
+
+	br, err := broker.Open(ctx, broker.Config{
+		Driver: cfg.BrokerDriver,
+		URL:    cfg.BrokerURL,
+		Topic:  cfg.BrokerTopic,
+	})
+	if err != nil {
+		log.Fatalf("broker init: %v", err)
+	}
+	defer func() {
+		if br != nil {
+			_ = br.Close()
+		}
+	}()
+
+	if br != nil {
+		pub, err := publisher.New(st, br, publisher.Config{
+			PollInterval: cfg.BrokerPollInterval,
+			BatchSize:    cfg.BrokerBatchSize,
+		})
+		if err != nil {
+			log.Fatalf("publisher init: %v", err)
+		}
+
+		go func() {
+			if err := pub.Run(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("publisher stopped: %v", err)
+				cancel()
+			}
+		}()
 	}
 
 	rpc := sdkjunocashd.New(cfg.RPCURL, cfg.RPCUser, cfg.RPCPassword)
