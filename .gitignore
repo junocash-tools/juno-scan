@@ -5,6 +5,7 @@
 
 # Build
 /bin/
+/.cache/
 
 # Rust
 /rust/**/target/

@@ -11,9 +11,11 @@ ifneq ($(JUNO_TEST_LOG),)
 TESTFLAGS += -v
 endif
 
+GOCACHE ?= $(CURDIR)/.cache/go-build
+
 build: rust-build
 	@mkdir -p $(BIN_DIR)
-	go build -o $(BIN) ./cmd/juno-scan
+	GOCACHE=$(GOCACHE) go build -o $(BIN) ./cmd/juno-scan
 
 rust-build:
 	cargo build --release --manifest-path $(RUST_MANIFEST)
@@ -22,13 +24,13 @@ rust-test:
 	cargo test --manifest-path $(RUST_MANIFEST)
 
 test-unit:
-	CGO_ENABLED=0 go test $(TESTFLAGS) ./...
+	GOCACHE=$(GOCACHE) CGO_ENABLED=0 go test $(TESTFLAGS) ./...
 
 test-integration: rust-build
-	go test $(TESTFLAGS) -tags=integration ./...
+	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=integration ./...
 
 test-e2e: build
-	go test $(TESTFLAGS) -tags=e2e ./...
+	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=e2e ./...
 
 test: rust-test test-unit test-integration test-e2e
 
@@ -36,7 +38,7 @@ fmt:
 	gofmt -w .
 
 tidy:
-	go mod tidy
+	GOCACHE=$(GOCACHE) go mod tidy
 
 clean:
 	rm -rf $(BIN_DIR)
