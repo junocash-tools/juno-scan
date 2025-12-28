@@ -21,6 +21,7 @@ type Config struct {
 	UAHRP         string
 	PollInterval  time.Duration
 	Confirmations int64
+	ZMQHashBlock  string
 
 	BrokerDriver       string
 	BrokerURL          string
@@ -50,6 +51,7 @@ func FromFlags() Config {
 	flag.StringVar(&cfg.UAHRP, "ua-hrp", getenv("JUNO_SCAN_UA_HRP", "j"), "Unified address HRP (e.g. j, jregtest)")
 	flag.DurationVar(&cfg.PollInterval, "poll-interval", getenvDuration("JUNO_SCAN_POLL_INTERVAL", 2*time.Second), "Poll interval for new blocks (when ZMQ is not used)")
 	flag.Int64Var(&cfg.Confirmations, "confirmations", getenvInt64("JUNO_SCAN_CONFIRMATIONS", 100), "Confirmations required for DepositConfirmed event")
+	flag.StringVar(&cfg.ZMQHashBlock, "zmq-hashblock", getenv("JUNO_SCAN_ZMQ_HASHBLOCK", ""), "Optional ZMQ endpoint for hashblock notifications (tcp://host:port)")
 
 	flag.StringVar(&cfg.BrokerDriver, "broker-driver", getenv("JUNO_SCAN_BROKER_DRIVER", "none"), "Message broker driver (none, kafka, nats, rabbitmq)")
 	flag.StringVar(&cfg.BrokerURL, "broker-url", getenv("JUNO_SCAN_BROKER_URL", ""), "Message broker URL/DSN")

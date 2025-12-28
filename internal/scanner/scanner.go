@@ -11,6 +11,7 @@ import (
 	"github.com/Abdullah1738/juno-scan/internal/events"
 	"github.com/Abdullah1738/juno-scan/internal/orchardscan"
 	"github.com/Abdullah1738/juno-scan/internal/store"
+	"github.com/Abdullah1738/juno-scan/internal/zmq"
 	sdkjunocashd "github.com/Abdullah1738/juno-sdk-go/junocashd"
 	"github.com/Abdullah1738/juno-sdk-go/types"
 )
@@ -22,9 +23,11 @@ type Scanner struct {
 
 	pollInterval  time.Duration
 	confirmations int64
+
+	zmqHashBlockEndpoint string
 }
 
-func New(st store.Store, rpc *sdkjunocashd.Client, uaHRP string, pollInterval time.Duration, confirmations int64) (*Scanner, error) {
+func New(st store.Store, rpc *sdkjunocashd.Client, uaHRP string, pollInterval time.Duration, confirmations int64, zmqHashBlockEndpoint string) (*Scanner, error) {
 	if st == nil {
 		return nil, errors.New("scanner: store is nil")
 	}
@@ -40,16 +43,34 @@ func New(st store.Store, rpc *sdkjunocashd.Client, uaHRP string, pollInterval ti
 	if confirmations <= 0 {
 		confirmations = 100
 	}
+	if zmqHashBlockEndpoint != "" {
+		if _, err := zmq.ParseEndpoint(zmqHashBlockEndpoint); err != nil {
+			return nil, fmt.Errorf("scanner: zmq-hashblock: %w", err)
+		}
+	}
 	return &Scanner{
-		st:            st,
-		rpc:           rpc,
-		uaHRP:         uaHRP,
-		pollInterval:  pollInterval,
-		confirmations: confirmations,
+		st:                   st,
+		rpc:                  rpc,
+		uaHRP:                uaHRP,
+		pollInterval:         pollInterval,
+		confirmations:        confirmations,
+		zmqHashBlockEndpoint: zmqHashBlockEndpoint,
 	}, nil
 }
 
 func (s *Scanner) Run(ctx context.Context) error {
+	var zmqNotify <-chan struct{}
+	if s.zmqHashBlockEndpoint != "" {
+		ch := make(chan struct{}, 1)
+		zmqNotify = ch
+		go func() {
+			_ = zmq.Notify(ctx, zmq.NotifyConfig{
+				Endpoint: s.zmqHashBlockEndpoint,
+				Topic:    "hashblock",
+			}, ch, log.Printf)
+		}()
+	}
+
 	ticker := time.NewTicker(s.pollInterval)
 	defer ticker.Stop()
 
@@ -61,59 +82,66 @@ func (s *Scanner) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+		case <-zmqNotify:
 		}
 	}
 }
 
 func (s *Scanner) scanOnce(ctx context.Context) error {
-	tip, ok, err := s.st.Tip(ctx)
-	if err != nil {
-		return err
-	}
+	for ctx.Err() == nil {
+		tip, ok, err := s.st.Tip(ctx)
+		if err != nil {
+			return err
+		}
 
-	nextHeight := int64(0)
-	if ok {
-		nextHeight = tip.Height + 1
-	}
+		nextHeight := int64(0)
+		if ok {
+			nextHeight = tip.Height + 1
+		}
 
-	chainHeight, err := s.rpc.GetBlockCount(ctx)
-	if err != nil {
-		return fmt.Errorf("scanner: getblockcount: %w", err)
-	}
-	if nextHeight > chainHeight {
-		return nil
-	}
-
-	nextHash, err := s.rpc.GetBlockHash(ctx, nextHeight)
-	if err != nil {
-		return fmt.Errorf("scanner: getblockhash(%d): %w", nextHeight, err)
-	}
-
-	// Reorg detection: compare stored tip with daemon chain at the same height.
-	if ok && tip.Height >= 0 {
-		daemonTipHash, err := s.rpc.GetBlockHash(ctx, tip.Height)
-		if err == nil && daemonTipHash != tip.Hash {
-			common, err := s.findCommonAncestor(ctx, tip.Height)
-			if err != nil {
-				return err
-			}
-			log.Printf("reorg detected: rolling back to height %d", common)
-			if err := s.st.RollbackToHeight(ctx, common); err != nil {
-				return err
-			}
+		chainHeight, err := s.rpc.GetBlockCount(ctx)
+		if err != nil {
+			return fmt.Errorf("scanner: getblockcount: %w", err)
+		}
+		if nextHeight > chainHeight {
 			return nil
+		}
+
+		nextHash, err := s.rpc.GetBlockHash(ctx, nextHeight)
+		if err != nil {
+			return fmt.Errorf("scanner: getblockhash(%d): %w", nextHeight, err)
+		}
+
+		// Reorg detection: compare stored tip with daemon chain at the same height.
+		if ok && tip.Height >= 0 {
+			daemonTipHash, err := s.rpc.GetBlockHash(ctx, tip.Height)
+			if err == nil && daemonTipHash != tip.Hash {
+				common, err := s.findCommonAncestor(ctx, tip.Height)
+				if err != nil {
+					return err
+				}
+				log.Printf("reorg detected: rolling back to height %d", common)
+				if err := s.st.RollbackToHeight(ctx, common); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		var blk blockVerbose2
+		if err := s.rpc.Call(ctx, "getblock", []any{nextHash, 2}, &blk); err != nil {
+			return fmt.Errorf("scanner: getblock(%d): %w", nextHeight, err)
+		}
+		if blk.Height != nextHeight {
+			return fmt.Errorf("scanner: daemon returned unexpected height: got %d want %d", blk.Height, nextHeight)
+		}
+
+		if err := s.processBlock(ctx, blk); err != nil {
+			return err
 		}
 	}
 
-	var blk blockVerbose2
-	if err := s.rpc.Call(ctx, "getblock", []any{nextHash, 2}, &blk); err != nil {
-		return fmt.Errorf("scanner: getblock(%d): %w", nextHeight, err)
-	}
-	if blk.Height != nextHeight {
-		return fmt.Errorf("scanner: daemon returned unexpected height: got %d want %d", blk.Height, nextHeight)
-	}
-
-	return s.processBlock(ctx, blk)
+	return ctx.Err()
 }
 
 func (s *Scanner) findCommonAncestor(ctx context.Context, fromHeight int64) (int64, error) {

@@ -64,7 +64,7 @@ func main() {
 	}
 
 	rpc := sdkjunocashd.New(cfg.RPCURL, cfg.RPCUser, cfg.RPCPassword)
-	sc, err := scanner.New(st, rpc, cfg.UAHRP, cfg.PollInterval, cfg.Confirmations)
+	sc, err := scanner.New(st, rpc, cfg.UAHRP, cfg.PollInterval, cfg.Confirmations, cfg.ZMQHashBlock)
 	if err != nil {
 		log.Fatalf("scanner init: %v", err)
 	}

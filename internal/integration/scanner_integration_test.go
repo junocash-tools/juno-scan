@@ -50,7 +50,7 @@ func TestScanner_DepositDetected(t *testing.T) {
 	}
 
 	rpc := sdkjunocashd.New(jd.RPCURL, jd.RPCUser, jd.RPCPassword)
-	sc, err := scanner.New(st, rpc, uaHRP, 100*time.Millisecond, 2)
+	sc, err := scanner.New(st, rpc, uaHRP, 100*time.Millisecond, 2, "")
 	if err != nil {
 		t.Fatalf("scanner.New: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestScanner_DepositMemoExtracted(t *testing.T) {
 	}
 
 	rpc := sdkjunocashd.New(jd.RPCURL, jd.RPCUser, jd.RPCPassword)
-	sc, err := scanner.New(st, rpc, uaHRP, 100*time.Millisecond, 1)
+	sc, err := scanner.New(st, rpc, uaHRP, 100*time.Millisecond, 1, "")
 	if err != nil {
 		t.Fatalf("scanner.New: %v", err)
 	}

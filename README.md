@@ -25,6 +25,11 @@ The confirmation threshold defaults to `100` and can be configured via `-confirm
 
 Requires a running `junocashd` (RPC) and a storage backend.
 
+### ZMQ (optional)
+
+If `junocashd` is configured with `-zmqpubhashblock=tcp://127.0.0.1:28332`, run `juno-scan` with `-zmq-hashblock tcp://127.0.0.1:28332` to trigger scans from ZMQ notifications.
+If `-zmq-hashblock` is not set, `juno-scan` polls using `-poll-interval`.
+
 ### Postgres (default)
 
 `juno-scan -db-driver postgres -db-dsn <dsn> -rpc-url <url> -rpc-user <user> -rpc-pass <pass> -ua-hrp <j|jregtest>`
