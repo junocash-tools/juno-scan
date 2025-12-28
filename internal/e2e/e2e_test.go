@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -114,9 +115,11 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 		t.Fatalf("expected auth_path length 32, got %d", len(wit.Paths[0].AuthPath))
 	}
 
+	mustWaitOrchardBalanceForViewingKey(t, ctx, jd, ufvk, 2)
+
 	// Spend.
 	toAddr := mustCreateUnifiedAddress(t, ctx, jd)
-	opid2 := mustSendMany(t, ctx, jd, addr, toAddr, 1)
+	opid2 := mustSendMany(t, ctx, jd, addr, toAddr, "0.01")
 	mustWaitOpSuccess(t, ctx, jd, opid2)
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	mustWaitForEventKind(t, ctx, baseURL, "hot", "SpendEvent")
@@ -332,28 +335,38 @@ func mustCoinbaseAddress(t *testing.T, ctx context.Context, jd *testutil.Running
 func mustShieldCoinbase(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string) string {
 	t.Helper()
 
+	out := mustRun(t, jd.CLICommand(ctx, "z_shieldcoinbase", fromAddr, toAddr))
+
 	var resp struct {
 		OpID string `json:"opid"`
 	}
-	mustRunJSON(t, jd.CLICommand(ctx, "z_shieldcoinbase", fromAddr, toAddr), &resp)
-	if resp.OpID == "" {
+	if err := json.Unmarshal(out, &resp); err == nil && resp.OpID != "" {
+		return resp.OpID
+	}
+	opid := strings.TrimSpace(string(out))
+	if opid == "" {
 		t.Fatalf("missing opid")
 	}
-	return resp.OpID
+	return opid
 }
 
-func mustSendMany(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string, amount int) string {
+func mustSendMany(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string, amount string) string {
 	t.Helper()
+
+	recipients := `[{"address":"` + toAddr + `","amount":` + amount + `}]`
+	out := mustRun(t, jd.CLICommand(ctx, "z_sendmany", fromAddr, recipients, "1"))
 
 	var resp struct {
 		OpID string `json:"opid"`
 	}
-	recipients := `[{"address":"` + toAddr + `","amount":` + fmt.Sprint(amount) + `}]`
-	mustRunJSON(t, jd.CLICommand(ctx, "z_sendmany", fromAddr, recipients), &resp)
-	if resp.OpID == "" {
+	if err := json.Unmarshal(out, &resp); err == nil && resp.OpID != "" {
+		return resp.OpID
+	}
+	opid := strings.TrimSpace(string(out))
+	if opid == "" {
 		t.Fatalf("missing opid")
 	}
-	return resp.OpID
+	return opid
 }
 
 func mustWaitOpSuccess(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, opid string) {
@@ -368,14 +381,57 @@ func mustWaitOpSuccess(t *testing.T, ctx context.Context, jd *testutil.RunningJu
 		out := mustRun(t, jd.CLICommand(ctx, "z_getoperationresult", `["`+opid+`"]`))
 		var res []struct {
 			Status string `json:"status"`
+			Error  *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error,omitempty"`
 		}
-		if err := json.Unmarshal(out, &res); err == nil && len(res) > 0 && res[0].Status == "success" {
-			return
+		if err := json.Unmarshal(out, &res); err == nil && len(res) > 0 {
+			switch res[0].Status {
+			case "success":
+				return
+			case "failed":
+				msg := ""
+				if res[0].Error != nil {
+					msg = res[0].Error.Message
+				}
+				t.Fatalf("operation failed: %s (%s)", opid, msg)
+			}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 
 	t.Fatalf("operation did not succeed: %s", opid)
+}
+
+func mustWaitOrchardBalanceForViewingKey(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, ufvk string, minconf int) int64 {
+	t.Helper()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	type pool struct {
+		ValueZat int64 `json:"valueZat"`
+	}
+	type resp struct {
+		Pools map[string]pool `json:"pools"`
+	}
+
+	for time.Now().Before(deadline) {
+		out := mustRun(t, jd.CLICommand(ctx, "z_getbalanceforviewingkey", ufvk, strconv.FormatInt(int64(minconf), 10)))
+		var r resp
+		if err := json.Unmarshal(out, &r); err == nil {
+			if p, ok := r.Pools["orchard"]; ok && p.ValueZat > 0 {
+				return p.ValueZat
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatalf("orchard balance not available for minconf=%d", minconf)
+	return 0
 }
 
 func mustRun(t *testing.T, cmd *exec.Cmd) []byte {
