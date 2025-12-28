@@ -6,11 +6,14 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"time"
 
+	build "github.com/docker/docker/api/types/build"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/go-connections/nat"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -22,7 +25,7 @@ const (
 	defaultMySQLImage       = "mysql:8.4"
 	defaultNATSImage        = "nats:2.10-alpine"
 	defaultRabbitMQImage    = "rabbitmq:3.13-management-alpine"
-	defaultKafkaImage       = "bitnami/kafka:3.7"
+	defaultKafkaImage       = "redpandadata/redpanda:v23.3.17"
 	defaultRPCUser          = "rpcuser"
 	defaultRPCPassword      = "rpcpass"
 	defaultPostgresUser     = "junoscan"
@@ -70,33 +73,33 @@ func StartIntegrationStack(ctx context.Context) (*IntegrationStack, error) {
 	st.postgres, st.PostgresDSN, err = startPostgres(ctx)
 	if err != nil {
 		cleanup()
-		return nil, err
+		return nil, fmt.Errorf("postgres: %w", err)
 	}
 	st.mysql, st.MySQLRootDSN, err = startMySQL(ctx)
 	if err != nil {
 		cleanup()
-		return nil, err
+		return nil, fmt.Errorf("mysql: %w", err)
 	}
 	st.nats, st.NATSURL, err = startNATS(ctx)
 	if err != nil {
 		cleanup()
-		return nil, err
+		return nil, fmt.Errorf("nats: %w", err)
 	}
 	st.rabbitmq, st.RabbitMQURL, err = startRabbitMQ(ctx)
 	if err != nil {
 		cleanup()
-		return nil, err
+		return nil, fmt.Errorf("rabbitmq: %w", err)
 	}
 	st.kafka, st.KafkaBrokers, err = startKafka(ctx)
 	if err != nil {
 		cleanup()
-		return nil, err
+		return nil, fmt.Errorf("kafka: %w", err)
 	}
 
 	st.junocashd, st.RPCURL, st.ZMQHashBlockEndpoint, st.JunocashdContainerID, err = startJunocashd(ctx, st.RPCUser, st.RPCPassword)
 	if err != nil {
 		cleanup()
-		return nil, err
+		return nil, fmt.Errorf("junocashd: %w", err)
 	}
 
 	return st, nil
@@ -161,11 +164,16 @@ func startJunocashd(ctx context.Context, rpcUser, rpcPass string) (testcontainer
 	version := defaultJunocashVersion
 
 	req := testcontainers.ContainerRequest{
+		ImagePlatform: "linux/amd64",
 		FromDockerfile: testcontainers.FromDockerfile{
 			Context:    repoRoot(),
 			Dockerfile: "docker/junocashd/Dockerfile",
 			BuildArgs: map[string]*string{
 				"JUNOCASH_VERSION": &version,
+			},
+			BuildOptionsModifier: func(opts *build.ImageBuildOptions) {
+				opts.Platform = "linux/amd64"
+				opts.Version = build.BuilderBuildKit
 			},
 		},
 		ExposedPorts: []string{
@@ -188,6 +196,12 @@ func startJunocashd(ctx context.Context, rpcUser, rpcPass string) (testcontainer
 			"-zmqpubhashblock=tcp://0.0.0.0:28332",
 		},
 		WaitingFor: wait.ForListeningPort(nat.Port("8232/tcp")).WithStartupTimeout(60 * time.Second),
+	}
+	if os.Getenv("JUNO_TEST_LOG") != "" {
+		req.FromDockerfile.BuildLogWriter = os.Stdout
+		req.LogConsumerCfg = &testcontainers.LogConsumerConfig{
+			Consumers: []testcontainers.LogConsumer{&testcontainers.StdoutLogConsumer{}},
+		}
 	}
 
 	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -360,21 +374,24 @@ func startKafka(ctx context.Context) (testcontainers.Container, string, error) {
 	}
 
 	req := testcontainers.ContainerRequest{
-		Image: defaultKafkaImage,
-		ExposedPorts: []string{
-			strconv.Itoa(hostPort) + ":9092/tcp",
+		Image:        defaultKafkaImage,
+		ExposedPorts: []string{"9092/tcp"},
+		Cmd: []string{
+			"redpanda",
+			"start",
+			"--overprovisioned",
+			"--node-id=0",
+			"--check=false",
+			"--smp=1",
+			"--memory=1G",
+			"--reserve-memory=0M",
+			"--kafka-addr=PLAINTEXT://0.0.0.0:9092",
+			fmt.Sprintf("--advertise-kafka-addr=PLAINTEXT://127.0.0.1:%d", hostPort),
 		},
-		Env: map[string]string{
-			"KAFKA_CFG_NODE_ID":                          "0",
-			"KAFKA_CFG_PROCESS_ROLES":                    "controller,broker",
-			"KAFKA_CFG_CONTROLLER_QUORUM_VOTERS":         "0@localhost:9093",
-			"KAFKA_CFG_LISTENERS":                        "PLAINTEXT://:9092,CONTROLLER://:9093",
-			"KAFKA_CFG_ADVERTISED_LISTENERS":             fmt.Sprintf("PLAINTEXT://127.0.0.1:%d", hostPort),
-			"KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP":   "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT",
-			"KAFKA_CFG_CONTROLLER_LISTENER_NAMES":        "CONTROLLER",
-			"KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE":        "true",
-			"ALLOW_PLAINTEXT_LISTENER":                   "yes",
-			"KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR": "1",
+		HostConfigModifier: func(cfg *container.HostConfig) {
+			cfg.PortBindings = nat.PortMap{
+				nat.Port("9092/tcp"): []nat.PortBinding{{HostIP: "127.0.0.1", HostPort: strconv.Itoa(hostPort)}},
+			}
 		},
 		WaitingFor: wait.ForListeningPort(nat.Port("9092/tcp")).WithStartupTimeout(120 * time.Second),
 	}
@@ -387,13 +404,7 @@ func startKafka(ctx context.Context) (testcontainers.Container, string, error) {
 		return nil, "", err
 	}
 
-	host, err := c.Host(ctx)
-	if err != nil {
-		_ = c.Terminate(ctx)
-		return nil, "", err
-	}
-
-	return c, fmt.Sprintf("%s:%d", host, hostPort), nil
+	return c, fmt.Sprintf("127.0.0.1:%d", hostPort), nil
 }
 
 func freePort() (int, error) {
