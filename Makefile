@@ -13,7 +13,6 @@ TESTFLAGS += -v
 endif
 
 GOCACHE ?= $(CURDIR)/.cache/go-build
-
 build: rust-build
 	@mkdir -p $(BIN_DIR)
 	GOCACHE=$(GOCACHE) go build -o $(BIN) ./cmd/juno-scan
