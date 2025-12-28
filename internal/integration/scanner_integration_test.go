@@ -6,41 +6,33 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Abdullah1738/juno-scan/internal/db/migrate"
 	"github.com/Abdullah1738/juno-scan/internal/scanner"
+	"github.com/Abdullah1738/juno-scan/internal/store"
+	"github.com/Abdullah1738/juno-scan/internal/store/rocksdb"
 	"github.com/Abdullah1738/juno-scan/internal/testutil"
 	sdkjunocashd "github.com/Abdullah1738/juno-sdk-go/junocashd"
 )
 
 func TestScanner_DepositDetected(t *testing.T) {
-	dbURL := os.Getenv("JUNO_SCAN_TEST_DB_URL")
-	if dbURL == "" {
-		t.Skip("set JUNO_SCAN_TEST_DB_URL to run integration tests")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	pg, err := testutil.OpenTestPostgres(ctx, dbURL)
+	st, err := rocksdb.Open(filepath.Join(t.TempDir(), "db"))
 	if err != nil {
-		t.Fatalf("OpenTestPostgres: %v", err)
+		t.Fatalf("Open store: %v", err)
 	}
-	defer func() { _ = pg.Close(context.Background()) }()
-
-	if err := migrate.Apply(ctx, pg.Pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	defer func() { _ = st.Close() }()
 
 	jd, err := testutil.StartJunocashd(ctx, testutil.JunocashdConfig{})
 	if err != nil {
-		if errors.Is(err, testutil.ErrJunocashdNotFound) || errors.Is(err, testutil.ErrJunocashCLIOnPath) {
+		if errors.Is(err, testutil.ErrJunocashdNotFound) || errors.Is(err, testutil.ErrJunocashCLIOnPath) || errors.Is(err, testutil.ErrListenNotAllowed) {
 			t.Skip(err.Error())
 		}
 		t.Fatalf("StartJunocashd: %v", err)
@@ -50,12 +42,15 @@ func TestScanner_DepositDetected(t *testing.T) {
 	addr, ufvk := mustCreateWalletAndUFVK(t, ctx, jd)
 	uaHRP := strings.SplitN(addr, "1", 2)[0]
 
-	if _, err := pg.Pool.Exec(ctx, `INSERT INTO wallets (wallet_id, ufvk) VALUES ($1, $2)`, "hot", ufvk); err != nil {
-		t.Fatalf("insert wallet: %v", err)
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if err := st.UpsertWallet(ctx, "hot", ufvk); err != nil {
+		t.Fatalf("UpsertWallet: %v", err)
 	}
 
 	rpc := sdkjunocashd.New(jd.RPCURL, jd.RPCUser, jd.RPCPassword)
-	sc, err := scanner.New(pg.Pool, rpc, uaHRP, 100*time.Millisecond)
+	sc, err := scanner.New(st, rpc, uaHRP, 100*time.Millisecond)
 	if err != nil {
 		t.Fatalf("scanner.New: %v", err)
 	}
@@ -71,7 +66,7 @@ func TestScanner_DepositDetected(t *testing.T) {
 
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 
-	waitForEvent(t, ctx, pg, "hot")
+	waitForEvent(t, ctx, st, "hot")
 }
 
 func mustCreateWalletAndUFVK(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd) (addr string, ufvk string) {
@@ -149,7 +144,7 @@ func mustWaitOpSuccess(t *testing.T, ctx context.Context, jd *testutil.RunningJu
 	t.Fatalf("operation did not succeed: %s", opid)
 }
 
-func waitForEvent(t *testing.T, ctx context.Context, pg *testutil.TestPostgres, walletID string) {
+func waitForEvent(t *testing.T, ctx context.Context, st store.Store, walletID string) {
 	t.Helper()
 
 	deadline, ok := ctx.Deadline()
@@ -158,8 +153,8 @@ func waitForEvent(t *testing.T, ctx context.Context, pg *testutil.TestPostgres, 
 	}
 
 	for time.Now().Before(deadline) {
-		var count int64
-		if err := pg.Pool.QueryRow(ctx, `SELECT COUNT(1) FROM events WHERE wallet_id=$1 AND kind='deposit'`, walletID).Scan(&count); err == nil && count > 0 {
+		events, _, err := st.ListWalletEvents(ctx, walletID, 0, 10)
+		if err == nil && len(events) > 0 {
 			return
 		}
 		time.Sleep(200 * time.Millisecond)

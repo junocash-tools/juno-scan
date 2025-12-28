@@ -20,6 +20,7 @@ import (
 
 var ErrJunocashdNotFound = errors.New("junocashd not found")
 var ErrJunocashCLIOnPath = errors.New("junocash-cli not found")
+var ErrListenNotAllowed = errors.New("listen not permitted")
 
 type JunocashdConfig struct {
 	JunocashdPath string
@@ -206,9 +207,11 @@ func (r *RunningJunocashd) waitForRPC(ctx context.Context, timeout time.Duration
 func freePort() (int, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+			return 0, ErrListenNotAllowed
+		}
 		return 0, fmt.Errorf("listen: %w", err)
 	}
 	defer ln.Close()
 	return ln.Addr().(*net.TCPAddr).Port, nil
 }
-

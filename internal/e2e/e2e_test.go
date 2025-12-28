@@ -22,23 +22,12 @@ import (
 )
 
 func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
-	dbURL := os.Getenv("JUNO_SCAN_TEST_DB_URL")
-	if dbURL == "" {
-		t.Skip("set JUNO_SCAN_TEST_DB_URL to run e2e tests")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	pg, err := testutil.OpenTestPostgres(ctx, dbURL)
-	if err != nil {
-		t.Fatalf("OpenTestPostgres: %v", err)
-	}
-	defer func() { _ = pg.Close(context.Background()) }()
-
 	jd, err := testutil.StartJunocashd(ctx, testutil.JunocashdConfig{})
 	if err != nil {
-		if errors.Is(err, testutil.ErrJunocashdNotFound) || errors.Is(err, testutil.ErrJunocashCLIOnPath) {
+		if errors.Is(err, testutil.ErrJunocashdNotFound) || errors.Is(err, testutil.ErrJunocashCLIOnPath) || errors.Is(err, testutil.ErrListenNotAllowed) {
 			t.Skip(err.Error())
 		}
 		t.Fatalf("StartJunocashd: %v", err)
@@ -51,14 +40,16 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 	port := mustFreePort(t)
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 
+	dbPath := filepath.Join(t.TempDir(), "db")
+
 	bin := filepath.Join("..", "..", "bin", "juno-scan")
 	if _, err := os.Stat(bin); err != nil {
 		t.Fatalf("missing binary: %v", err)
 	}
 	cmd := exec.CommandContext(ctx, bin,
 		"-listen", fmt.Sprintf("127.0.0.1:%d", port),
-		"-db-url", dbURL,
-		"-db-schema", pg.Schema,
+		"-db-driver", "rocksdb",
+		"-db-path", dbPath,
 		"-rpc-url", jd.RPCURL,
 		"-rpc-user", jd.RPCUser,
 		"-rpc-pass", jd.RPCPassword,
