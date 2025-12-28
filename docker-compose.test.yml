@@ -5,8 +5,7 @@ services:
       context: .
       dockerfile: docker/junocashd/Dockerfile
       args:
-        # Pinned commit from Juno Cash release v0.9.7.
-        JUNOCASH_COMMIT: eaaeb5a85
+        JUNOCASH_VERSION: 0.9.7
     command:
       - -regtest
       - -server=1
@@ -104,4 +103,3 @@ services:
 
 volumes:
   junocashd-data:
-

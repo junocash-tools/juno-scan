@@ -1,36 +1,22 @@
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:22.04
 
-ARG JUNOCASH_REPO=https://github.com/juno-cash/junocash.git
-ARG JUNOCASH_COMMIT=eaaeb5a85
+ARG JUNOCASH_VERSION=0.9.7
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
-    git \
-    build-essential \
-    pkg-config \
-    python3 \
-    automake \
-    autoconf \
-    libtool \
+    tar \
   && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /src
-RUN git clone --depth 1 ${JUNOCASH_REPO} .
-RUN git fetch --depth 1 origin ${JUNOCASH_COMMIT} && git checkout ${JUNOCASH_COMMIT}
-
-RUN ./zcutil/build.sh -j"$(nproc)"
-
-FROM ubuntu:22.04
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /src/src/junocashd /usr/local/bin/junocashd
-COPY --from=builder /src/src/junocash-cli /usr/local/bin/junocash-cli
+WORKDIR /tmp
+RUN curl -fsSLo SHA256SUMS "https://github.com/juno-cash/junocash/releases/download/v${JUNOCASH_VERSION}/SHA256SUMS" \
+ && curl -fsSLo "junocash-${JUNOCASH_VERSION}-linux64.tar.gz" "https://github.com/juno-cash/junocash/releases/download/v${JUNOCASH_VERSION}/junocash-${JUNOCASH_VERSION}-linux64.tar.gz" \
+ && grep " junocash-${JUNOCASH_VERSION}-linux64.tar.gz" SHA256SUMS | sha256sum -c - \
+ && tar -xzf "junocash-${JUNOCASH_VERSION}-linux64.tar.gz" \
+ && install -m 0755 "junocash-${JUNOCASH_VERSION}/bin/junocashd" /usr/local/bin/junocashd \
+ && install -m 0755 "junocash-${JUNOCASH_VERSION}/bin/junocash-cli" /usr/local/bin/junocash-cli \
+ && rm -rf /tmp/*
 
 VOLUME ["/data"]
 
 ENTRYPOINT ["junocashd"]
-
