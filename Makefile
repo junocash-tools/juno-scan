@@ -1,9 +1,10 @@
-.PHONY: build rust-build rust-test test test-unit test-integration test-e2e fmt tidy clean
+.PHONY: build rust-build rust-test test test-unit test-integration test-e2e fmt tidy clean docker-up docker-down test-docker
 
 BIN_DIR := bin
 BIN := $(BIN_DIR)/juno-scan
 
 RUST_MANIFEST := rust/scan/Cargo.toml
+DOCKER_COMPOSE := docker compose -f docker-compose.test.yml
 
 TESTFLAGS ?=
 
@@ -33,6 +34,15 @@ test-e2e: build
 	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=e2e ./...
 
 test: rust-test test-unit test-integration test-e2e
+
+docker-up:
+	$(DOCKER_COMPOSE) up -d --build
+
+docker-down:
+	$(DOCKER_COMPOSE) down -v
+
+test-docker:
+	./scripts/test-docker.sh
 
 fmt:
 	gofmt -w .

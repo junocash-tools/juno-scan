@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -42,10 +44,18 @@ type RunningJunocashd struct {
 
 	cliPath string
 
+	dockerContainer string
+	dockerDatadir   string
+	dockerRPCPort   int
+
 	stopOnce sync.Once
 }
 
 func StartJunocashd(ctx context.Context, cfg JunocashdConfig) (*RunningJunocashd, error) {
+	if rpcURL := os.Getenv("JUNO_TEST_RPC_URL"); rpcURL != "" {
+		return connectExternalJunocashd(ctx, rpcURL)
+	}
+
 	bin := cfg.JunocashdPath
 	if bin == "" {
 		p, err := exec.LookPath("junocashd")
@@ -139,9 +149,71 @@ func StartJunocashd(ctx context.Context, cfg JunocashdConfig) (*RunningJunocashd
 	return r, nil
 }
 
+func connectExternalJunocashd(ctx context.Context, rpcURL string) (*RunningJunocashd, error) {
+	parsed, err := url.Parse(rpcURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return nil, fmt.Errorf("invalid JUNO_TEST_RPC_URL: %q", rpcURL)
+	}
+	hostPort := parsed.Host
+	if parsed.Port() == "" {
+		return nil, fmt.Errorf("invalid JUNO_TEST_RPC_URL (missing port): %q", rpcURL)
+	}
+	rpcPort, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		return nil, fmt.Errorf("invalid JUNO_TEST_RPC_URL port: %q", parsed.Port())
+	}
+
+	rpcUser := os.Getenv("JUNO_TEST_RPC_USER")
+	if rpcUser == "" {
+		rpcUser = "rpcuser"
+	}
+	rpcPass := os.Getenv("JUNO_TEST_RPC_PASS")
+	if rpcPass == "" {
+		rpcPass = "rpcpass"
+	}
+
+	container := os.Getenv("JUNO_TEST_JUNOCASHD_CONTAINER")
+	if container == "" {
+		return nil, errors.New("JUNO_TEST_JUNOCASHD_CONTAINER is required when JUNO_TEST_RPC_URL is set")
+	}
+	datadir := os.Getenv("JUNO_TEST_JUNOCASHD_DATADIR")
+	if datadir == "" {
+		datadir = "/data"
+	}
+
+	internalRPCPort := 8232
+	if v := os.Getenv("JUNO_TEST_JUNOCASHD_RPC_PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			internalRPCPort = n
+		}
+	}
+
+	r := &RunningJunocashd{
+		cmd:             nil,
+		Datadir:         datadir,
+		RPCURL:          (&url.URL{Scheme: parsed.Scheme, Host: hostPort}).String(),
+		RPCPort:         rpcPort,
+		RPCUser:         rpcUser,
+		RPCPassword:     rpcPass,
+		cliPath:         "junocash-cli",
+		dockerContainer: container,
+		dockerDatadir:   datadir,
+		dockerRPCPort:   internalRPCPort,
+	}
+
+	if err := r.waitForRPC(ctx, 25*time.Second); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
 func (r *RunningJunocashd) Stop(ctx context.Context) error {
 	var err error
 	r.stopOnce.Do(func() {
+		if r.dockerContainer != "" && r.cmd == nil {
+			err = nil
+			return
+		}
 		if r.cmd == nil || r.cmd.Process == nil {
 			err = nil
 			return
@@ -172,6 +244,20 @@ func (r *RunningJunocashd) Stop(ctx context.Context) error {
 }
 
 func (r *RunningJunocashd) CLICommand(ctx context.Context, args ...string) *exec.Cmd {
+	if r.dockerContainer != "" {
+		base := []string{
+			"exec",
+			r.dockerContainer,
+			r.cliPath,
+			"-regtest",
+			"-datadir=" + r.dockerDatadir,
+			"-rpcuser=" + r.RPCUser,
+			"-rpcpassword=" + r.RPCPassword,
+			"-rpcport=" + fmt.Sprint(r.dockerRPCPort),
+		}
+		return exec.CommandContext(ctx, "docker", append(base, args...)...)
+	}
+
 	base := []string{
 		"-regtest",
 		"-datadir=" + r.Datadir,
