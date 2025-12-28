@@ -454,7 +454,7 @@ FROM notes
 
 func (s *Store) WalletEventPublishCursor(ctx context.Context, walletID string) (int64, error) {
 	var cursor int64
-	if err := s.db.QueryRowContext(ctx, `SELECT cursor FROM wallet_event_publish_cursors WHERE wallet_id = ?`, walletID).Scan(&cursor); err != nil {
+	if err := s.db.QueryRowContext(ctx, "SELECT `cursor` FROM wallet_event_publish_cursors WHERE wallet_id = ?", walletID).Scan(&cursor); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, nil
 		}
@@ -465,10 +465,10 @@ func (s *Store) WalletEventPublishCursor(ctx context.Context, walletID string) (
 
 func (s *Store) SetWalletEventPublishCursor(ctx context.Context, walletID string, cursor int64) error {
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO wallet_event_publish_cursors (wallet_id, cursor)
-VALUES (?, ?)
-ON DUPLICATE KEY UPDATE cursor = VALUES(cursor)
-`, walletID, cursor)
+	INSERT INTO wallet_event_publish_cursors (wallet_id, `+"`cursor`"+`)
+	VALUES (?, ?)
+	ON DUPLICATE KEY UPDATE `+"`cursor`"+` = VALUES(`+"`cursor`"+`)
+	`, walletID, cursor)
 	if err != nil {
 		return fmt.Errorf("mysql: set publish cursor: %w", err)
 	}
