@@ -101,7 +101,7 @@ func TestScanner_DepositDetected(t *testing.T) {
 
 	// Spend the detected note.
 	toAddr := mustCreateUnifiedAddress(t, ctx, jd)
-	opid2 := mustSendMany(t, ctx, jd, addr, toAddr, 1)
+	opid2 := mustSendMany(t, ctx, jd, addr, toAddr, "0.01")
 	mustWaitOpSuccess(t, ctx, jd, opid2)
 
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
@@ -178,12 +178,19 @@ func TestScanner_DepositMemoExtracted(t *testing.T) {
 	mustRun(t, jd.CLICommand(ctx, "generate", "101"))
 	fromAddr := mustCoinbaseAddress(t, ctx, jd)
 
+	// Fund the wallet first (coinbase spends cannot make change).
+	opidFund := mustShieldCoinbase(t, ctx, jd, fromAddr, addr)
+	mustWaitOpSuccess(t, ctx, jd, opidFund)
+	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
+	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
+	mustWaitOrchardBalanceForViewingKey(t, ctx, jd, ufvk, 2)
+
 	// A memo of "00" (padded by the node) should be detectable (not the "no memo" marker 0xF6).
-	opid := mustSendManyWithMemo(t, ctx, jd, fromAddr, addr, 1, "00")
+	opid := mustSendManyWithMemo(t, ctx, jd, addr, addr, "0.01", "00")
 	mustWaitOpSuccess(t, ctx, jd, opid)
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 
-	deposit := waitForEventKind(t, ctx, st, "hot", "DepositEvent")
+	deposit := waitForEventWithMemoPrefix(t, ctx, st, "hot", "DepositEvent", "00")
 
 	var payload struct {
 		MemoHex string `json:"memo_hex"`
@@ -198,7 +205,7 @@ func TestScanner_DepositMemoExtracted(t *testing.T) {
 		t.Fatalf("unexpected memo_hex prefix: %q", payload.MemoHex[:min(8, len(payload.MemoHex))])
 	}
 
-	confirmed := waitForEventKind(t, ctx, st, "hot", "DepositConfirmed")
+	confirmed := waitForEventWithMemoPrefix(t, ctx, st, "hot", "DepositConfirmed", payload.MemoHex)
 	var confirmedPayload struct {
 		MemoHex string `json:"memo_hex"`
 	}
@@ -271,42 +278,57 @@ func mustCoinbaseAddress(t *testing.T, ctx context.Context, jd *testutil.Running
 func mustShieldCoinbase(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string) string {
 	t.Helper()
 
+	out := mustRun(t, jd.CLICommand(ctx, "z_shieldcoinbase", fromAddr, toAddr))
+
 	var resp struct {
 		OpID string `json:"opid"`
 	}
-	mustRunJSON(t, jd.CLICommand(ctx, "z_shieldcoinbase", fromAddr, toAddr), &resp)
-	if resp.OpID == "" {
+	if err := json.Unmarshal(out, &resp); err == nil && resp.OpID != "" {
+		return resp.OpID
+	}
+	opid := strings.TrimSpace(string(out))
+	if opid == "" {
 		t.Fatalf("missing opid")
 	}
-	return resp.OpID
+	return opid
 }
 
-func mustSendMany(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string, amount int) string {
+func mustSendMany(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string, amount string) string {
 	t.Helper()
+
+	recipients := `[{"address":"` + toAddr + `","amount":` + amount + `}]`
+	out := mustRun(t, jd.CLICommand(ctx, "z_sendmany", fromAddr, recipients, "1"))
 
 	var resp struct {
 		OpID string `json:"opid"`
 	}
-	recipients := `[{"address":"` + toAddr + `","amount":` + strconvI(amount) + `}]`
-	mustRunJSON(t, jd.CLICommand(ctx, "z_sendmany", fromAddr, recipients), &resp)
-	if resp.OpID == "" {
+	if err := json.Unmarshal(out, &resp); err == nil && resp.OpID != "" {
+		return resp.OpID
+	}
+	opid := strings.TrimSpace(string(out))
+	if opid == "" {
 		t.Fatalf("missing opid")
 	}
-	return resp.OpID
+	return opid
 }
 
-func mustSendManyWithMemo(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string, amount int, memoHex string) string {
+func mustSendManyWithMemo(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string, amount string, memoHex string) string {
 	t.Helper()
+
+	recipients := `[{"address":"` + toAddr + `","amount":` + amount + `,"memo":"` + memoHex + `"}]`
+	out := mustRun(t, jd.CLICommand(ctx, "z_sendmany", fromAddr, recipients, "1"))
 
 	var resp struct {
 		OpID string `json:"opid"`
 	}
-	recipients := `[{"address":"` + toAddr + `","amount":` + strconvI(amount) + `,"memo":"` + memoHex + `"}]`
-	mustRunJSON(t, jd.CLICommand(ctx, "z_sendmany", fromAddr, recipients), &resp)
-	if resp.OpID == "" {
+	if err := json.Unmarshal(out, &resp); err == nil && resp.OpID != "" {
+		return resp.OpID
+	}
+	opid := strings.TrimSpace(string(out))
+	if opid == "" {
 		t.Fatalf("missing opid")
 	}
-	return resp.OpID
+	return opid
 }
 
 func mustWaitOpSuccess(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, opid string) {
@@ -321,14 +343,57 @@ func mustWaitOpSuccess(t *testing.T, ctx context.Context, jd *testutil.RunningJu
 		out := mustRun(t, jd.CLICommand(ctx, "z_getoperationresult", `["`+opid+`"]`))
 		var res []struct {
 			Status string `json:"status"`
+			Error  *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error,omitempty"`
 		}
-		if err := json.Unmarshal(out, &res); err == nil && len(res) > 0 && res[0].Status == "success" {
-			return
+		if err := json.Unmarshal(out, &res); err == nil && len(res) > 0 {
+			switch res[0].Status {
+			case "success":
+				return
+			case "failed":
+				msg := ""
+				if res[0].Error != nil {
+					msg = res[0].Error.Message
+				}
+				t.Fatalf("operation failed: %s (%s)", opid, msg)
+			}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 
 	t.Fatalf("operation did not succeed: %s", opid)
+}
+
+func mustWaitOrchardBalanceForViewingKey(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, ufvk string, minconf int) int64 {
+	t.Helper()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	type pool struct {
+		ValueZat int64 `json:"valueZat"`
+	}
+	type resp struct {
+		Pools map[string]pool `json:"pools"`
+	}
+
+	for time.Now().Before(deadline) {
+		out := mustRun(t, jd.CLICommand(ctx, "z_getbalanceforviewingkey", ufvk, strconvI(minconf)))
+		var r resp
+		if err := json.Unmarshal(out, &r); err == nil {
+			if p, ok := r.Pools["orchard"]; ok && p.ValueZat > 0 {
+				return p.ValueZat
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatalf("orchard balance not available for minconf=%d", minconf)
+	return 0
 }
 
 func waitForEventKind(t *testing.T, ctx context.Context, st store.Store, walletID string, kind string) store.Event {
@@ -351,6 +416,45 @@ func waitForEventKind(t *testing.T, ctx context.Context, st store.Store, walletI
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("%s not found", kind)
+	return store.Event{}
+}
+
+func waitForEventWithMemoPrefix(t *testing.T, ctx context.Context, st store.Store, walletID string, kind string, memoPrefix string) store.Event {
+	t.Helper()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	type payload struct {
+		TxID    string `json:"txid"`
+		MemoHex string `json:"memo_hex"`
+	}
+
+	for time.Now().Before(deadline) {
+		events, _, err := st.ListWalletEvents(ctx, walletID, 0, 1000)
+		if err == nil {
+			for _, e := range events {
+				if e.Kind != kind {
+					continue
+				}
+				var p payload
+				if err := json.Unmarshal(e.Payload, &p); err != nil {
+					continue
+				}
+				if p.MemoHex == "" {
+					continue
+				}
+				if memoPrefix == "" || strings.HasPrefix(p.MemoHex, memoPrefix) {
+					return e
+				}
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatalf("%s with memo_prefix=%q not found", kind, memoPrefix)
 	return store.Event{}
 }
 
