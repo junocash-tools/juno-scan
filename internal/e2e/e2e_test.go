@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -98,6 +99,25 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 
 	mustWaitForDepositEvent(t, ctx, baseURL, "hot")
+
+	notes := mustGetNotes(t, ctx, baseURL, "hot", false)
+	if len(notes) == 0 || notes[0].Position == nil {
+		t.Fatalf("expected at least 1 note with position")
+	}
+	if *notes[0].Position < 0 {
+		t.Fatalf("invalid note position: %d", *notes[0].Position)
+	}
+
+	wit := mustGetWitness(t, ctx, baseURL, []uint32{uint32(*notes[0].Position)})
+	if wit.Root == "" {
+		t.Fatalf("missing witness root")
+	}
+	if len(wit.Paths) != 1 {
+		t.Fatalf("expected 1 witness path, got %d", len(wit.Paths))
+	}
+	if len(wit.Paths[0].AuthPath) != 32 {
+		t.Fatalf("expected auth_path length 32, got %d", len(wit.Paths[0].AuthPath))
+	}
 }
 
 func mustWaitHTTP(t *testing.T, ctx context.Context, url string) {
@@ -154,6 +174,74 @@ func mustWaitForDepositEvent(t *testing.T, ctx context.Context, baseURL, walletI
 	}
 
 	t.Fatalf("deposit event not found via API")
+}
+
+type apiNote struct {
+	TxID        string `json:"txid"`
+	ActionIndex int32  `json:"action_index"`
+	Position    *int64 `json:"position,omitempty"`
+}
+
+func mustGetNotes(t *testing.T, ctx context.Context, baseURL, walletID string, spent bool) []apiNote {
+	t.Helper()
+
+	url := fmt.Sprintf("%s/v1/wallets/%s/notes?spent=%t", baseURL, walletID, spent)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/wallets/%s/notes: %v", walletID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/wallets/%s/notes status=%d", walletID, resp.StatusCode)
+	}
+	var out struct {
+		Notes []apiNote `json:"notes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode notes: %v", err)
+	}
+	return out.Notes
+}
+
+type witnessResponse struct {
+	Status       string `json:"status"`
+	AnchorHeight int64  `json:"anchor_height"`
+	Root         string `json:"root"`
+	Paths        []struct {
+		Position uint32   `json:"position"`
+		AuthPath []string `json:"auth_path"`
+	} `json:"paths"`
+}
+
+func mustGetWitness(t *testing.T, ctx context.Context, baseURL string, positions []uint32) witnessResponse {
+	t.Helper()
+
+	body, _ := json.Marshal(map[string]any{
+		"positions": positions,
+	})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/orchard/witness", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/orchard/witness: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST /v1/orchard/witness status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out witnessResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode witness: %v", err)
+	}
+	if out.Status != "ok" {
+		t.Fatalf("unexpected witness status=%q", out.Status)
+	}
+	if out.AnchorHeight < 0 {
+		t.Fatalf("invalid anchor_height=%d", out.AnchorHeight)
+	}
+	return out
 }
 
 func mustFreePort(t *testing.T) int {
