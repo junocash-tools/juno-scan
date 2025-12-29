@@ -21,7 +21,7 @@ services:
       - -rpcpassword=rpcpass
       - -zmqpubhashblock=tcp://0.0.0.0:28332
     ports:
-      - 18232:8232
+      - 28232:8232
       - 28332:28332
     volumes:
       - junocashd-data:/data
