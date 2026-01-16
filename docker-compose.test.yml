@@ -5,7 +5,7 @@ services:
       context: .
       dockerfile: docker/junocashd/Dockerfile
       args:
-        JUNOCASH_VERSION: 0.9.7
+        JUNOCASH_VERSION: 0.9.8
     command:
       - -regtest
       - -server=1
