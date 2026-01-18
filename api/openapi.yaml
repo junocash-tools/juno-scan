@@ -1,0 +1,340 @@
+openapi: 3.0.3
+info:
+  title: juno-scan HTTP API
+  version: v1
+servers:
+  - url: http://127.0.0.1:8080
+paths:
+  /v1/health:
+    get:
+      summary: Health / status
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /v1/wallets:
+    get:
+      summary: List wallets
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListWalletsResponse"
+        "500":
+          description: DB error
+          content:
+            text/plain:
+              schema:
+                type: string
+    post:
+      summary: Upsert wallet UFVK
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpsertWalletRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpsertWalletResponse"
+        "400":
+          description: Invalid request
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: Validation/DB error
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/wallets/{wallet_id}/events:
+    get:
+      summary: List wallet events
+      parameters:
+        - name: wallet_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListWalletEventsResponse"
+        "400":
+          description: Invalid request
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: DB error
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/wallets/{wallet_id}/notes:
+    get:
+      summary: List wallet notes
+      parameters:
+        - name: wallet_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: spent
+          in: query
+          required: false
+          schema:
+            type: string
+            description: When set to true, include spent notes
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListWalletNotesResponse"
+        "400":
+          description: Invalid request
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: DB error
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/orchard/witness:
+    post:
+      summary: Compute Orchard witnesses
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WitnessRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WitnessResponse"
+        "400":
+          description: Invalid request
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: DB / witness error
+          content:
+            text/plain:
+              schema:
+                type: string
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        scanned_height:
+          type: integer
+          format: int64
+        scanned_hash:
+          type: string
+      additionalProperties: true
+    Wallet:
+      type: object
+      required: [wallet_id, created_at]
+      properties:
+        wallet_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        disabled_at:
+          type: string
+          format: date-time
+      additionalProperties: true
+    ListWalletsResponse:
+      type: object
+      required: [wallets]
+      properties:
+        wallets:
+          type: array
+          items:
+            $ref: "#/components/schemas/Wallet"
+      additionalProperties: true
+    UpsertWalletRequest:
+      type: object
+      required: [wallet_id, ufvk]
+      properties:
+        wallet_id:
+          type: string
+        ufvk:
+          type: string
+      additionalProperties: false
+    UpsertWalletResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+      additionalProperties: true
+    WalletEvent:
+      type: object
+      required: [id, kind, height, payload, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        kind:
+          type: string
+        height:
+          type: integer
+          format: int64
+        payload:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: true
+    ListWalletEventsResponse:
+      type: object
+      required: [events, next_cursor]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/WalletEvent"
+        next_cursor:
+          type: integer
+          format: int64
+      additionalProperties: true
+    WalletNote:
+      type: object
+      required: [txid, action_index, height, recipient_address, value_zat, note_nullifier, created_at]
+      properties:
+        txid:
+          type: string
+        action_index:
+          type: integer
+          format: int32
+        height:
+          type: integer
+          format: int64
+        position:
+          type: integer
+          format: int64
+        recipient_address:
+          type: string
+        value_zat:
+          type: integer
+          format: int64
+        note_nullifier:
+          type: string
+        spent_height:
+          type: integer
+          format: int64
+        spent_txid:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: true
+    ListWalletNotesResponse:
+      type: object
+      required: [notes]
+      properties:
+        notes:
+          type: array
+          items:
+            $ref: "#/components/schemas/WalletNote"
+      additionalProperties: true
+    WitnessRequest:
+      type: object
+      required: [positions]
+      properties:
+        anchor_height:
+          type: integer
+          format: int64
+          minimum: 0
+          description: If omitted, the current scanned tip height is used
+        positions:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            type: integer
+            minimum: 0
+            maximum: 4294967295
+      additionalProperties: false
+    WitnessPath:
+      type: object
+      required: [position, auth_path]
+      properties:
+        position:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+        auth_path:
+          type: array
+          items:
+            type: string
+      additionalProperties: true
+    WitnessResponse:
+      type: object
+      required: [status, anchor_height, root, paths]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        anchor_height:
+          type: integer
+          format: int64
+        root:
+          type: string
+        paths:
+          type: array
+          items:
+            $ref: "#/components/schemas/WitnessPath"
+      additionalProperties: true

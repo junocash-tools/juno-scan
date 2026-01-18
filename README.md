@@ -162,6 +162,12 @@ The broker message key is derived from `payload.txid` when present (falls back t
 - `GET /v1/wallets/{wallet_id}/notes[?spent=true]` → unspent notes (default) or all notes
 - `POST /v1/orchard/witness` → compute Orchard witnesses for commitment positions
 
+HTTP API stability:
+
+- Endpoints are versioned under `/v1`. Breaking changes must be introduced under a new path version.
+- OpenAPI: `api/openapi.yaml`
+- Error responses are currently `text/plain` via `http.Error` (status code + message). Treat non-2xx as failure; do not parse error bodies as JSON.
+
 `/v1/orchard/witness` request:
 
 ```json
@@ -176,6 +182,7 @@ If `anchor_height` is omitted, the current scanned tip height is used.
 ## Events
 
 Events are available via `GET /v1/wallets/{wallet_id}/events` (and optionally via the broker outbox).
+Payload shapes are documented in `docs/events.md`.
 
 Deposit lifecycle:
 
