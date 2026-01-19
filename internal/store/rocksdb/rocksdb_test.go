@@ -71,7 +71,7 @@ func TestStore_RollbackUnspendsAndDeletes(t *testing.T) {
 		}
 
 		p0 := int64(0)
-		if err := tx.InsertNote(ctx, store.Note{
+		if _, err := tx.InsertNote(ctx, store.Note{
 			WalletID:         "hot",
 			TxID:             "tx1",
 			ActionIndex:      0,

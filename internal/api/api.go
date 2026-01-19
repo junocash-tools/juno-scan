@@ -4,24 +4,41 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Abdullah1738/juno-scan/internal/backfill"
 	"github.com/Abdullah1738/juno-scan/internal/orchardscan"
 	"github.com/Abdullah1738/juno-scan/internal/store"
 )
 
 type Server struct {
 	st store.Store
+	bf *backfill.Service
 }
 
-func New(st store.Store) (*Server, error) {
+type Option func(*Server)
+
+func WithBackfillService(bf *backfill.Service) Option {
+	return func(s *Server) {
+		s.bf = bf
+	}
+}
+
+func New(st store.Store, opts ...Option) (*Server, error) {
 	if st == nil {
 		return nil, errors.New("api: store is nil")
 	}
-	return &Server{st: st}, nil
+	s := &Server{st: st}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -82,6 +99,8 @@ func (s *Server) handleWalletSubroutes(w http.ResponseWriter, r *http.Request) {
 		s.handleListWalletEvents(w, r, walletID)
 	case "notes":
 		s.handleListWalletNotes(w, r, walletID)
+	case "backfill":
+		s.handleBackfillWallet(w, r, walletID)
 	default:
 		http.NotFound(w, r)
 	}
@@ -214,6 +233,79 @@ func (s *Server) handleListWalletEvents(w http.ResponseWriter, r *http.Request, 
 	writeJSON(w, map[string]any{
 		"events":      events,
 		"next_cursor": nextCursor,
+	})
+}
+
+func (s *Server) handleBackfillWallet(w http.ResponseWriter, r *http.Request, walletID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if walletID == "" || !isSafeWalletID(walletID) {
+		http.Error(w, "invalid wallet_id", http.StatusBadRequest)
+		return
+	}
+	if s.bf == nil {
+		http.Error(w, "backfill not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		FromHeight int64  `json:"from_height"`
+		ToHeight   *int64 `json:"to_height,omitempty"`
+		BatchSize  int64  `json:"batch_size,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if !errors.Is(err, io.EOF) {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+
+	tip, ok, err := s.st.Tip(ctx)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		http.Error(w, "scanner has not indexed any blocks yet", http.StatusBadRequest)
+		return
+	}
+
+	toHeight := tip.Height
+	if req.ToHeight != nil {
+		toHeight = *req.ToHeight
+	}
+	if toHeight > tip.Height {
+		http.Error(w, "to_height exceeds scanned tip", http.StatusBadRequest)
+		return
+	}
+
+	res, err := s.bf.BackfillWallet(ctx, backfill.Request{
+		WalletID:   walletID,
+		FromHeight: req.FromHeight,
+		ToHeight:   toHeight,
+		BatchSize:  req.BatchSize,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	next := res.NextHeight
+	writeJSON(w, map[string]any{
+		"status":          "ok",
+		"wallet_id":       walletID,
+		"from_height":     res.FromHeight,
+		"to_height":       res.ToHeight,
+		"scanned_from":    res.ScannedFrom,
+		"scanned_to":      res.ScannedTo,
+		"next_height":     next,
+		"inserted_notes":  res.InsertedNotes,
+		"inserted_events": res.InsertedEvents,
 	})
 }
 

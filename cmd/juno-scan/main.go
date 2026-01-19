@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Abdullah1738/juno-scan/internal/api"
+	"github.com/Abdullah1738/juno-scan/internal/backfill"
 	"github.com/Abdullah1738/juno-scan/internal/broker"
 	"github.com/Abdullah1738/juno-scan/internal/config"
 	"github.com/Abdullah1738/juno-scan/internal/publisher"
@@ -76,7 +77,12 @@ func main() {
 		}
 	}()
 
-	apiServer, err := api.New(st)
+	bf, err := backfill.New(st, rpc, cfg.UAHRP, cfg.Confirmations)
+	if err != nil {
+		log.Fatalf("backfill init: %v", err)
+	}
+
+	apiServer, err := api.New(st, api.WithBackfillService(bf))
 	if err != nil {
 		log.Fatalf("api init: %v", err)
 	}

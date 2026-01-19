@@ -604,6 +604,17 @@ ORDER BY position
 	return out, nil
 }
 
+func (s *Store) FirstOrchardCommitmentPositionFromHeight(ctx context.Context, height int64) (int64, bool, error) {
+	var pos sql.NullInt64
+	if err := s.pool.QueryRow(ctx, `SELECT MIN(position) FROM orchard_commitments WHERE height >= $1`, height).Scan(&pos); err != nil {
+		return 0, false, fmt.Errorf("postgres: first commitment position: %w", err)
+	}
+	if !pos.Valid {
+		return 0, false, nil
+	}
+	return pos.Int64, true, nil
+}
+
 type pgTx struct {
 	tx pgx.Tx
 }
@@ -708,18 +719,23 @@ RETURNING wallet_id, txid, action_index, height, position, diversifier_index, re
 	return out, nil
 }
 
-func (t *pgTx) InsertNote(ctx context.Context, n store.Note) error {
-	_, err := t.tx.Exec(ctx, `
+func (t *pgTx) InsertNote(ctx context.Context, n store.Note) (bool, error) {
+	var inserted int
+	err := t.tx.QueryRow(ctx, `
 INSERT INTO notes (
   wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 ON CONFLICT (wallet_id, txid, action_index) DO NOTHING
-`, n.WalletID, n.TxID, n.ActionIndex, n.Height, n.Position, int64(n.DiversifierIndex), n.RecipientAddress, n.ValueZat, n.MemoHex, n.NoteNullifier)
-	if err != nil {
-		return fmt.Errorf("postgres: insert note: %w", err)
+RETURNING 1
+`, n.WalletID, n.TxID, n.ActionIndex, n.Height, n.Position, int64(n.DiversifierIndex), n.RecipientAddress, n.ValueZat, n.MemoHex, n.NoteNullifier).Scan(&inserted)
+	if err == nil {
+		return true, nil
 	}
-	return nil
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return false, fmt.Errorf("postgres: insert note: %w", err)
 }
 
 func (t *pgTx) ConfirmNotes(ctx context.Context, confirmationHeight int64, maxNoteHeight int64) ([]store.Note, error) {

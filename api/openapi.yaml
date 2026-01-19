@@ -103,6 +103,46 @@ paths:
             text/plain:
               schema:
                 type: string
+  /v1/wallets/{wallet_id}/backfill:
+    post:
+      summary: Backfill wallet history (incremental)
+      parameters:
+        - name: wallet_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BackfillRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackfillResponse"
+        "400":
+          description: Invalid request
+          content:
+            text/plain:
+              schema:
+                type: string
+        "503":
+          description: Backfill not enabled
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: DB / RPC error
+          content:
+            text/plain:
+              schema:
+                type: string
   /v1/wallets/{wallet_id}/notes:
     get:
       summary: List wallet notes
@@ -247,6 +287,66 @@ components:
           items:
             $ref: "#/components/schemas/WalletEvent"
         next_cursor:
+          type: integer
+          format: int64
+      additionalProperties: true
+    BackfillRequest:
+      type: object
+      properties:
+        from_height:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+        to_height:
+          type: integer
+          format: int64
+          minimum: 0
+          description: If omitted, the current scanned tip height is used
+        batch_size:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 10000
+          default: 100
+      additionalProperties: false
+    BackfillResponse:
+      type: object
+      required:
+        - status
+        - wallet_id
+        - from_height
+        - to_height
+        - scanned_from
+        - scanned_to
+        - next_height
+        - inserted_notes
+        - inserted_events
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        wallet_id:
+          type: string
+        from_height:
+          type: integer
+          format: int64
+        to_height:
+          type: integer
+          format: int64
+        scanned_from:
+          type: integer
+          format: int64
+        scanned_to:
+          type: integer
+          format: int64
+        next_height:
+          type: integer
+          format: int64
+        inserted_notes:
+          type: integer
+          format: int64
+        inserted_events:
           type: integer
           format: int64
       additionalProperties: true

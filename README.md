@@ -34,7 +34,16 @@ curl -sS -X POST http://127.0.0.1:8080/v1/wallets \
   -d '{"wallet_id":"exchange-hot-001","ufvk":"<ufvk>"}'
 ```
 
-Wallets added after the scanner has already advanced past a height are only detected going forward; to backfill, restart from a fresh database.
+Wallets added after the scanner has already advanced past a height are only detected going forward until you backfill them.
+To backfill a wallet in an existing database, call:
+
+```sh
+curl -sS -X POST http://127.0.0.1:8080/v1/wallets/exchange-hot-001/backfill \
+  -H 'content-type: application/json' \
+  -d '{"from_height":0,"batch_size":10000}'
+```
+
+The response includes `next_height`; repeat calls starting from `next_height` until you reach the scanned tip (or omit `to_height` to default to the current scanned tip). You can also restart from a fresh database to rescan everything.
 
 Fetch events / notes:
 
@@ -159,6 +168,7 @@ The broker message key is derived from `payload.txid` when present (falls back t
 - `GET /v1/wallets` → list wallets
 - `POST /v1/wallets` → upsert wallet `{wallet_id, ufvk}`
 - `GET /v1/wallets/{wallet_id}/events?cursor=<id>&limit=<n>` → wallet event stream (default limit: 100, max: 1000)
+- `POST /v1/wallets/{wallet_id}/backfill` → backfill wallet history (incremental)
 - `GET /v1/wallets/{wallet_id}/notes[?spent=true]` → unspent notes (default) or all notes
 - `POST /v1/orchard/witness` → compute Orchard witnesses for commitment positions
 

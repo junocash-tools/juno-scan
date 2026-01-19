@@ -280,7 +280,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 					memo := n.MemoHex
 					memoHexPtr = &memo
 				}
-				if err := tx.InsertNote(ctx, store.Note{
+				inserted, err := tx.InsertNote(ctx, store.Note{
 					WalletID:         n.WalletID,
 					TxID:             t.TxID,
 					ActionIndex:      int32(n.ActionIndex),
@@ -291,40 +291,43 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 					ValueZat:         int64(n.ValueZat),
 					MemoHex:          memoHexPtr,
 					NoteNullifier:    n.NoteNullifier,
-				}); err != nil {
+				})
+				if err != nil {
 					return err
 				}
 
-				payload := events.DepositEventPayload{
-					DepositEvent: types.DepositEvent{
-						Version:          types.V1,
-						WalletID:         n.WalletID,
-						DiversifierIndex: n.DiversifierIndex,
-						TxID:             t.TxID,
-						Height:           blk.Height,
-						ActionIndex:      n.ActionIndex,
-						AmountZatoshis:   n.ValueZat,
-						MemoHex:          n.MemoHex,
-						Status: types.TxStatus{
-							State:         types.TxStateConfirmed,
-							Height:        blk.Height,
-							Confirmations: 1,
+				if inserted {
+					payload := events.DepositEventPayload{
+						DepositEvent: types.DepositEvent{
+							Version:          types.V1,
+							WalletID:         n.WalletID,
+							DiversifierIndex: n.DiversifierIndex,
+							TxID:             t.TxID,
+							Height:           blk.Height,
+							ActionIndex:      n.ActionIndex,
+							AmountZatoshis:   n.ValueZat,
+							MemoHex:          n.MemoHex,
+							Status: types.TxStatus{
+								State:         types.TxStateConfirmed,
+								Height:        blk.Height,
+								Confirmations: 1,
+							},
 						},
-					},
-					RecipientAddress: n.RecipientAddress,
-					NoteNullifier:    n.NoteNullifier,
-				}
-				payloadBytes, err := json.Marshal(payload)
-				if err != nil {
-					return fmt.Errorf("scanner: marshal event payload: %w", err)
-				}
-				if err := tx.InsertEvent(ctx, store.Event{
-					Kind:     events.KindDepositEvent,
-					WalletID: n.WalletID,
-					Height:   blk.Height,
-					Payload:  payloadBytes,
-				}); err != nil {
-					return err
+						RecipientAddress: n.RecipientAddress,
+						NoteNullifier:    n.NoteNullifier,
+					}
+					payloadBytes, err := json.Marshal(payload)
+					if err != nil {
+						return fmt.Errorf("scanner: marshal event payload: %w", err)
+					}
+					if err := tx.InsertEvent(ctx, store.Event{
+						Kind:     events.KindDepositEvent,
+						WalletID: n.WalletID,
+						Height:   blk.Height,
+						Payload:  payloadBytes,
+					}); err != nil {
+						return err
+					}
 				}
 			}
 		}

@@ -990,6 +990,36 @@ func (s *Store) ListOrchardCommitmentsUpToHeight(ctx context.Context, height int
 	return out, nil
 }
 
+func (s *Store) FirstOrchardCommitmentPositionFromHeight(ctx context.Context, height int64) (int64, bool, error) {
+	_ = ctx
+	if height < 0 {
+		height = 0
+	}
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: commitmentPrefix,
+		UpperBound: prefixUpperBound(commitmentPrefix),
+	})
+	if err != nil {
+		return 0, false, fmt.Errorf("rocksdb: iter: %w", err)
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var rec commitmentRecord
+		if err := json.Unmarshal(iter.Value(), &rec); err != nil {
+			return 0, false, fmt.Errorf("rocksdb: decode commitment: %w", err)
+		}
+		if rec.Height >= height {
+			return int64(rec.Position), true, nil
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return 0, false, fmt.Errorf("rocksdb: iter: %w", err)
+	}
+	return 0, false, nil
+}
+
 type rocksTx struct {
 	db    *pebble.DB
 	batch *pebble.Batch
@@ -1465,18 +1495,18 @@ func (t *rocksTx) ConfirmSpends(ctx context.Context, confirmationHeight int64, m
 	return out, nil
 }
 
-func (t *rocksTx) InsertNote(ctx context.Context, n store.Note) error {
+func (t *rocksTx) InsertNote(ctx context.Context, n store.Note) (bool, error) {
 	_ = ctx
 	if n.Height < 0 {
-		return errors.New("rocksdb: negative height")
+		return false, errors.New("rocksdb: negative height")
 	}
 
 	key := keyNote(n.WalletID, n.TxID, n.ActionIndex)
 	if _, closer, err := t.db.Get(key); err == nil {
 		_ = closer.Close()
-		return nil
+		return false, nil
 	} else if !errors.Is(err, pebble.ErrNotFound) {
-		return fmt.Errorf("rocksdb: get note: %w", err)
+		return false, fmt.Errorf("rocksdb: get note: %w", err)
 	}
 
 	rec := noteRecord{
@@ -1497,22 +1527,22 @@ func (t *rocksTx) InsertNote(ctx context.Context, n store.Note) error {
 	}
 	b, err := json.Marshal(rec)
 	if err != nil {
-		return fmt.Errorf("rocksdb: encode note: %w", err)
+		return false, fmt.Errorf("rocksdb: encode note: %w", err)
 	}
 	if err := t.batch.Set(key, b, pebble.NoSync); err != nil {
-		return fmt.Errorf("rocksdb: insert note: %w", err)
+		return false, fmt.Errorf("rocksdb: insert note: %w", err)
 	}
 
 	if err := t.batch.Set(keyNullifier(n.NoteNullifier), key, pebble.NoSync); err != nil {
-		return fmt.Errorf("rocksdb: insert nullifier: %w", err)
+		return false, fmt.Errorf("rocksdb: insert nullifier: %w", err)
 	}
 	if err := t.batch.Set(keyNoteHeightIndex(uint64(n.Height), n.WalletID, n.TxID, n.ActionIndex), []byte(n.NoteNullifier), pebble.NoSync); err != nil {
-		return fmt.Errorf("rocksdb: insert note height index: %w", err)
+		return false, fmt.Errorf("rocksdb: insert note height index: %w", err)
 	}
 	if err := t.batch.Set(keyWalletNoteIndex(uint64(n.Height), n.WalletID, n.TxID, n.ActionIndex), nil, pebble.NoSync); err != nil {
-		return fmt.Errorf("rocksdb: insert wallet note index: %w", err)
+		return false, fmt.Errorf("rocksdb: insert wallet note index: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func (t *rocksTx) InsertEvent(ctx context.Context, e store.Event) error {

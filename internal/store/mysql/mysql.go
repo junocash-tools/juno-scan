@@ -616,6 +616,17 @@ ORDER BY position
 	return out, nil
 }
 
+func (s *Store) FirstOrchardCommitmentPositionFromHeight(ctx context.Context, height int64) (int64, bool, error) {
+	var pos sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT MIN(position) FROM orchard_commitments WHERE height >= ?`, height).Scan(&pos); err != nil {
+		return 0, false, fmt.Errorf("mysql: first commitment position: %w", err)
+	}
+	if !pos.Valid {
+		return 0, false, nil
+	}
+	return pos.Int64, true, nil
+}
+
 type myTx struct {
 	tx *sql.Tx
 }
@@ -777,17 +788,21 @@ WHERE spent_height IS NULL AND note_nullifier IN (`)
 	return out, nil
 }
 
-func (t *myTx) InsertNote(ctx context.Context, n store.Note) error {
-	_, err := t.tx.ExecContext(ctx, `
+func (t *myTx) InsertNote(ctx context.Context, n store.Note) (bool, error) {
+	res, err := t.tx.ExecContext(ctx, `
 INSERT IGNORE INTO notes (
   wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier
 )
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `, n.WalletID, n.TxID, n.ActionIndex, n.Height, n.Position, int64(n.DiversifierIndex), n.RecipientAddress, n.ValueZat, n.MemoHex, n.NoteNullifier)
 	if err != nil {
-		return fmt.Errorf("mysql: insert note: %w", err)
+		return false, fmt.Errorf("mysql: insert note: %w", err)
 	}
-	return nil
+	affected, err := res.RowsAffected()
+	if err == nil && affected > 0 {
+		return true, nil
+	}
+	return false, nil
 }
 
 func (t *myTx) ConfirmNotes(ctx context.Context, confirmationHeight int64, maxNoteHeight int64) ([]store.Note, error) {

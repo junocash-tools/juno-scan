@@ -26,6 +26,7 @@ type Store interface {
 	ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int) (events []Event, nextCursor int64, err error)
 	ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]Note, error)
 	ListOrchardCommitmentsUpToHeight(ctx context.Context, height int64) ([]OrchardCommitment, error)
+	FirstOrchardCommitmentPositionFromHeight(ctx context.Context, height int64) (pos int64, ok bool, err error)
 }
 
 type Tx interface {
@@ -36,7 +37,7 @@ type Tx interface {
 	MarkNotesSpent(ctx context.Context, height int64, txid string, nullifiers []string) ([]Note, error)
 	ConfirmNotes(ctx context.Context, confirmationHeight int64, maxNoteHeight int64) ([]Note, error)
 	ConfirmSpends(ctx context.Context, confirmationHeight int64, maxSpentHeight int64) ([]Note, error)
-	InsertNote(ctx context.Context, n Note) error
+	InsertNote(ctx context.Context, n Note) (inserted bool, err error)
 	InsertEvent(ctx context.Context, e Event) error
 }
 
