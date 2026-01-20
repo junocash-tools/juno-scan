@@ -202,6 +202,16 @@ func (s *Server) handleListWalletEvents(w http.ResponseWriter, r *http.Request, 
 		limit = 100
 	}
 
+	var blockHeight *int64
+	if v := strings.TrimSpace(r.URL.Query().Get("block_height")); v != "" {
+		h, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || h < 0 {
+			http.Error(w, "invalid block_height", http.StatusBadRequest)
+			return
+		}
+		blockHeight = &h
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
@@ -213,7 +223,7 @@ func (s *Server) handleListWalletEvents(w http.ResponseWriter, r *http.Request, 
 		CreatedAt time.Time       `json:"created_at"`
 	}
 
-	evs, nextCursor, err := s.st.ListWalletEvents(ctx, walletID, cursor, int(limit))
+	evs, nextCursor, err := s.st.ListWalletEvents(ctx, walletID, cursor, int(limit), blockHeight)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return

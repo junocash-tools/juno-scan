@@ -4,6 +4,11 @@ Wallet events are returned by:
 
 - `GET /v1/wallets/{wallet_id}/events`
 
+Query parameters:
+
+- `cursor` / `limit`: paginate by event id.
+- `block_height` (optional): filter to events emitted at a specific height (debug/audit only; not recommended due to reorg risk).
+
 Each item has:
 
 - `kind`: identifies the payload type

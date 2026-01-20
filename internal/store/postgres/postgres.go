@@ -479,18 +479,30 @@ DO UPDATE SET cursor = EXCLUDED.cursor, updated_at = now()
 	return nil
 }
 
-func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int) ([]store.Event, int64, error) {
+func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, blockHeight *int64) ([]store.Event, int64, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
+	if blockHeight != nil && *blockHeight < 0 {
+		return nil, afterID, errors.New("postgres: negative blockHeight")
+	}
 
-	rows, err := s.pool.Query(ctx, `
+	query := `
 SELECT id, kind, height, payload, created_at
 FROM events
 WHERE wallet_id = $1 AND id > $2
-ORDER BY id
-LIMIT $3
-`, walletID, afterID, limit)
+`
+	args := []any{walletID, afterID}
+	argN := 3
+	if blockHeight != nil {
+		query += fmt.Sprintf(" AND height = $%d\n", argN)
+		args = append(args, *blockHeight)
+		argN++
+	}
+	query += fmt.Sprintf("ORDER BY id\nLIMIT $%d\n", argN)
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, afterID, fmt.Errorf("postgres: list events: %w", err)
 	}

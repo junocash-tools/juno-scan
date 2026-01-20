@@ -829,13 +829,71 @@ func (s *Store) SetWalletEventPublishCursor(ctx context.Context, walletID string
 	return nil
 }
 
-func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int) ([]store.Event, int64, error) {
+func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, blockHeight *int64) ([]store.Event, int64, error) {
 	_ = ctx
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
 	if afterID < 0 {
 		afterID = 0
+	}
+	if blockHeight != nil && *blockHeight < 0 {
+		return nil, afterID, errors.New("rocksdb: negative blockHeight")
+	}
+
+	if blockHeight != nil {
+		height := uint64(*blockHeight)
+
+		iter, err := s.db.NewIter(&pebble.IterOptions{
+			LowerBound: keyEventHeightIndex(height, walletID, uint64(afterID+1)),
+			UpperBound: prefixUpperBound(keyEventHeightPrefix(height, walletID)),
+		})
+		if err != nil {
+			return nil, afterID, fmt.Errorf("rocksdb: iter: %w", err)
+		}
+		defer iter.Close()
+
+		var out []store.Event
+		nextCursor := afterID
+		for iter.First(); iter.Valid(); iter.Next() {
+			if len(out) >= limit {
+				break
+			}
+
+			id, err := parseEventHeightIndexID(iter.Key(), height, walletID)
+			if err != nil {
+				return nil, afterID, err
+			}
+
+			v, closer, err := s.db.Get(keyEvent(walletID, id))
+			if err != nil {
+				if errors.Is(err, pebble.ErrNotFound) {
+					continue
+				}
+				return nil, afterID, fmt.Errorf("rocksdb: get event: %w", err)
+			}
+
+			var rec eventRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				_ = closer.Close()
+				return nil, afterID, fmt.Errorf("rocksdb: decode event: %w", err)
+			}
+			_ = closer.Close()
+
+			nextCursor = int64(id)
+			out = append(out, store.Event{
+				ID:        int64(id),
+				Kind:      rec.Kind,
+				WalletID:  walletID,
+				Height:    rec.Height,
+				Payload:   json.RawMessage(rec.Payload),
+				CreatedAt: time.Unix(rec.CreatedAtUnix, 0).UTC(),
+			})
+		}
+		if err := iter.Error(); err != nil {
+			return nil, afterID, fmt.Errorf("rocksdb: list events: %w", err)
+		}
+		return out, nextCursor, nil
 	}
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
@@ -2221,6 +2279,16 @@ func keyEventPrefix(walletID string) []byte {
 	return b
 }
 
+func keyEventHeightPrefix(height uint64, walletID string) []byte {
+	b := make([]byte, 0, len(eventHeightPrefix)+20+1+len(walletID)+1)
+	b = append(b, eventHeightPrefix...)
+	b = appendUint64Fixed20(b, height)
+	b = append(b, '/')
+	b = append(b, walletID...)
+	b = append(b, '/')
+	return b
+}
+
 func parseEventID(key []byte, walletID string) (uint64, error) {
 	prefix := keyEventPrefix(walletID)
 	if !bytes.HasPrefix(key, prefix) {
@@ -2229,6 +2297,18 @@ func parseEventID(key []byte, walletID string) (uint64, error) {
 	idBytes := bytes.TrimPrefix(key, prefix)
 	if len(idBytes) != 20 {
 		return 0, errors.New("rocksdb: event id invalid")
+	}
+	return strconv.ParseUint(string(idBytes), 10, 64)
+}
+
+func parseEventHeightIndexID(key []byte, height uint64, walletID string) (uint64, error) {
+	prefix := keyEventHeightPrefix(height, walletID)
+	if !bytes.HasPrefix(key, prefix) {
+		return 0, errors.New("rocksdb: event height key prefix mismatch")
+	}
+	idBytes := bytes.TrimPrefix(key, prefix)
+	if len(idBytes) != 20 {
+		return 0, errors.New("rocksdb: event height id invalid")
 	}
 	return strconv.ParseUint(string(idBytes), 10, 64)
 }

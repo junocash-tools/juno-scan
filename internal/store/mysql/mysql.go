@@ -475,18 +475,28 @@ func (s *Store) SetWalletEventPublishCursor(ctx context.Context, walletID string
 	return nil
 }
 
-func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int) ([]store.Event, int64, error) {
+func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, blockHeight *int64) ([]store.Event, int64, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
+	if blockHeight != nil && *blockHeight < 0 {
+		return nil, afterID, errors.New("mysql: negative blockHeight")
+	}
 
-	rows, err := s.db.QueryContext(ctx, `
+	query := `
 SELECT id, kind, height, payload, created_at
 FROM events
 WHERE wallet_id = ? AND id > ?
-ORDER BY id
-LIMIT ?
-`, walletID, afterID, limit)
+`
+	args := []any{walletID, afterID}
+	if blockHeight != nil {
+		query += " AND height = ?\n"
+		args = append(args, *blockHeight)
+	}
+	query += "ORDER BY id\nLIMIT ?\n"
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, afterID, fmt.Errorf("mysql: list events: %w", err)
 	}

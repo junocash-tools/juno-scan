@@ -93,6 +93,28 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 
 	mustWaitForEventKind(t, ctx, baseURL, "hot", "DepositEvent")
 
+	// block_height filter (debug/audit)
+	allEvents := mustGetEvents(t, ctx, baseURL, "hot", nil)
+	depositHeight := int64(-1)
+	for _, e := range allEvents {
+		if e.Kind == "DepositEvent" {
+			depositHeight = e.Height
+			break
+		}
+	}
+	if depositHeight < 0 {
+		t.Fatalf("DepositEvent not found via API")
+	}
+	atHeight := mustGetEvents(t, ctx, baseURL, "hot", &depositHeight)
+	if len(atHeight) == 0 {
+		t.Fatalf("expected events at height=%d", depositHeight)
+	}
+	for _, e := range atHeight {
+		if e.Height != depositHeight {
+			t.Fatalf("expected all filtered events at height=%d, got %+v", depositHeight, atHeight)
+		}
+	}
+
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	mustWaitForEventKind(t, ctx, baseURL, "hot", "DepositConfirmed")
 
@@ -193,6 +215,38 @@ func mustWaitForEventKind(t *testing.T, ctx context.Context, baseURL, walletID, 
 	}
 
 	t.Fatalf("%s not found via API", kind)
+}
+
+type apiEvent struct {
+	Kind   string `json:"kind"`
+	Height int64  `json:"height"`
+}
+
+func mustGetEvents(t *testing.T, ctx context.Context, baseURL, walletID string, blockHeight *int64) []apiEvent {
+	t.Helper()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	url := fmt.Sprintf("%s/v1/wallets/%s/events?cursor=0&limit=1000", baseURL, walletID)
+	if blockHeight != nil {
+		url += fmt.Sprintf("&block_height=%d", *blockHeight)
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/wallets/%s/events: %v", walletID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/wallets/%s/events status=%d", walletID, resp.StatusCode)
+	}
+
+	var out struct {
+		Events []apiEvent `json:"events"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode events: %v", err)
+	}
+	return out.Events
 }
 
 type apiNote struct {

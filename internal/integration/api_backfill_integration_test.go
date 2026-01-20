@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -101,7 +102,7 @@ func TestIntegration_API_BackfillWallet(t *testing.T) {
 	}
 
 	// Without backfill, the historic deposit is not detected.
-	evs := mustListEvents(t, ctx, srv.URL, "hot")
+	evs := mustListEvents(t, ctx, srv.URL, "hot", nil)
 	if countKind(evs, "DepositEvent") != 0 {
 		t.Fatalf("expected no DepositEvent before backfill")
 	}
@@ -120,7 +121,7 @@ func TestIntegration_API_BackfillWallet(t *testing.T) {
 		t.Fatalf("POST /v1/wallets/hot/backfill status=%d", bfResp.StatusCode)
 	}
 
-	evs = mustListEvents(t, ctx, srv.URL, "hot")
+	evs = mustListEvents(t, ctx, srv.URL, "hot", nil)
 	if countKind(evs, "DepositEvent") != 1 {
 		t.Fatalf("expected DepositEvent after backfill")
 	}
@@ -138,9 +139,31 @@ func TestIntegration_API_BackfillWallet(t *testing.T) {
 		t.Fatalf("POST /v1/wallets/hot/backfill(2) status=%d", bfResp2.StatusCode)
 	}
 
-	evs2 := mustListEvents(t, ctx, srv.URL, "hot")
+	evs2 := mustListEvents(t, ctx, srv.URL, "hot", nil)
 	if countKind(evs2, "DepositEvent") != 1 {
 		t.Fatalf("expected DepositEvent to remain single after second backfill")
+	}
+
+	// block_height filter (debug/audit)
+	depositHeight := int64(-1)
+	for _, e := range evs2 {
+		if e.Kind == "DepositEvent" {
+			depositHeight = e.Height
+			break
+		}
+	}
+	if depositHeight < 0 {
+		t.Fatalf("expected DepositEvent with a height")
+	}
+
+	evsAtHeight := mustListEvents(t, ctx, srv.URL, "hot", &depositHeight)
+	if countKind(evsAtHeight, "DepositEvent") != 1 {
+		t.Fatalf("expected DepositEvent via block_height filter")
+	}
+	for _, e := range evsAtHeight {
+		if e.Height != depositHeight {
+			t.Fatalf("expected all filtered events at height=%d, got %+v", depositHeight, evsAtHeight)
+		}
 	}
 }
 
@@ -167,13 +190,19 @@ func waitForScannerTip(t *testing.T, ctx context.Context, st store.Store, rpc *s
 }
 
 type walletEvent struct {
-	Kind string `json:"kind"`
+	Kind   string `json:"kind"`
+	Height int64  `json:"height"`
 }
 
-func mustListEvents(t *testing.T, ctx context.Context, baseURL string, walletID string) []walletEvent {
+func mustListEvents(t *testing.T, ctx context.Context, baseURL string, walletID string, blockHeight *int64) []walletEvent {
 	t.Helper()
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/wallets/"+walletID+"/events?cursor=0&limit=1000", nil)
+	url := baseURL + "/v1/wallets/" + walletID + "/events?cursor=0&limit=1000"
+	if blockHeight != nil {
+		url += "&block_height=" + strconv.FormatInt(*blockHeight, 10)
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
 		t.Fatalf("GET /v1/wallets/%s/events: %v", walletID, err)

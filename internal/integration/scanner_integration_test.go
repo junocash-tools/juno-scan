@@ -426,7 +426,7 @@ func waitForEventKind(t *testing.T, ctx context.Context, st store.Store, walletI
 	}
 
 	for time.Now().Before(deadline) {
-		events, _, err := st.ListWalletEvents(ctx, walletID, 0, 10)
+		events, _, err := st.ListWalletEvents(ctx, walletID, 0, 10, nil)
 		if err == nil {
 			for _, e := range events {
 				if e.Kind == kind {
@@ -454,7 +454,7 @@ func waitForEventWithMemoPrefix(t *testing.T, ctx context.Context, st store.Stor
 	}
 
 	for time.Now().Before(deadline) {
-		events, _, err := st.ListWalletEvents(ctx, walletID, 0, 1000)
+		events, _, err := st.ListWalletEvents(ctx, walletID, 0, 1000, nil)
 		if err == nil {
 			for _, e := range events {
 				if e.Kind != kind {

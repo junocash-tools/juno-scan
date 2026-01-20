@@ -84,6 +84,14 @@ paths:
             minimum: 1
             maximum: 1000
             default: 100
+        - name: block_height
+          in: query
+          required: false
+          description: Filter to events emitted at a specific block height (debug/audit only; not recommended due to reorg risk).
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
       responses:
         "200":
           description: OK

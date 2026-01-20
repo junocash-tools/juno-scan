@@ -158,7 +158,7 @@ func TestStore_RollbackUnspendsAndDeletes(t *testing.T) {
 		t.Fatalf("expected 1 unspent note after rollback, got %+v", unspent)
 	}
 
-	eventsAfterRollback, _, err := st.ListWalletEvents(ctx, "hot", 0, 100)
+	eventsAfterRollback, _, err := st.ListWalletEvents(ctx, "hot", 0, 100, nil)
 	if err != nil {
 		t.Fatalf("ListWalletEvents(after rollback): %v", err)
 	}
@@ -187,7 +187,7 @@ func TestStore_RollbackUnspendsAndDeletes(t *testing.T) {
 		t.Fatalf("expected 0 notes after rollback to 0, got %d", len(notesAfter))
 	}
 
-	events, _, err := st.ListWalletEvents(ctx, "hot", 0, 100)
+	events, _, err := st.ListWalletEvents(ctx, "hot", 0, 100, nil)
 	if err != nil {
 		t.Fatalf("ListWalletEvents: %v", err)
 	}
