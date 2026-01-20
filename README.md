@@ -53,6 +53,8 @@ curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes"           # u
 curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes?spent=true" # include spent
 ```
 
+If you configured `-api-bearer-token`, include `-H 'Authorization: Bearer <token>'` in all requests.
+
 ## Configuration
 
 All configuration can be provided via flags or environment variables.
@@ -61,6 +63,7 @@ Durations use Go’s `time.ParseDuration` format (e.g. `500ms`, `2s`, `1m`).
 | Flag | Env var | Default | Notes |
 | --- | --- | --- | --- |
 | `-listen` | `JUNO_SCAN_LISTEN` | `127.0.0.1:8080` | HTTP listen address |
+| `-api-bearer-token` | `JUNO_SCAN_API_BEARER_TOKEN` | _(empty)_ | Optional bearer token required for all HTTP API requests (`Authorization: Bearer ...`). Not recommended as primary auth; prefer a private connection between services with mTLS at the proxy/load balancer. |
 | `-rpc-url` | `JUNO_SCAN_RPC_URL` | `http://127.0.0.1:8232` | `junocashd` RPC URL |
 | `-rpc-user` | `JUNO_SCAN_RPC_USER` | _(empty)_ | `junocashd` RPC username |
 | `-rpc-pass` | `JUNO_SCAN_RPC_PASS` | _(empty)_ | `junocashd` RPC password |
@@ -171,6 +174,10 @@ The broker message key is derived from `payload.txid` when present (falls back t
 - `POST /v1/wallets/{wallet_id}/backfill` → backfill wallet history (incremental)
 - `GET /v1/wallets/{wallet_id}/notes[?spent=true]` → unspent notes (default) or all notes
 - `POST /v1/orchard/witness` → compute Orchard witnesses for commitment positions
+
+HTTP API authentication (optional):
+
+- If `-api-bearer-token` is set, clients must send `Authorization: Bearer <token>` on all requests. This is a convenience mechanism for internal service-to-service auth; prefer a private network and mTLS on the proxy/load balancer.
 
 HTTP API stability:
 

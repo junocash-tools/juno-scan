@@ -82,7 +82,10 @@ func main() {
 		log.Fatalf("backfill init: %v", err)
 	}
 
-	apiServer, err := api.New(st, api.WithBackfillService(bf))
+	apiServer, err := api.New(st,
+		api.WithBackfillService(bf),
+		api.WithBearerToken(cfg.APIBearerToken),
+	)
 	if err != nil {
 		log.Fatalf("api init: %v", err)
 	}

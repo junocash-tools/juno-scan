@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,6 +19,8 @@ import (
 type Server struct {
 	st store.Store
 	bf *backfill.Service
+
+	bearerToken string
 }
 
 type Option func(*Server)
@@ -25,6 +28,13 @@ type Option func(*Server)
 func WithBackfillService(bf *backfill.Service) Option {
 	return func(s *Server) {
 		s.bf = bf
+	}
+}
+
+func WithBearerToken(token string) Option {
+	token = strings.TrimSpace(token)
+	return func(s *Server) {
+		s.bearerToken = token
 	}
 }
 
@@ -47,7 +57,19 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/orchard/witness", s.handleOrchardWitness)
 	mux.HandleFunc("/v1/wallets", s.handleWallets)
 	mux.HandleFunc("/v1/wallets/", s.handleWalletSubroutes)
-	return mux
+
+	if s.bearerToken == "" {
+		return mux
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !validBearerToken(r, s.bearerToken) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -497,4 +519,20 @@ func isSafeWalletID(s string) bool {
 		return false
 	}
 	return true
+}
+
+func validBearerToken(r *http.Request, expected string) bool {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if auth == "" {
+		return false
+	}
+	parts := strings.Fields(auth)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
+		return false
+	}
+	got := parts[1]
+	if len(got) != len(expected) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
 }
