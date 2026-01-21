@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/Abdullah1738/juno-scan/internal/events"
@@ -25,6 +26,8 @@ type Scanner struct {
 	confirmations int64
 
 	zmqHashBlockEndpoint string
+
+	mempoolOrchardNullifiersByTxID map[string][]string
 }
 
 func New(st store.Store, rpc *sdkjunocashd.Client, uaHRP string, pollInterval time.Duration, confirmations int64, zmqHashBlockEndpoint string) (*Scanner, error) {
@@ -104,6 +107,9 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 			return fmt.Errorf("scanner: getblockcount: %w", err)
 		}
 		if nextHeight > chainHeight {
+			if err := s.updatePendingSpends(ctx); err != nil {
+				return err
+			}
 			return nil
 		}
 
@@ -142,6 +148,85 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 	}
 
 	return ctx.Err()
+}
+
+func (s *Scanner) updatePendingSpends(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	var txids []string
+	if err := s.rpc.Call(ctx, "getrawmempool", nil, &txids); err != nil {
+		return fmt.Errorf("scanner: getrawmempool: %w", err)
+	}
+
+	type rawTx struct {
+		Orchard struct {
+			Actions []struct {
+				Nullifier string `json:"nullifier"`
+			} `json:"actions"`
+		} `json:"orchard"`
+	}
+
+	if s.mempoolOrchardNullifiersByTxID == nil {
+		s.mempoolOrchardNullifiersByTxID = make(map[string][]string)
+	}
+
+	inMempool := make(map[string]struct{}, len(txids))
+	for _, txid := range txids {
+		txid = strings.ToLower(strings.TrimSpace(txid))
+		if txid == "" {
+			continue
+		}
+		inMempool[txid] = struct{}{}
+	}
+
+	for txid := range s.mempoolOrchardNullifiersByTxID {
+		if _, ok := inMempool[txid]; !ok {
+			delete(s.mempoolOrchardNullifiersByTxID, txid)
+		}
+	}
+
+	for txid := range inMempool {
+		if _, ok := s.mempoolOrchardNullifiersByTxID[txid]; ok {
+			continue
+		}
+
+		var tx rawTx
+		if err := s.rpc.Call(ctx, "getrawtransaction", []any{txid, 1}, &tx); err != nil {
+			var rpcErr *sdkjunocashd.RPCError
+			if errors.As(err, &rpcErr) && rpcErr.Code == -5 {
+				continue
+			}
+			log.Printf("mempool: getrawtransaction(%s) failed: %v", txid, err)
+			continue
+		}
+
+		nfs := make([]string, 0, len(tx.Orchard.Actions))
+		for _, a := range tx.Orchard.Actions {
+			nf := strings.ToLower(strings.TrimSpace(a.Nullifier))
+			if nf == "" {
+				continue
+			}
+			nfs = append(nfs, nf)
+		}
+
+		s.mempoolOrchardNullifiersByTxID[txid] = nfs
+	}
+
+	pending := make(map[string]string)
+	for txid, nfs := range s.mempoolOrchardNullifiersByTxID {
+		for _, nf := range nfs {
+			if nf == "" {
+				continue
+			}
+			pending[nf] = txid
+		}
+	}
+
+	if err := s.st.UpdatePendingSpends(ctx, pending, time.Now().UTC()); err != nil {
+		return fmt.Errorf("scanner: update pending spends: %w", err)
+	}
+	return nil
 }
 
 func (s *Scanner) findCommonAncestor(ctx context.Context, fromHeight int64) (int64, error) {

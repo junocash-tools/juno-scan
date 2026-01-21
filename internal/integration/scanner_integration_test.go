@@ -114,6 +114,8 @@ func TestScanner_DepositDetected(t *testing.T) {
 	toAddr := mustCreateUnifiedAddress(t, ctx, jd)
 	opid2 := mustSendMany(t, ctx, jd, addr, toAddr, "0.01")
 	mustWaitOpSuccess(t, ctx, jd, opid2)
+	spendTxID := mustTxIDForOpID(t, ctx, jd, opid2)
+	waitForPendingSpend(t, ctx, st, "hot", spendTxID)
 
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	waitForEventKind(t, ctx, st, "hot", "SpendEvent")
@@ -147,6 +149,26 @@ func TestScanner_DepositDetected(t *testing.T) {
 	}
 	if spendConfirmedPayload.ConfirmedHeight <= 0 {
 		t.Fatalf("invalid confirmed_height=%d", spendConfirmedPayload.ConfirmedHeight)
+	}
+
+	notesAll, err := st.ListWalletNotes(ctx, "hot", false, 1000)
+	if err != nil {
+		t.Fatalf("ListWalletNotes(all): %v", err)
+	}
+	foundSpent := false
+	for _, n := range notesAll {
+		if n.SpentTxID != nil && strings.TrimSpace(*n.SpentTxID) == spendTxID {
+			foundSpent = true
+			if n.PendingSpentTxID != nil {
+				t.Fatalf("pending_spent_txid not cleared")
+			}
+			if n.PendingSpentAt != nil {
+				t.Fatalf("pending_spent_at not cleared")
+			}
+		}
+	}
+	if !foundSpent {
+		t.Fatalf("spent note not found")
 	}
 }
 
@@ -361,7 +383,7 @@ func mustWaitOpSuccess(t *testing.T, ctx context.Context, jd *testutil.RunningJu
 	}
 
 	for time.Now().Before(deadline) {
-		out := mustRun(t, jd.CLICommand(ctx, "z_getoperationresult", `["`+opid+`"]`))
+		out := mustRun(t, jd.CLICommand(ctx, "z_getoperationstatus", `["`+opid+`"]`))
 		var res []struct {
 			Status string `json:"status"`
 			Error  *struct {
@@ -415,6 +437,79 @@ func mustWaitOrchardBalanceForViewingKey(t *testing.T, ctx context.Context, jd *
 
 	t.Fatalf("orchard balance not available for minconf=%d", minconf)
 	return 0
+}
+
+func mustTxIDForOpID(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, opid string) string {
+	t.Helper()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	for time.Now().Before(deadline) {
+		out := mustRun(t, jd.CLICommand(ctx, "z_getoperationresult", `["`+opid+`"]`))
+		var res []struct {
+			Status string `json:"status"`
+			Result *struct {
+				TxID string `json:"txid"`
+			} `json:"result,omitempty"`
+			Error *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error,omitempty"`
+		}
+		if err := json.Unmarshal(out, &res); err != nil {
+			t.Fatalf("op result decode failed: %v", err)
+		}
+		if len(res) == 0 {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		switch res[0].Status {
+		case "success":
+			if res[0].Result == nil || strings.TrimSpace(res[0].Result.TxID) == "" {
+				t.Fatalf("missing txid for opid %s", opid)
+			}
+			return strings.TrimSpace(res[0].Result.TxID)
+		case "failed":
+			msg := ""
+			if res[0].Error != nil {
+				msg = res[0].Error.Message
+			}
+			t.Fatalf("operation failed: %s (%s)", opid, msg)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatalf("txid not available for opid %s", opid)
+	return ""
+}
+
+func waitForPendingSpend(t *testing.T, ctx context.Context, st store.Store, walletID string, spendTxID string) {
+	t.Helper()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	for time.Now().Before(deadline) {
+		notes, err := st.ListWalletNotes(ctx, walletID, true, 1000)
+		if err == nil {
+			for _, n := range notes {
+				if n.PendingSpentTxID != nil && strings.TrimSpace(*n.PendingSpentTxID) == spendTxID {
+					if n.PendingSpentAt == nil {
+						t.Fatalf("pending_spent_at not set")
+					}
+					return
+				}
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatalf("pending spend not detected for txid=%s", spendTxID)
 }
 
 func waitForEventKind(t *testing.T, ctx context.Context, st store.Store, walletID string, kind string) store.Event {

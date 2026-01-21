@@ -25,6 +25,7 @@ type Store interface {
 
 	ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, blockHeight *int64) (events []Event, nextCursor int64, err error)
 	ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]Note, error)
+	UpdatePendingSpends(ctx context.Context, pending map[string]string, seenAt time.Time) error
 	ListOrchardCommitmentsUpToHeight(ctx context.Context, height int64) ([]OrchardCommitment, error)
 	FirstOrchardCommitmentPositionFromHeight(ctx context.Context, height int64) (pos int64, ok bool, err error)
 }
@@ -93,6 +94,8 @@ type Note struct {
 	ValueZat             int64
 	MemoHex              *string
 	NoteNullifier        string
+	PendingSpentTxID     *string
+	PendingSpentAt       *time.Time
 	SpentHeight          *int64
 	SpentTxID            *string
 	ConfirmedHeight      *int64

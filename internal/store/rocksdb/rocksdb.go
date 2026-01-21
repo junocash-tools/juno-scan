@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -986,6 +987,11 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 			p := int64(*rec.Position)
 			posPtr = &p
 		}
+		var pendingAt *time.Time
+		if rec.PendingSpentAtUnix != nil {
+			t := time.Unix(*rec.PendingSpentAtUnix, 0).UTC()
+			pendingAt = &t
+		}
 		out = append(out, store.Note{
 			WalletID:             walletID,
 			TxID:                 rec.TxID,
@@ -997,6 +1003,8 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 			ValueZat:             rec.ValueZat,
 			MemoHex:              rec.MemoHex,
 			NoteNullifier:        rec.NoteNullifier,
+			PendingSpentTxID:     rec.PendingSpentTxID,
+			PendingSpentAt:       pendingAt,
 			SpentHeight:          rec.SpentHeight,
 			SpentTxID:            rec.SpentTxID,
 			ConfirmedHeight:      rec.ConfirmedHeight,
@@ -1008,6 +1016,162 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 		return nil, fmt.Errorf("rocksdb: list notes: %w", err)
 	}
 	return out, nil
+}
+
+func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]string, seenAt time.Time) error {
+	_ = ctx
+	if seenAt.IsZero() {
+		seenAt = time.Now().UTC()
+	}
+	nowUnix := seenAt.Unix()
+
+	desired := make(map[string]string, len(pending))
+	for nf, txid := range pending {
+		nf = strings.ToLower(strings.TrimSpace(nf))
+		txid = strings.ToLower(strings.TrimSpace(txid))
+		if nf == "" || txid == "" {
+			continue
+		}
+		desired[nf] = txid
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	batch := s.db.NewIndexedBatch()
+	defer batch.Close()
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: pendingNullifierPrefix,
+		UpperBound: prefixUpperBound(pendingNullifierPrefix),
+	})
+	if err != nil {
+		return fmt.Errorf("rocksdb: iter pending: %w", err)
+	}
+	for iter.First(); iter.Valid(); iter.Next() {
+		nf := string(bytes.TrimPrefix(iter.Key(), pendingNullifierPrefix))
+		if _, ok := desired[nf]; ok {
+			continue
+		}
+
+		// Clear pending markers on the note record, if we still have it.
+		locBytes, closer, err := s.db.Get(keyNullifier(nf))
+		if err == nil {
+			noteKey := append([]byte{}, locBytes...)
+			if closer != nil {
+				_ = closer.Close()
+			}
+
+			v, closer, err := s.db.Get(noteKey)
+			if err == nil {
+				var rec noteRecord
+				if err := json.Unmarshal(v, &rec); err != nil {
+					_ = closer.Close()
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: decode note: %w", err)
+				}
+				if closer != nil {
+					_ = closer.Close()
+				}
+
+				rec.PendingSpentTxID = nil
+				rec.PendingSpentAtUnix = nil
+
+				b, err := json.Marshal(rec)
+				if err != nil {
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: encode note: %w", err)
+				}
+				if err := batch.Set(noteKey, b, pebble.NoSync); err != nil {
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: clear pending note: %w", err)
+				}
+			} else if !errors.Is(err, pebble.ErrNotFound) {
+				if closer != nil {
+					_ = closer.Close()
+				}
+				_ = iter.Close()
+				return fmt.Errorf("rocksdb: get note: %w", err)
+			}
+		} else if !errors.Is(err, pebble.ErrNotFound) {
+			if closer != nil {
+				_ = closer.Close()
+			}
+			_ = iter.Close()
+			return fmt.Errorf("rocksdb: get nullifier: %w", err)
+		}
+
+		keyCopy := append([]byte{}, iter.Key()...)
+		if err := batch.Delete(keyCopy, pebble.NoSync); err != nil {
+			_ = iter.Close()
+			return fmt.Errorf("rocksdb: delete pending key: %w", err)
+		}
+	}
+	if err := iter.Error(); err != nil {
+		_ = iter.Close()
+		return fmt.Errorf("rocksdb: iter pending: %w", err)
+	}
+	_ = iter.Close()
+
+	for nf, txid := range desired {
+		locBytes, closer, err := s.db.Get(keyNullifier(nf))
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue
+			}
+			return fmt.Errorf("rocksdb: get nullifier: %w", err)
+		}
+		noteKey := append([]byte{}, locBytes...)
+		if closer != nil {
+			_ = closer.Close()
+		}
+
+		v, closer, err := s.db.Get(noteKey)
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue
+			}
+			return fmt.Errorf("rocksdb: get note: %w", err)
+		}
+		var rec noteRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			if closer != nil {
+				_ = closer.Close()
+			}
+			return fmt.Errorf("rocksdb: decode note: %w", err)
+		}
+		if closer != nil {
+			_ = closer.Close()
+		}
+
+		if rec.SpentHeight != nil {
+			continue
+		}
+
+		txidCopy := txid
+		if rec.PendingSpentTxID == nil || *rec.PendingSpentTxID != txidCopy {
+			rec.PendingSpentTxID = &txidCopy
+			rec.PendingSpentAtUnix = &nowUnix
+		} else if rec.PendingSpentAtUnix == nil {
+			rec.PendingSpentAtUnix = &nowUnix
+		}
+
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return fmt.Errorf("rocksdb: encode note: %w", err)
+		}
+		if err := batch.Set(noteKey, b, pebble.NoSync); err != nil {
+			return fmt.Errorf("rocksdb: set pending note: %w", err)
+		}
+		if err := batch.Set(keyPendingNullifier(nf), []byte(txidCopy), pebble.NoSync); err != nil {
+			return fmt.Errorf("rocksdb: set pending key: %w", err)
+		}
+	}
+
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: update pending commit: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) ListOrchardCommitmentsUpToHeight(ctx context.Context, height int64) ([]store.OrchardCommitment, error) {
@@ -1264,6 +1428,8 @@ func (t *rocksTx) MarkNotesSpent(ctx context.Context, height int64, txid string,
 		rec.SpentHeight = &height
 		rec.SpentTxID = &txid
 		rec.SpentConfirmedHeight = nil
+		rec.PendingSpentTxID = nil
+		rec.PendingSpentAtUnix = nil
 
 		b, err := json.Marshal(rec)
 		if err != nil {
@@ -1271,6 +1437,9 @@ func (t *rocksTx) MarkNotesSpent(ctx context.Context, height int64, txid string,
 		}
 		if err := t.batch.Set(noteKey, b, pebble.NoSync); err != nil {
 			return nil, fmt.Errorf("rocksdb: mark spent: %w", err)
+		}
+		if err := t.batch.Delete(keyPendingNullifier(nf), pebble.NoSync); err != nil {
+			return nil, fmt.Errorf("rocksdb: clear pending key: %w", err)
 		}
 		if err := t.batch.Set(keySpentHeightIndex(uint64(height), nf), nil, pebble.NoSync); err != nil {
 			return nil, fmt.Errorf("rocksdb: mark spent index: %w", err)
@@ -1691,6 +1860,8 @@ type noteRecord struct {
 	ValueZat             int64   `json:"value_zat"`
 	MemoHex              *string `json:"memo_hex,omitempty"`
 	NoteNullifier        string  `json:"note_nullifier"`
+	PendingSpentTxID     *string `json:"pending_spent_txid,omitempty"`
+	PendingSpentAtUnix   *int64  `json:"pending_spent_at_unix,omitempty"`
 	SpentHeight          *int64  `json:"spent_height,omitempty"`
 	SpentTxID            *string `json:"spent_txid,omitempty"`
 	ConfirmedHeight      *int64  `json:"confirmed_height,omitempty"`
@@ -1716,6 +1887,7 @@ var (
 	noteHeightPrefix               = []byte("nh/")
 	walletNotePrefix               = []byte("nwh/")
 	nullifierPrefix                = []byte("nn/")
+	pendingNullifierPrefix         = []byte("np/")
 	noteSpentHeightPrefix          = []byte("nsh/")
 	noteConfirmedHeightPrefix      = []byte("nch/")
 	noteSpentConfirmedHeightPrefix = []byte("nsch/")
@@ -1798,6 +1970,13 @@ func keyNote(walletID, txid string, actionIndex int32) []byte {
 func keyNullifier(nf string) []byte {
 	b := make([]byte, 0, len(nullifierPrefix)+len(nf))
 	b = append(b, nullifierPrefix...)
+	b = append(b, nf...)
+	return b
+}
+
+func keyPendingNullifier(nf string) []byte {
+	b := make([]byte, 0, len(pendingNullifierPrefix)+len(nf))
+	b = append(b, pendingNullifierPrefix...)
 	b = append(b, nf...)
 	return b
 }

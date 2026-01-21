@@ -429,6 +429,11 @@ components:
           format: int64
         note_nullifier:
           type: string
+        pending_spent_txid:
+          type: string
+        pending_spent_at:
+          type: string
+          format: date-time
         spent_height:
           type: integer
           format: int64

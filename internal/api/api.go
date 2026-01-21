@@ -358,16 +358,18 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 	defer cancel()
 
 	type note struct {
-		TxID          string    `json:"txid"`
-		ActionIndex   int32     `json:"action_index"`
-		Height        int64     `json:"height"`
-		Position      *int64    `json:"position,omitempty"`
-		Recipient     string    `json:"recipient_address"`
-		ValueZat      int64     `json:"value_zat"`
-		NoteNullifier string    `json:"note_nullifier"`
-		SpentHeight   *int64    `json:"spent_height,omitempty"`
-		SpentTxID     *string   `json:"spent_txid,omitempty"`
-		CreatedAt     time.Time `json:"created_at"`
+		TxID          string     `json:"txid"`
+		ActionIndex   int32      `json:"action_index"`
+		Height        int64      `json:"height"`
+		Position      *int64     `json:"position,omitempty"`
+		Recipient     string     `json:"recipient_address"`
+		ValueZat      int64      `json:"value_zat"`
+		NoteNullifier string     `json:"note_nullifier"`
+		PendingTxID   *string    `json:"pending_spent_txid,omitempty"`
+		PendingAt     *time.Time `json:"pending_spent_at,omitempty"`
+		SpentHeight   *int64     `json:"spent_height,omitempty"`
+		SpentTxID     *string    `json:"spent_txid,omitempty"`
+		CreatedAt     time.Time  `json:"created_at"`
 	}
 
 	ns, err := s.st.ListWalletNotes(ctx, walletID, onlyUnspent, 1000)
@@ -386,6 +388,8 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 			Recipient:     n.RecipientAddress,
 			ValueZat:      n.ValueZat,
 			NoteNullifier: n.NoteNullifier,
+			PendingTxID:   n.PendingSpentTxID,
+			PendingAt:     n.PendingSpentAt,
 			SpentHeight:   n.SpentHeight,
 			SpentTxID:     n.SpentTxID,
 			CreatedAt:     n.CreatedAt,

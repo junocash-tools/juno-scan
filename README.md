@@ -53,6 +53,8 @@ curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes"           # u
 curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes?spent=true" # include spent
 ```
 
+Note: when a note’s nullifier is observed in the node mempool, the note will include `pending_spent_txid` / `pending_spent_at` until the spend is mined (or disappears from the mempool).
+
 If you configured `-api-bearer-token`, include `-H 'Authorization: Bearer <token>'` in all requests.
 
 ## Configuration
@@ -67,7 +69,7 @@ Durations use Go’s `time.ParseDuration` format (e.g. `500ms`, `2s`, `1m`).
 | `-rpc-url` | `JUNO_SCAN_RPC_URL` | `http://127.0.0.1:8232` | `junocashd` RPC URL |
 | `-rpc-user` | `JUNO_SCAN_RPC_USER` | _(empty)_ | `junocashd` RPC username |
 | `-rpc-pass` | `JUNO_SCAN_RPC_PASS` | _(empty)_ | `junocashd` RPC password |
-| `-ua-hrp` | `JUNO_SCAN_UA_HRP` | `j` | Unified Address HRP (`j`, `jregtest`, …) |
+| `-ua-hrp` | `JUNO_SCAN_UA_HRP` | `j` | Unified Address HRP (`j`, `jtest`, `jregtest`, …) |
 | `-poll-interval` | `JUNO_SCAN_POLL_INTERVAL` | `2s` | Used when ZMQ is not enabled |
 | `-zmq-hashblock` | `JUNO_SCAN_ZMQ_HASHBLOCK` | _(empty)_ | `tcp://host:port` to receive `hashblock` notifications |
 | `-confirmations` | `JUNO_SCAN_CONFIRMATIONS` | `100` | Confirmations required for `*Confirmed` events |

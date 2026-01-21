@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Abdullah1738/juno-scan/internal/db/migrate"
 	"github.com/Abdullah1738/juno-scan/internal/events"
@@ -531,7 +532,7 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 	}
 
 	query := `
-SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
+SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, pending_spent_txid, pending_spent_at, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
 FROM notes
 WHERE wallet_id = $1
 `
@@ -564,6 +565,8 @@ WHERE wallet_id = $1
 			&n.ValueZat,
 			&memo,
 			&n.NoteNullifier,
+			&n.PendingSpentTxID,
+			&n.PendingSpentAt,
 			&n.SpentHeight,
 			&n.SpentTxID,
 			&confirmedHeight,
@@ -588,6 +591,69 @@ WHERE wallet_id = $1
 		return nil, fmt.Errorf("postgres: list notes: %w", err)
 	}
 	return out, nil
+}
+
+func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]string, seenAt time.Time) error {
+	if seenAt.IsZero() {
+		seenAt = time.Now().UTC()
+	}
+
+	nullifiers := make([]string, 0, len(pending))
+	txids := make([]string, 0, len(pending))
+	for nf, txid := range pending {
+		nf = strings.TrimSpace(nf)
+		txid = strings.TrimSpace(txid)
+		if nf == "" || txid == "" {
+			continue
+		}
+		nullifiers = append(nullifiers, nf)
+		txids = append(txids, txid)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if len(nullifiers) == 0 {
+		if _, err := tx.Exec(ctx, `
+UPDATE notes
+SET pending_spent_txid = NULL, pending_spent_at = NULL
+WHERE spent_height IS NULL AND pending_spent_txid IS NOT NULL
+`); err != nil {
+			return fmt.Errorf("postgres: clear pending spends: %w", err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `
+UPDATE notes
+SET pending_spent_txid = NULL, pending_spent_at = NULL
+WHERE spent_height IS NULL
+  AND pending_spent_txid IS NOT NULL
+  AND NOT (note_nullifier = ANY($1::text[]))
+`, nullifiers); err != nil {
+			return fmt.Errorf("postgres: clear pending spends: %w", err)
+		}
+
+		if _, err := tx.Exec(ctx, `
+WITH pending (note_nullifier, pending_spent_txid) AS (SELECT * FROM UNNEST($1::text[], $2::text[]))
+UPDATE notes n
+SET pending_spent_txid = pending.pending_spent_txid,
+    pending_spent_at = CASE
+      WHEN n.pending_spent_txid IS DISTINCT FROM pending.pending_spent_txid THEN $3
+      ELSE COALESCE(n.pending_spent_at, $3)
+    END
+FROM pending
+WHERE n.spent_height IS NULL AND n.note_nullifier = pending.note_nullifier
+`, nullifiers, txids, seenAt); err != nil {
+			return fmt.Errorf("postgres: set pending spends: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: commit: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) ListOrchardCommitmentsUpToHeight(ctx context.Context, height int64) ([]store.OrchardCommitment, error) {
@@ -678,7 +744,11 @@ ON CONFLICT (position) DO NOTHING
 func (t *pgTx) MarkNotesSpent(ctx context.Context, height int64, txid string, nullifiers []string) ([]store.Note, error) {
 	rows, err := t.tx.Query(ctx, `
 UPDATE notes
-SET spent_height = $1, spent_txid = $2, spent_confirmed_height = NULL
+SET spent_height = $1,
+    spent_txid = $2,
+    spent_confirmed_height = NULL,
+    pending_spent_txid = NULL,
+    pending_spent_at = NULL
 WHERE spent_height IS NULL AND note_nullifier = ANY($3::text[])
 RETURNING wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
 `, height, txid, nullifiers)

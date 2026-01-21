@@ -89,11 +89,33 @@ func TestScanner_DepositDetected_MySQL(t *testing.T) {
 	toAddr := mustCreateUnifiedAddress(t, ctx, jd)
 	opid2 := mustSendMany(t, ctx, jd, addr, toAddr, "0.01")
 	mustWaitOpSuccess(t, ctx, jd, opid2)
+	spendTxID := mustTxIDForOpID(t, ctx, jd, opid2)
+	waitForPendingSpend(t, ctx, st, "hot", spendTxID)
 
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	waitForEventKind(t, ctx, st, "hot", "SpendEvent")
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	waitForEventKind(t, ctx, st, "hot", "SpendConfirmed")
+
+	notesAll, err := st.ListWalletNotes(ctx, "hot", false, 1000)
+	if err != nil {
+		t.Fatalf("ListWalletNotes(all): %v", err)
+	}
+	foundSpent := false
+	for _, n := range notesAll {
+		if n.SpentTxID != nil && strings.TrimSpace(*n.SpentTxID) == spendTxID {
+			foundSpent = true
+			if n.PendingSpentTxID != nil {
+				t.Fatalf("pending_spent_txid not cleared")
+			}
+			if n.PendingSpentAt != nil {
+				t.Fatalf("pending_spent_at not cleared")
+			}
+		}
+	}
+	if !foundSpent {
+		t.Fatalf("spent note not found")
+	}
 }
 
 func openMySQLTestStore(t *testing.T, ctx context.Context, rootDSN string) (*mysql.Store, func()) {

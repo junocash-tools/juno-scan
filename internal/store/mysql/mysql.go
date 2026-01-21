@@ -527,7 +527,7 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 	}
 
 	query := `
-SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
+SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, pending_spent_txid, pending_spent_at, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
 FROM notes
 WHERE wallet_id = ?
 `
@@ -548,6 +548,8 @@ WHERE wallet_id = ?
 		var position sql.NullInt64
 		var divIdx sql.NullInt64
 		var memo sql.NullString
+		var pendingTxid sql.NullString
+		var pendingAt sql.NullTime
 		var spentHeight sql.NullInt64
 		var spentTxid sql.NullString
 		var confirmedHeight sql.NullInt64
@@ -563,6 +565,8 @@ WHERE wallet_id = ?
 			&n.ValueZat,
 			&memo,
 			&n.NoteNullifier,
+			&pendingTxid,
+			&pendingAt,
 			&spentHeight,
 			&spentTxid,
 			&confirmedHeight,
@@ -579,6 +583,13 @@ WHERE wallet_id = ?
 		}
 		if memo.Valid {
 			n.MemoHex = &memo.String
+		}
+		if pendingTxid.Valid {
+			n.PendingSpentTxID = &pendingTxid.String
+		}
+		if pendingAt.Valid {
+			t := pendingAt.Time.UTC()
+			n.PendingSpentAt = &t
 		}
 		if spentHeight.Valid {
 			n.SpentHeight = &spentHeight.Int64
@@ -598,6 +609,46 @@ WHERE wallet_id = ?
 		return nil, fmt.Errorf("mysql: list notes: %w", err)
 	}
 	return out, nil
+}
+
+func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]string, seenAt time.Time) error {
+	if seenAt.IsZero() {
+		seenAt = time.Now().UTC()
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mysql: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `
+UPDATE notes
+SET pending_spent_txid = NULL, pending_spent_at = NULL
+WHERE spent_height IS NULL AND pending_spent_txid IS NOT NULL
+`); err != nil {
+		return fmt.Errorf("mysql: clear pending spends: %w", err)
+	}
+
+	for nf, txid := range pending {
+		nf = strings.TrimSpace(nf)
+		txid = strings.TrimSpace(txid)
+		if nf == "" || txid == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE notes
+SET pending_spent_txid = ?, pending_spent_at = ?
+WHERE spent_height IS NULL AND note_nullifier = ?
+`, txid, seenAt, nf); err != nil {
+			return fmt.Errorf("mysql: set pending spend: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("mysql: commit: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) ListOrchardCommitmentsUpToHeight(ctx context.Context, height int64) ([]store.OrchardCommitment, error) {
@@ -775,7 +826,11 @@ WHERE spent_height IS NULL AND note_nullifier IN (`)
 	b.Reset()
 	b.WriteString(`
 UPDATE notes
-SET spent_height = ?, spent_txid = ?, spent_confirmed_height = NULL
+SET spent_height = ?,
+    spent_txid = ?,
+    spent_confirmed_height = NULL,
+    pending_spent_txid = NULL,
+    pending_spent_at = NULL
 WHERE spent_height IS NULL AND note_nullifier IN (`)
 	for i, nf := range nullifiers {
 		if i > 0 {
