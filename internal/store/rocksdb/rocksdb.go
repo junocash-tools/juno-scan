@@ -290,6 +290,8 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 	var unconfirmedDeposits []store.Note
 	var orphanSpends []store.Note
 	var unconfirmedSpends []store.Note
+	var orphanOutgoingOutputs []store.OutgoingOutput
+	var unconfirmedOutgoingOutputs []store.OutgoingOutput
 
 	noteFromRecord := func(rec noteRecord) store.Note {
 		var posPtr *int64
@@ -313,6 +315,28 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 			ConfirmedHeight:      rec.ConfirmedHeight,
 			SpentConfirmedHeight: rec.SpentConfirmedHeight,
 			CreatedAt:            time.Unix(rec.CreatedAtUnix, 0).UTC(),
+		}
+	}
+
+	outgoingFromRecord := func(rec outgoingOutputRecord) store.OutgoingOutput {
+		var mempoolSeenAt *time.Time
+		if rec.MempoolSeenUnix != nil {
+			t := time.Unix(*rec.MempoolSeenUnix, 0).UTC()
+			mempoolSeenAt = &t
+		}
+		return store.OutgoingOutput{
+			WalletID:         rec.WalletID,
+			TxID:             rec.TxID,
+			ActionIndex:      rec.ActionIndex,
+			MinedHeight:      rec.MinedHeight,
+			ConfirmedHeight:  rec.ConfirmedHeight,
+			MempoolSeenAt:    mempoolSeenAt,
+			RecipientAddress: rec.RecipientAddress,
+			ValueZat:         rec.ValueZat,
+			MemoHex:          rec.MemoHex,
+			OvkScope:         rec.OvkScope,
+			RecipientScope:   rec.RecipientScope,
+			CreatedAt:        time.Unix(rec.CreatedAtUnix, 0).UTC(),
 		}
 	}
 
@@ -533,6 +557,98 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 			}
 			_ = iter.Close()
 		}
+
+		// Outgoing outputs mined above height.
+		{
+			lower := make([]byte, 0, len(outgoingMinedHeightPrefix)+20)
+			lower = append(lower, outgoingMinedHeightPrefix...)
+			lower = appendUint64Fixed20(lower, uint64(height+1))
+
+			iter, err := s.db.NewIter(&pebble.IterOptions{
+				LowerBound: lower,
+				UpperBound: prefixUpperBound(outgoingMinedHeightPrefix),
+			})
+			if err != nil {
+				return fmt.Errorf("rocksdb: rollback iter outgoing outputs: %w", err)
+			}
+			for iter.First(); iter.Valid(); iter.Next() {
+				walletID, _, txid, actionIndex, err := parseOutgoingMinedHeightIndexKey(iter.Key())
+				if err != nil {
+					_ = iter.Close()
+					return err
+				}
+				ooKey := keyOutgoingOutput(walletID, txid, actionIndex)
+				v, closer, err := s.db.Get(ooKey)
+				if err != nil {
+					if errors.Is(err, pebble.ErrNotFound) {
+						continue
+					}
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback get outgoing output: %w", err)
+				}
+				var rec outgoingOutputRecord
+				if err := json.Unmarshal(v, &rec); err != nil {
+					_ = closer.Close()
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback decode outgoing output: %w", err)
+				}
+				_ = closer.Close()
+				orphanOutgoingOutputs = append(orphanOutgoingOutputs, outgoingFromRecord(rec))
+			}
+			if err := iter.Error(); err != nil {
+				_ = iter.Close()
+				return fmt.Errorf("rocksdb: rollback iter outgoing outputs: %w", err)
+			}
+			_ = iter.Close()
+		}
+
+		// Outgoing outputs that were previously confirmed above height.
+		{
+			lower := make([]byte, 0, len(outgoingConfirmedHeightPrefix)+20)
+			lower = append(lower, outgoingConfirmedHeightPrefix...)
+			lower = appendUint64Fixed20(lower, uint64(height+1))
+
+			iter, err := s.db.NewIter(&pebble.IterOptions{
+				LowerBound: lower,
+				UpperBound: prefixUpperBound(outgoingConfirmedHeightPrefix),
+			})
+			if err != nil {
+				return fmt.Errorf("rocksdb: rollback iter confirmed outgoing outputs: %w", err)
+			}
+			for iter.First(); iter.Valid(); iter.Next() {
+				walletID, _, txid, actionIndex, err := parseOutgoingConfirmedHeightIndexKey(iter.Key())
+				if err != nil {
+					_ = iter.Close()
+					return err
+				}
+				ooKey := keyOutgoingOutput(walletID, txid, actionIndex)
+				v, closer, err := s.db.Get(ooKey)
+				if err != nil {
+					if errors.Is(err, pebble.ErrNotFound) {
+						continue
+					}
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback get outgoing output: %w", err)
+				}
+				var rec outgoingOutputRecord
+				if err := json.Unmarshal(v, &rec); err != nil {
+					_ = closer.Close()
+					_ = iter.Close()
+					return fmt.Errorf("rocksdb: rollback decode outgoing output: %w", err)
+				}
+				_ = closer.Close()
+
+				if rec.MinedHeight != nil && *rec.MinedHeight <= height &&
+					rec.ConfirmedHeight != nil && *rec.ConfirmedHeight > height {
+					unconfirmedOutgoingOutputs = append(unconfirmedOutgoingOutputs, outgoingFromRecord(rec))
+				}
+			}
+			if err := iter.Error(); err != nil {
+				_ = iter.Close()
+				return fmt.Errorf("rocksdb: rollback iter confirmed outgoing outputs: %w", err)
+			}
+			_ = iter.Close()
+		}
 	}
 
 	// Delete blocks above height.
@@ -599,6 +715,17 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 		return err
 	}
 	_ = batch.Delete(keyMeta("confirmed_upto_spent_height"), pebble.NoSync)
+
+	// Delete outgoing outputs mined above height (via mined height index).
+	if err := deleteOutgoingOutputsAboveHeight(batch, s.db, uint64(height+1)); err != nil {
+		return err
+	}
+
+	// Unconfirm outgoing outputs confirmed above height.
+	if err := unconfirmOutgoingOutputsAboveHeight(batch, s.db, uint64(height)); err != nil {
+		return err
+	}
+	_ = batch.Delete(keyMeta("confirmed_upto_outgoing_mined_height"), pebble.NoSync)
 
 	// Delete commitments above height and fix next position.
 	if err := rollbackCommitments(batch, s.db, uint64(height)); err != nil {
@@ -776,6 +903,101 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 				return err
 			}
 		}
+
+		for _, o := range orphanOutgoingOutputs {
+			if o.MinedHeight == nil {
+				continue
+			}
+
+			memoHex := ""
+			if o.MemoHex != nil {
+				memoHex = *o.MemoHex
+			}
+
+			heightCopy := *o.MinedHeight
+			payload := events.OutgoingOutputOrphanedPayload{
+				OutgoingOutputEventPayload: events.OutgoingOutputEventPayload{
+					Version:          types.V1,
+					WalletID:         o.WalletID,
+					TxID:             o.TxID,
+					Height:           &heightCopy,
+					ActionIndex:      uint32(o.ActionIndex),
+					AmountZatoshis:   uint64(o.ValueZat),
+					RecipientAddress: o.RecipientAddress,
+					MemoHex:          memoHex,
+					OvkScope:         o.OvkScope,
+					RecipientScope:   derefString(o.RecipientScope),
+					Status: types.TxStatus{
+						State:  types.TxStateOrphaned,
+						Height: *o.MinedHeight,
+					},
+				},
+				OrphanedAtHeight: height,
+			}
+			b, err := json.Marshal(payload)
+			if err != nil {
+				return fmt.Errorf("rocksdb: rollback marshal outgoing output orphaned: %w", err)
+			}
+			if err := rtx.InsertEvent(ctx, store.Event{
+				Kind:     events.KindOutgoingOutputOrphaned,
+				WalletID: o.WalletID,
+				Height:   height,
+				Payload:  b,
+			}); err != nil {
+				return err
+			}
+		}
+
+		for _, o := range unconfirmedOutgoingOutputs {
+			if o.MinedHeight == nil || o.ConfirmedHeight == nil {
+				continue
+			}
+
+			memoHex := ""
+			if o.MemoHex != nil {
+				memoHex = *o.MemoHex
+			}
+
+			confirmations := height - *o.MinedHeight + 1
+			if confirmations < 0 {
+				confirmations = 0
+			}
+
+			heightCopy := *o.MinedHeight
+			payload := events.OutgoingOutputUnconfirmedPayload{
+				OutgoingOutputEventPayload: events.OutgoingOutputEventPayload{
+					Version:          types.V1,
+					WalletID:         o.WalletID,
+					TxID:             o.TxID,
+					Height:           &heightCopy,
+					ActionIndex:      uint32(o.ActionIndex),
+					AmountZatoshis:   uint64(o.ValueZat),
+					RecipientAddress: o.RecipientAddress,
+					MemoHex:          memoHex,
+					OvkScope:         o.OvkScope,
+					RecipientScope:   derefString(o.RecipientScope),
+					Status: types.TxStatus{
+						State:         types.TxStateConfirmed,
+						Height:        *o.MinedHeight,
+						Confirmations: confirmations,
+					},
+				},
+				RollbackHeight:          height,
+				PreviousConfirmedHeight: *o.ConfirmedHeight,
+			}
+			b, err := json.Marshal(payload)
+			if err != nil {
+				return fmt.Errorf("rocksdb: rollback marshal outgoing output unconfirmed: %w", err)
+			}
+			if err := rtx.InsertEvent(ctx, store.Event{
+				Kind:     events.KindOutgoingOutputUnconfirmed,
+				WalletID: o.WalletID,
+				Height:   height,
+				Payload:  b,
+			}); err != nil {
+				return err
+			}
+		}
 	}
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
@@ -830,7 +1052,7 @@ func (s *Store) SetWalletEventPublishCursor(ctx context.Context, walletID string
 	return nil
 }
 
-func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, blockHeight *int64) ([]store.Event, int64, error) {
+func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, filter store.EventFilter) ([]store.Event, int64, error) {
 	_ = ctx
 	if limit <= 0 || limit > 1000 {
 		limit = 100
@@ -838,12 +1060,22 @@ func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID i
 	if afterID < 0 {
 		afterID = 0
 	}
-	if blockHeight != nil && *blockHeight < 0 {
+	if filter.BlockHeight != nil && *filter.BlockHeight < 0 {
 		return nil, afterID, errors.New("rocksdb: negative blockHeight")
 	}
 
-	if blockHeight != nil {
-		height := uint64(*blockHeight)
+	wantKind := make(map[string]struct{}, len(filter.Kinds))
+	for _, k := range filter.Kinds {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		wantKind[k] = struct{}{}
+	}
+	wantTxID := strings.ToLower(strings.TrimSpace(filter.TxID))
+
+	if filter.BlockHeight != nil {
+		height := uint64(*filter.BlockHeight)
 
 		iter, err := s.db.NewIter(&pebble.IterOptions{
 			LowerBound: keyEventHeightIndex(height, walletID, uint64(afterID+1)),
@@ -880,6 +1112,21 @@ func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID i
 				return nil, afterID, fmt.Errorf("rocksdb: decode event: %w", err)
 			}
 			_ = closer.Close()
+
+			if len(wantKind) > 0 {
+				if _, ok := wantKind[rec.Kind]; !ok {
+					continue
+				}
+			}
+			if wantTxID != "" {
+				var p struct {
+					TxID string `json:"txid"`
+				}
+				_ = json.Unmarshal([]byte(rec.Payload), &p)
+				if strings.ToLower(strings.TrimSpace(p.TxID)) != wantTxID {
+					continue
+				}
+			}
 
 			nextCursor = int64(id)
 			out = append(out, store.Event{
@@ -920,6 +1167,22 @@ func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID i
 		if err := json.Unmarshal(iter.Value(), &rec); err != nil {
 			return nil, afterID, fmt.Errorf("rocksdb: decode event: %w", err)
 		}
+
+		if len(wantKind) > 0 {
+			if _, ok := wantKind[rec.Kind]; !ok {
+				continue
+			}
+		}
+		if wantTxID != "" {
+			var p struct {
+				TxID string `json:"txid"`
+			}
+			_ = json.Unmarshal([]byte(rec.Payload), &p)
+			if strings.ToLower(strings.TrimSpace(p.TxID)) != wantTxID {
+				continue
+			}
+		}
+
 		nextCursor = int64(id)
 		out = append(out, store.Event{
 			ID:        int64(id),
@@ -1172,6 +1435,165 @@ func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]stri
 		return fmt.Errorf("rocksdb: update pending commit: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) ListNotesByPendingSpentTxIDs(ctx context.Context, txids []string) ([]store.Note, error) {
+	_ = ctx
+
+	txids = cleanStringsLower(txids)
+	if len(txids) == 0 {
+		return nil, nil
+	}
+
+	want := make(map[string]struct{}, len(txids))
+	for _, txid := range txids {
+		want[txid] = struct{}{}
+	}
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: pendingNullifierPrefix,
+		UpperBound: prefixUpperBound(pendingNullifierPrefix),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("rocksdb: iter pending: %w", err)
+	}
+	defer iter.Close()
+
+	var out []store.Note
+	for iter.First(); iter.Valid(); iter.Next() {
+		txid := string(iter.Value())
+		if _, ok := want[txid]; !ok {
+			continue
+		}
+
+		nf := string(bytes.TrimPrefix(iter.Key(), pendingNullifierPrefix))
+		locBytes, closer, err := s.db.Get(keyNullifier(nf))
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("rocksdb: get nullifier: %w", err)
+		}
+		noteKey := append([]byte{}, locBytes...)
+		if closer != nil {
+			_ = closer.Close()
+		}
+
+		v, closer, err := s.db.Get(noteKey)
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("rocksdb: get note: %w", err)
+		}
+		var rec noteRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			if closer != nil {
+				_ = closer.Close()
+			}
+			return nil, fmt.Errorf("rocksdb: decode note: %w", err)
+		}
+		if closer != nil {
+			_ = closer.Close()
+		}
+
+		var posPtr *int64
+		if rec.Position != nil {
+			p := int64(*rec.Position)
+			posPtr = &p
+		}
+		var pendingAt *time.Time
+		if rec.PendingSpentAtUnix != nil {
+			t := time.Unix(*rec.PendingSpentAtUnix, 0).UTC()
+			pendingAt = &t
+		}
+
+		out = append(out, store.Note{
+			WalletID:             rec.WalletID,
+			TxID:                 rec.TxID,
+			ActionIndex:          rec.ActionIndex,
+			Height:               rec.Height,
+			Position:             posPtr,
+			DiversifierIndex:     rec.DiversifierIndex,
+			RecipientAddress:     rec.RecipientAddress,
+			ValueZat:             rec.ValueZat,
+			MemoHex:              rec.MemoHex,
+			NoteNullifier:        rec.NoteNullifier,
+			PendingSpentTxID:     rec.PendingSpentTxID,
+			PendingSpentAt:       pendingAt,
+			SpentHeight:          rec.SpentHeight,
+			SpentTxID:            rec.SpentTxID,
+			ConfirmedHeight:      rec.ConfirmedHeight,
+			SpentConfirmedHeight: rec.SpentConfirmedHeight,
+			CreatedAt:            time.Unix(rec.CreatedAtUnix, 0).UTC(),
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("rocksdb: iter pending: %w", err)
+	}
+
+	return out, nil
+}
+
+func (s *Store) ListOutgoingOutputsByTxID(ctx context.Context, walletID, txid string) ([]store.OutgoingOutput, error) {
+	_ = ctx
+
+	walletID = strings.TrimSpace(walletID)
+	txid = strings.ToLower(strings.TrimSpace(txid))
+	if walletID == "" || txid == "" {
+		return nil, errors.New("rocksdb: wallet_id and txid are required")
+	}
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: keyOutgoingOutputTxPrefix(walletID, txid),
+		UpperBound: prefixUpperBound(keyOutgoingOutputTxPrefix(walletID, txid)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("rocksdb: iter outgoing outputs: %w", err)
+	}
+	defer iter.Close()
+
+	var out []store.OutgoingOutput
+	for iter.First(); iter.Valid(); iter.Next() {
+		var rec outgoingOutputRecord
+		if err := json.Unmarshal(iter.Value(), &rec); err != nil {
+			return nil, fmt.Errorf("rocksdb: decode outgoing output: %w", err)
+		}
+
+		var minedHeight *int64
+		if rec.MinedHeight != nil {
+			h := *rec.MinedHeight
+			minedHeight = &h
+		}
+		var confirmedHeight *int64
+		if rec.ConfirmedHeight != nil {
+			h := *rec.ConfirmedHeight
+			confirmedHeight = &h
+		}
+		var mempoolSeenAt *time.Time
+		if rec.MempoolSeenUnix != nil {
+			t := time.Unix(*rec.MempoolSeenUnix, 0).UTC()
+			mempoolSeenAt = &t
+		}
+		out = append(out, store.OutgoingOutput{
+			WalletID:         rec.WalletID,
+			TxID:             rec.TxID,
+			ActionIndex:      rec.ActionIndex,
+			MinedHeight:      minedHeight,
+			ConfirmedHeight:  confirmedHeight,
+			MempoolSeenAt:    mempoolSeenAt,
+			RecipientAddress: rec.RecipientAddress,
+			ValueZat:         rec.ValueZat,
+			MemoHex:          rec.MemoHex,
+			OvkScope:         rec.OvkScope,
+			RecipientScope:   rec.RecipientScope,
+			CreatedAt:        time.Unix(rec.CreatedAtUnix, 0).UTC(),
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("rocksdb: list outgoing outputs: %w", err)
+	}
+	return out, nil
 }
 
 func (s *Store) ListOrchardCommitmentsUpToHeight(ctx context.Context, height int64) ([]store.OrchardCommitment, error) {
@@ -1587,6 +2009,121 @@ func (t *rocksTx) ConfirmNotes(ctx context.Context, confirmationHeight int64, ma
 	return out, nil
 }
 
+func (t *rocksTx) ConfirmOutgoingOutputs(ctx context.Context, confirmationHeight int64, maxMinedHeight int64) ([]store.OutgoingOutput, error) {
+	_ = ctx
+	if confirmationHeight < 0 {
+		return nil, errors.New("rocksdb: negative confirmation height")
+	}
+	if maxMinedHeight < 0 {
+		return nil, nil
+	}
+
+	var startHeight uint64 = 0
+	v, closer, err := t.batch.Get(keyMeta("confirmed_upto_outgoing_mined_height"))
+	if err == nil {
+		if len(v) != 8 {
+			_ = closer.Close()
+			return nil, errors.New("rocksdb: confirmed_upto_outgoing_mined_height corrupt")
+		}
+		startHeight = binary.BigEndian.Uint64(v) + 1
+		_ = closer.Close()
+	} else if !errors.Is(err, pebble.ErrNotFound) {
+		return nil, fmt.Errorf("rocksdb: get confirmed_upto_outgoing_mined_height: %w", err)
+	}
+
+	if startHeight > uint64(maxMinedHeight) {
+		startHeight = 0
+	}
+
+	lower := make([]byte, 0, len(outgoingMinedHeightPrefix)+20)
+	lower = append(lower, outgoingMinedHeightPrefix...)
+	lower = appendUint64Fixed20(lower, startHeight)
+
+	iter, err := t.batch.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: prefixUpperBound(outgoingMinedHeightPrefix),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("rocksdb: iter outgoing confirmations: %w", err)
+	}
+	defer iter.Close()
+
+	var out []store.OutgoingOutput
+	for iter.First(); iter.Valid(); iter.Next() {
+		walletID, minedHeight, txid, actionIndex, err := parseOutgoingMinedHeightIndexKey(iter.Key())
+		if err != nil {
+			return nil, err
+		}
+		if minedHeight > maxMinedHeight {
+			break
+		}
+
+		ooKey := keyOutgoingOutput(walletID, txid, actionIndex)
+		v, closer, err := t.batch.Get(ooKey)
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("rocksdb: get outgoing output: %w", err)
+		}
+		var rec outgoingOutputRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			_ = closer.Close()
+			return nil, fmt.Errorf("rocksdb: decode outgoing output: %w", err)
+		}
+		_ = closer.Close()
+
+		if rec.ConfirmedHeight != nil {
+			continue
+		}
+		rec.ConfirmedHeight = &confirmationHeight
+
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return nil, fmt.Errorf("rocksdb: encode outgoing output: %w", err)
+		}
+		if err := t.batch.Set(ooKey, b, pebble.NoSync); err != nil {
+			return nil, fmt.Errorf("rocksdb: confirm outgoing output: %w", err)
+		}
+		if err := t.batch.Set(keyOutgoingConfirmedHeightIndex(uint64(confirmationHeight), walletID, txid, actionIndex), nil, pebble.NoSync); err != nil {
+			return nil, fmt.Errorf("rocksdb: confirm outgoing output index: %w", err)
+		}
+
+		var minedHeightPtr *int64
+		if rec.MinedHeight != nil {
+			h := *rec.MinedHeight
+			minedHeightPtr = &h
+		}
+		var mempoolSeenAt *time.Time
+		if rec.MempoolSeenUnix != nil {
+			tm := time.Unix(*rec.MempoolSeenUnix, 0).UTC()
+			mempoolSeenAt = &tm
+		}
+		out = append(out, store.OutgoingOutput{
+			WalletID:         walletID,
+			TxID:             rec.TxID,
+			ActionIndex:      rec.ActionIndex,
+			MinedHeight:      minedHeightPtr,
+			ConfirmedHeight:  &confirmationHeight,
+			MempoolSeenAt:    mempoolSeenAt,
+			RecipientAddress: rec.RecipientAddress,
+			ValueZat:         rec.ValueZat,
+			MemoHex:          rec.MemoHex,
+			OvkScope:         rec.OvkScope,
+			RecipientScope:   rec.RecipientScope,
+			CreatedAt:        time.Unix(rec.CreatedAtUnix, 0).UTC(),
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("rocksdb: confirm outgoing outputs iter: %w", err)
+	}
+
+	if err := t.batch.Set(keyMeta("confirmed_upto_outgoing_mined_height"), uint64To8(uint64(maxMinedHeight)), pebble.NoSync); err != nil {
+		return nil, fmt.Errorf("rocksdb: set confirmed_upto_outgoing_mined_height: %w", err)
+	}
+	return out, nil
+}
+
 func (t *rocksTx) ConfirmSpends(ctx context.Context, confirmationHeight int64, maxSpentHeight int64) ([]store.Note, error) {
 	_ = ctx
 	if confirmationHeight < 0 {
@@ -1772,6 +2309,96 @@ func (t *rocksTx) InsertNote(ctx context.Context, n store.Note) (bool, error) {
 	return true, nil
 }
 
+func (t *rocksTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutput) (bool, error) {
+	_ = ctx
+
+	o.WalletID = strings.TrimSpace(o.WalletID)
+	o.TxID = strings.ToLower(strings.TrimSpace(o.TxID))
+	o.OvkScope = strings.ToLower(strings.TrimSpace(o.OvkScope))
+	if o.RecipientScope != nil {
+		v := strings.ToLower(strings.TrimSpace(*o.RecipientScope))
+		if v == "" {
+			o.RecipientScope = nil
+		} else {
+			o.RecipientScope = &v
+		}
+	}
+	if o.WalletID == "" || o.TxID == "" || o.OvkScope == "" || o.RecipientAddress == "" {
+		return false, errors.New("rocksdb: outgoing output missing required fields")
+	}
+
+	key := keyOutgoingOutput(o.WalletID, o.TxID, o.ActionIndex)
+	v, closer, err := t.batch.Get(key)
+	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return false, fmt.Errorf("rocksdb: get outgoing output: %w", err)
+	}
+	if err == nil {
+		defer func() { _ = closer.Close() }()
+		var rec outgoingOutputRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			return false, fmt.Errorf("rocksdb: decode outgoing output: %w", err)
+		}
+
+		changed := false
+		if rec.MinedHeight == nil && o.MinedHeight != nil {
+			h := *o.MinedHeight
+			rec.MinedHeight = &h
+			if err := t.batch.Set(keyOutgoingMinedHeightIndex(uint64(h), o.WalletID, o.TxID, o.ActionIndex), nil, pebble.NoSync); err != nil {
+				return false, fmt.Errorf("rocksdb: insert outgoing mined height index: %w", err)
+			}
+			changed = true
+		}
+		if rec.MempoolSeenUnix == nil && o.MempoolSeenAt != nil && !o.MempoolSeenAt.IsZero() {
+			u := o.MempoolSeenAt.UTC().Unix()
+			rec.MempoolSeenUnix = &u
+			changed = true
+		}
+		if !changed {
+			return false, nil
+		}
+
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return false, fmt.Errorf("rocksdb: encode outgoing output: %w", err)
+		}
+		if err := t.batch.Set(key, b, pebble.NoSync); err != nil {
+			return false, fmt.Errorf("rocksdb: update outgoing output: %w", err)
+		}
+		return true, nil
+	}
+
+	rec := outgoingOutputRecord{
+		WalletID:         o.WalletID,
+		TxID:             o.TxID,
+		ActionIndex:      o.ActionIndex,
+		MinedHeight:      o.MinedHeight,
+		RecipientAddress: o.RecipientAddress,
+		ValueZat:         o.ValueZat,
+		MemoHex:          o.MemoHex,
+		OvkScope:         o.OvkScope,
+		RecipientScope:   o.RecipientScope,
+		CreatedAtUnix:    t.now.Unix(),
+	}
+	if o.MempoolSeenAt != nil && !o.MempoolSeenAt.IsZero() {
+		u := o.MempoolSeenAt.UTC().Unix()
+		rec.MempoolSeenUnix = &u
+	}
+
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return false, fmt.Errorf("rocksdb: encode outgoing output: %w", err)
+	}
+	if err := t.batch.Set(key, b, pebble.NoSync); err != nil {
+		return false, fmt.Errorf("rocksdb: insert outgoing output: %w", err)
+	}
+	if o.MinedHeight != nil {
+		if err := t.batch.Set(keyOutgoingMinedHeightIndex(uint64(*o.MinedHeight), o.WalletID, o.TxID, o.ActionIndex), nil, pebble.NoSync); err != nil {
+			return false, fmt.Errorf("rocksdb: insert outgoing mined height index: %w", err)
+		}
+	}
+	return true, nil
+}
+
 func (t *rocksTx) InsertEvent(ctx context.Context, e store.Event) error {
 	_ = ctx
 	if e.Height < 0 {
@@ -1869,6 +2496,26 @@ type noteRecord struct {
 	CreatedAtUnix        int64   `json:"created_at_unix"`
 }
 
+type outgoingOutputRecord struct {
+	WalletID string `json:"wallet_id"`
+	TxID     string `json:"txid"`
+
+	ActionIndex int32 `json:"action_index"`
+
+	MinedHeight     *int64 `json:"mined_height,omitempty"`
+	ConfirmedHeight *int64 `json:"confirmed_height,omitempty"`
+	MempoolSeenUnix *int64 `json:"mempool_seen_at_unix,omitempty"`
+
+	RecipientAddress string  `json:"recipient_address"`
+	ValueZat         int64   `json:"value_zat"`
+	MemoHex          *string `json:"memo_hex,omitempty"`
+
+	OvkScope       string  `json:"ovk_scope"`
+	RecipientScope *string `json:"recipient_scope,omitempty"`
+
+	CreatedAtUnix int64 `json:"created_at_unix"`
+}
+
 type eventRecord struct {
 	Kind          string `json:"kind"`
 	WalletID      string `json:"wallet_id"`
@@ -1891,6 +2538,9 @@ var (
 	noteSpentHeightPrefix          = []byte("nsh/")
 	noteConfirmedHeightPrefix      = []byte("nch/")
 	noteSpentConfirmedHeightPrefix = []byte("nsch/")
+	outgoingOutputPrefix           = []byte("oo/")
+	outgoingMinedHeightPrefix      = []byte("oomh/")
+	outgoingConfirmedHeightPrefix  = []byte("ooch/")
 	eventPrefix                    = []byte("e/")
 	eventHeightPrefix              = []byte("eh/")
 	eventSeqPrefix                 = []byte("es/")
@@ -1964,6 +2614,27 @@ func keyNote(walletID, txid string, actionIndex int32) []byte {
 	b = append(b, txid...)
 	b = append(b, '/')
 	b = strconv.AppendInt(b, int64(actionIndex), 10)
+	return b
+}
+
+func keyOutgoingOutput(walletID, txid string, actionIndex int32) []byte {
+	b := make([]byte, 0, len(outgoingOutputPrefix)+len(walletID)+1+len(txid)+1+11)
+	b = append(b, outgoingOutputPrefix...)
+	b = append(b, walletID...)
+	b = append(b, '/')
+	b = append(b, txid...)
+	b = append(b, '/')
+	b = strconv.AppendInt(b, int64(actionIndex), 10)
+	return b
+}
+
+func keyOutgoingOutputTxPrefix(walletID, txid string) []byte {
+	b := make([]byte, 0, len(outgoingOutputPrefix)+len(walletID)+1+len(txid)+1)
+	b = append(b, outgoingOutputPrefix...)
+	b = append(b, walletID...)
+	b = append(b, '/')
+	b = append(b, txid...)
+	b = append(b, '/')
 	return b
 }
 
@@ -2048,6 +2719,32 @@ func keySpentConfirmedHeightIndex(height uint64, nullifier string) []byte {
 	b = appendUint64Fixed20(b, height)
 	b = append(b, '/')
 	b = append(b, nullifier...)
+	return b
+}
+
+func keyOutgoingMinedHeightIndex(height uint64, walletID, txid string, actionIndex int32) []byte {
+	b := make([]byte, 0, len(outgoingMinedHeightPrefix)+20+1+len(walletID)+1+len(txid)+1+11)
+	b = append(b, outgoingMinedHeightPrefix...)
+	b = appendUint64Fixed20(b, height)
+	b = append(b, '/')
+	b = append(b, walletID...)
+	b = append(b, '/')
+	b = append(b, txid...)
+	b = append(b, '/')
+	b = strconv.AppendInt(b, int64(actionIndex), 10)
+	return b
+}
+
+func keyOutgoingConfirmedHeightIndex(height uint64, walletID, txid string, actionIndex int32) []byte {
+	b := make([]byte, 0, len(outgoingConfirmedHeightPrefix)+20+1+len(walletID)+1+len(txid)+1+11)
+	b = append(b, outgoingConfirmedHeightPrefix...)
+	b = appendUint64Fixed20(b, height)
+	b = append(b, '/')
+	b = append(b, walletID...)
+	b = append(b, '/')
+	b = append(b, txid...)
+	b = append(b, '/')
+	b = strconv.AppendInt(b, int64(actionIndex), 10)
 	return b
 }
 
@@ -2390,6 +3087,119 @@ func unconfirmSpendsAboveHeight(batch *pebble.Batch, db *pebble.DB, height uint6
 	return nil
 }
 
+func deleteOutgoingOutputsAboveHeight(batch *pebble.Batch, db *pebble.DB, startHeight uint64) error {
+	lower := make([]byte, 0, len(outgoingMinedHeightPrefix)+20)
+	lower = append(lower, outgoingMinedHeightPrefix...)
+	lower = appendUint64Fixed20(lower, startHeight)
+
+	iter, err := db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: prefixUpperBound(outgoingMinedHeightPrefix),
+	})
+	if err != nil {
+		return fmt.Errorf("rocksdb: iter: %w", err)
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		k := append([]byte{}, iter.Key()...)
+
+		walletID, _, txid, actionIndex, err := parseOutgoingMinedHeightIndexKey(k)
+		if err != nil {
+			return err
+		}
+
+		ooKey := keyOutgoingOutput(walletID, txid, actionIndex)
+		v, closer, err := batch.Get(ooKey)
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				_ = batch.Delete(k, pebble.NoSync)
+				continue
+			}
+			return fmt.Errorf("rocksdb: delete outgoing output get: %w", err)
+		}
+		var rec outgoingOutputRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			_ = closer.Close()
+			return fmt.Errorf("rocksdb: delete outgoing output decode: %w", err)
+		}
+		_ = closer.Close()
+
+		if err := batch.Delete(k, pebble.NoSync); err != nil {
+			return fmt.Errorf("rocksdb: delete outgoing mined index: %w", err)
+		}
+		if err := batch.Delete(ooKey, pebble.NoSync); err != nil {
+			return fmt.Errorf("rocksdb: delete outgoing output: %w", err)
+		}
+		if rec.ConfirmedHeight != nil {
+			if err := batch.Delete(keyOutgoingConfirmedHeightIndex(uint64(*rec.ConfirmedHeight), walletID, txid, actionIndex), pebble.NoSync); err != nil {
+				return fmt.Errorf("rocksdb: delete outgoing confirmed index: %w", err)
+			}
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("rocksdb: delete outgoing outputs iter: %w", err)
+	}
+	return nil
+}
+
+func unconfirmOutgoingOutputsAboveHeight(batch *pebble.Batch, db *pebble.DB, height uint64) error {
+	lower := make([]byte, 0, len(outgoingConfirmedHeightPrefix)+20)
+	lower = append(lower, outgoingConfirmedHeightPrefix...)
+	lower = appendUint64Fixed20(lower, height+1)
+
+	iter, err := db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: prefixUpperBound(outgoingConfirmedHeightPrefix),
+	})
+	if err != nil {
+		return fmt.Errorf("rocksdb: iter: %w", err)
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		k := append([]byte{}, iter.Key()...)
+
+		walletID, _, txid, actionIndex, err := parseOutgoingConfirmedHeightIndexKey(k)
+		if err != nil {
+			return err
+		}
+
+		ooKey := keyOutgoingOutput(walletID, txid, actionIndex)
+		v, closer, err := batch.Get(ooKey)
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				_ = batch.Delete(k, pebble.NoSync)
+				continue
+			}
+			return fmt.Errorf("rocksdb: unconfirm outgoing output get: %w", err)
+		}
+		var rec outgoingOutputRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			_ = closer.Close()
+			return fmt.Errorf("rocksdb: unconfirm outgoing output decode: %w", err)
+		}
+		_ = closer.Close()
+
+		rec.ConfirmedHeight = nil
+
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return fmt.Errorf("rocksdb: unconfirm outgoing output encode: %w", err)
+		}
+		if err := batch.Set(ooKey, b, pebble.NoSync); err != nil {
+			return fmt.Errorf("rocksdb: unconfirm outgoing output set: %w", err)
+		}
+		if err := batch.Delete(k, pebble.NoSync); err != nil {
+			return fmt.Errorf("rocksdb: unconfirm outgoing output delete index: %w", err)
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("rocksdb: unconfirm outgoing outputs iter: %w", err)
+	}
+	return nil
+}
+
 func rollbackCommitments(batch *pebble.Batch, db *pebble.DB, height uint64) error {
 	iter, err := db.NewIter(&pebble.IterOptions{
 		LowerBound: commitmentPrefix,
@@ -2524,4 +3334,62 @@ func parseNoteHeightIndexKey(key []byte) (walletID string, height int64, txid st
 		return "", 0, "", 0, errors.New("rocksdb: note action_index invalid")
 	}
 	return string(parts[2]), h, string(parts[3]), int32(action), nil
+}
+
+func parseOutgoingMinedHeightIndexKey(key []byte) (walletID string, height int64, txid string, actionIndex int32, err error) {
+	// k = oomh/<height>/<wallet>/<txid>/<action_index>
+	parts := bytes.Split(key, []byte("/"))
+	if len(parts) != 5 {
+		return "", 0, "", 0, errors.New("rocksdb: outgoing mined height index malformed")
+	}
+	h, err := parseFixed20Int64(parts[1])
+	if err != nil {
+		return "", 0, "", 0, errors.New("rocksdb: outgoing mined height invalid")
+	}
+	action, err := strconv.ParseInt(string(parts[4]), 10, 32)
+	if err != nil {
+		return "", 0, "", 0, errors.New("rocksdb: outgoing action_index invalid")
+	}
+	return string(parts[2]), h, string(parts[3]), int32(action), nil
+}
+
+func parseOutgoingConfirmedHeightIndexKey(key []byte) (walletID string, height int64, txid string, actionIndex int32, err error) {
+	// k = ooch/<height>/<wallet>/<txid>/<action_index>
+	parts := bytes.Split(key, []byte("/"))
+	if len(parts) != 5 {
+		return "", 0, "", 0, errors.New("rocksdb: outgoing confirmed height index malformed")
+	}
+	h, err := parseFixed20Int64(parts[1])
+	if err != nil {
+		return "", 0, "", 0, errors.New("rocksdb: outgoing confirmed height invalid")
+	}
+	action, err := strconv.ParseInt(string(parts[4]), 10, 32)
+	if err != nil {
+		return "", 0, "", 0, errors.New("rocksdb: outgoing action_index invalid")
+	}
+	return string(parts[2]), h, string(parts[3]), int32(action), nil
+}
+
+func cleanStringsLower(v []string) []string {
+	seen := make(map[string]struct{}, len(v))
+	out := make([]string, 0, len(v))
+	for _, s := range v {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+func derefString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
 }

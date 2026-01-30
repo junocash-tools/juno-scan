@@ -23,11 +23,14 @@ type Store interface {
 	WalletEventPublishCursor(ctx context.Context, walletID string) (int64, error)
 	SetWalletEventPublishCursor(ctx context.Context, walletID string, cursor int64) error
 
-	ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, blockHeight *int64) (events []Event, nextCursor int64, err error)
+	ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, filter EventFilter) (events []Event, nextCursor int64, err error)
 	ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]Note, error)
 	UpdatePendingSpends(ctx context.Context, pending map[string]string, seenAt time.Time) error
+	ListNotesByPendingSpentTxIDs(ctx context.Context, txids []string) ([]Note, error)
 	ListOrchardCommitmentsUpToHeight(ctx context.Context, height int64) ([]OrchardCommitment, error)
 	FirstOrchardCommitmentPositionFromHeight(ctx context.Context, height int64) (pos int64, ok bool, err error)
+
+	ListOutgoingOutputsByTxID(ctx context.Context, walletID, txid string) ([]OutgoingOutput, error)
 }
 
 type Tx interface {
@@ -39,6 +42,8 @@ type Tx interface {
 	ConfirmNotes(ctx context.Context, confirmationHeight int64, maxNoteHeight int64) ([]Note, error)
 	ConfirmSpends(ctx context.Context, confirmationHeight int64, maxSpentHeight int64) ([]Note, error)
 	InsertNote(ctx context.Context, n Note) (inserted bool, err error)
+	InsertOutgoingOutput(ctx context.Context, o OutgoingOutput) (changed bool, err error)
+	ConfirmOutgoingOutputs(ctx context.Context, confirmationHeight int64, maxMinedHeight int64) ([]OutgoingOutput, error)
 	InsertEvent(ctx context.Context, e Event) error
 }
 
@@ -109,5 +114,31 @@ type Event struct {
 	WalletID  string
 	Height    int64
 	Payload   json.RawMessage
+	CreatedAt time.Time
+}
+
+type EventFilter struct {
+	BlockHeight *int64
+	Kinds       []string
+	TxID        string
+}
+
+type OutgoingOutput struct {
+	WalletID string
+
+	TxID        string
+	ActionIndex int32
+
+	MinedHeight     *int64
+	ConfirmedHeight *int64
+	MempoolSeenAt   *time.Time
+
+	RecipientAddress string
+	ValueZat         int64
+	MemoHex          *string
+
+	OvkScope       string
+	RecipientScope *string
+
 	CreatedAt time.Time
 }

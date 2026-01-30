@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Abdullah1738/juno-scan/internal/backfill"
+	"github.com/Abdullah1738/juno-scan/internal/events"
 	"github.com/Abdullah1738/juno-scan/internal/orchardscan"
 	"github.com/Abdullah1738/juno-scan/internal/store"
 )
@@ -234,6 +235,35 @@ func (s *Server) handleListWalletEvents(w http.ResponseWriter, r *http.Request, 
 		blockHeight = &h
 	}
 
+	var kinds []string
+	{
+		seen := make(map[string]struct{})
+		for _, raw := range r.URL.Query()["kind"] {
+			for _, k := range strings.Split(raw, ",") {
+				k = strings.TrimSpace(k)
+				if k == "" {
+					continue
+				}
+				if canon, ok := canonicalEventKind(k); ok {
+					k = canon
+				}
+				if _, ok := seen[k]; ok {
+					continue
+				}
+				seen[k] = struct{}{}
+				kinds = append(kinds, k)
+			}
+		}
+	}
+
+	txid := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("txid")))
+	if txid != "" {
+		if len(txid) != 64 || !isLowerHex(txid) {
+			http.Error(w, "invalid txid", http.StatusBadRequest)
+			return
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
@@ -245,7 +275,13 @@ func (s *Server) handleListWalletEvents(w http.ResponseWriter, r *http.Request, 
 		CreatedAt time.Time       `json:"created_at"`
 	}
 
-	evs, nextCursor, err := s.st.ListWalletEvents(ctx, walletID, cursor, int(limit), blockHeight)
+	filter := store.EventFilter{
+		BlockHeight: blockHeight,
+		Kinds:       kinds,
+		TxID:        txid,
+	}
+
+	evs, nextCursor, err := s.st.ListWalletEvents(ctx, walletID, cursor, int(limit), filter)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
@@ -266,6 +302,51 @@ func (s *Server) handleListWalletEvents(w http.ResponseWriter, r *http.Request, 
 		"events":      events,
 		"next_cursor": nextCursor,
 	})
+}
+
+func canonicalEventKind(kind string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case strings.ToLower(events.KindDepositEvent):
+		return events.KindDepositEvent, true
+	case strings.ToLower(events.KindDepositConfirmed):
+		return events.KindDepositConfirmed, true
+	case strings.ToLower(events.KindDepositOrphaned):
+		return events.KindDepositOrphaned, true
+	case strings.ToLower(events.KindDepositUnconfirmed):
+		return events.KindDepositUnconfirmed, true
+	case strings.ToLower(events.KindSpendEvent):
+		return events.KindSpendEvent, true
+	case strings.ToLower(events.KindSpendConfirmed):
+		return events.KindSpendConfirmed, true
+	case strings.ToLower(events.KindSpendOrphaned):
+		return events.KindSpendOrphaned, true
+	case strings.ToLower(events.KindSpendUnconfirmed):
+		return events.KindSpendUnconfirmed, true
+	case strings.ToLower(events.KindOutgoingOutputEvent):
+		return events.KindOutgoingOutputEvent, true
+	case strings.ToLower(events.KindOutgoingOutputConfirmed):
+		return events.KindOutgoingOutputConfirmed, true
+	case strings.ToLower(events.KindOutgoingOutputOrphaned):
+		return events.KindOutgoingOutputOrphaned, true
+	case strings.ToLower(events.KindOutgoingOutputUnconfirmed):
+		return events.KindOutgoingOutputUnconfirmed, true
+	default:
+		return "", false
+	}
+}
+
+func isLowerHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			continue
+		}
+		if c >= 'a' && c <= 'f' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (s *Server) handleBackfillWallet(w http.ResponseWriter, r *http.Request, walletID string) {

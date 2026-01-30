@@ -79,7 +79,7 @@ func (p *Publisher) publishOnce(ctx context.Context) error {
 		}
 
 		for {
-			events, nextCursor, err := p.st.ListWalletEvents(ctx, w.WalletID, cursor, p.batchSize, nil)
+			events, nextCursor, err := p.st.ListWalletEvents(ctx, w.WalletID, cursor, p.batchSize, store.EventFilter{})
 			if err != nil {
 				return err
 			}
