@@ -552,7 +552,13 @@ func waitForEventKind(t *testing.T, ctx context.Context, st store.Store, walletI
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("%s not found", kind)
+
+	evs, _, _ := st.ListWalletEvents(context.Background(), walletID, 0, 1000, store.EventFilter{})
+	kinds := make([]string, 0, len(evs))
+	for _, e := range evs {
+		kinds = append(kinds, e.Kind)
+	}
+	t.Fatalf("%s not found (events=%v)", kind, kinds)
 	return store.Event{}
 }
 
