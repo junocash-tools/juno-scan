@@ -179,6 +179,88 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 					insertedEvents++
 				}
 
+				// Record outgoing outputs for spends (recipient/value/memo via OVK output recovery).
+				if len(spentNotes) > 0 {
+					outs, err := orchardscan.RecoverOutgoingTx(ctx, s.uaHRP, []orchardscan.Wallet{{WalletID: req.WalletID, UFVK: walletUFVK}}, t.Hex)
+					if err != nil {
+						return fmt.Errorf("backfill: recover outgoing tx %s: %w", t.TxID, err)
+					}
+
+					for _, o := range outs {
+						heightCopy := height
+
+						var memoHexPtr *string
+						memoHex := strings.TrimSpace(o.MemoHex)
+						if memoHex != "" {
+							memoHexPtr = &memoHex
+						}
+
+						var recipientScopePtr *string
+						recipientScope := strings.TrimSpace(o.RecipientScope)
+						if recipientScope != "" {
+							recipientScopePtr = &recipientScope
+						}
+
+						changed, err := tx.InsertOutgoingOutput(ctx, store.OutgoingOutput{
+							WalletID: o.WalletID,
+							TxID:     t.TxID,
+
+							ActionIndex: int32(o.ActionIndex),
+
+							MinedHeight: &heightCopy,
+
+							RecipientAddress: o.RecipientAddress,
+							ValueZat:         int64(o.ValueZat),
+							MemoHex:          memoHexPtr,
+
+							OvkScope:       o.OvkScope,
+							RecipientScope: recipientScopePtr,
+						})
+						if err != nil {
+							return err
+						}
+						if !changed {
+							continue
+						}
+
+						payload := events.OutgoingOutputEventPayload{
+							Version:  types.V1,
+							WalletID: o.WalletID,
+
+							TxID:  t.TxID,
+							Height: &heightCopy,
+
+							ActionIndex:    o.ActionIndex,
+							AmountZatoshis: o.ValueZat,
+
+							RecipientAddress: o.RecipientAddress,
+							MemoHex:          memoHex,
+
+							OvkScope:       o.OvkScope,
+							RecipientScope: recipientScope,
+
+							Status: types.TxStatus{
+								State:         types.TxStateConfirmed,
+								Height:        height,
+								Confirmations: 1,
+							},
+						}
+						b, err := json.Marshal(payload)
+						if err != nil {
+							return fmt.Errorf("backfill: marshal outgoing output payload: %w", err)
+						}
+						if err := tx.InsertEvent(ctx, store.Event{
+							Kind:     events.KindOutgoingOutputEvent,
+							WalletID: o.WalletID,
+							Height:   height,
+							Payload:  b,
+						}); err != nil {
+							return err
+						}
+						insertedEvents++
+					}
+				}
+
 				for _, n := range res.Notes {
 					pos, ok := posByTxAction[t.TxID][n.ActionIndex]
 					if !ok {
@@ -258,6 +340,13 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 			}
 			insertedEvents += confirmedSpendEvents
 			_ = confirmedSpends
+
+			confirmedOutgoing, confirmedOutgoingEvents, err := confirmOutgoingOutputConfirmations(ctx, tx, s.confirmations, height)
+			if err != nil {
+				return err
+			}
+			insertedEvents += confirmedOutgoingEvents
+			_ = confirmedOutgoing
 
 			return nil
 		})
@@ -418,6 +507,76 @@ func confirmSpendConfirmations(ctx context.Context, tx store.Tx, confirmations i
 	return notes, inserted, nil
 }
 
+func confirmOutgoingOutputConfirmations(ctx context.Context, tx store.Tx, confirmations int64, scanHeight int64) ([]store.OutgoingOutput, int64, error) {
+	maxMinedHeight := scanHeight - confirmations + 1
+	if maxMinedHeight < 0 {
+		return nil, 0, nil
+	}
+
+	outs, err := tx.ConfirmOutgoingOutputs(ctx, scanHeight, maxMinedHeight)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var inserted int64
+	for _, o := range outs {
+		if o.MinedHeight == nil {
+			continue
+		}
+		confCount := scanHeight - *o.MinedHeight + 1
+		if confCount < 1 {
+			confCount = 1
+		}
+
+		memoHex := ""
+		if o.MemoHex != nil {
+			memoHex = *o.MemoHex
+		}
+
+		heightCopy := *o.MinedHeight
+		payload := events.OutgoingOutputConfirmedPayload{
+			OutgoingOutputEventPayload: events.OutgoingOutputEventPayload{
+				Version:  types.V1,
+				WalletID: o.WalletID,
+
+				TxID:  o.TxID,
+				Height: &heightCopy,
+
+				ActionIndex:    uint32(o.ActionIndex),
+				AmountZatoshis: uint64(o.ValueZat),
+
+				RecipientAddress: o.RecipientAddress,
+				MemoHex:          memoHex,
+
+				OvkScope:       o.OvkScope,
+				RecipientScope: derefString(o.RecipientScope),
+
+				Status: types.TxStatus{
+					State:         types.TxStateConfirmed,
+					Height:        *o.MinedHeight,
+					Confirmations: confCount,
+				},
+			},
+			ConfirmedHeight:       scanHeight,
+			RequiredConfirmations: confirmations,
+		}
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return nil, 0, fmt.Errorf("backfill: marshal outgoing output confirmed payload: %w", err)
+		}
+		if err := tx.InsertEvent(ctx, store.Event{
+			Kind:     events.KindOutgoingOutputConfirmed,
+			WalletID: o.WalletID,
+			Height:   scanHeight,
+			Payload:  b,
+		}); err != nil {
+			return nil, 0, err
+		}
+		inserted++
+	}
+	return outs, inserted, nil
+}
+
 type blockVerbose2 struct {
 	Hash              string       `json:"hash"`
 	Height            int64        `json:"height"`
@@ -429,4 +588,11 @@ type blockVerbose2 struct {
 type txVerbose2 struct {
 	TxID string `json:"txid"`
 	Hex  string `json:"hex"`
+}
+
+func derefString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
 }

@@ -154,12 +154,15 @@ func (s *Scanner) updatePendingSpends(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	seenAt := time.Now().UTC()
+
 	var txids []string
 	if err := s.rpc.Call(ctx, "getrawmempool", nil, &txids); err != nil {
 		return fmt.Errorf("scanner: getrawmempool: %w", err)
 	}
 
 	type rawTx struct {
+		Hex     string `json:"hex"`
 		Orchard struct {
 			Actions []struct {
 				Nullifier string `json:"nullifier"`
@@ -170,6 +173,8 @@ func (s *Scanner) updatePendingSpends(ctx context.Context) error {
 	if s.mempoolOrchardNullifiersByTxID == nil {
 		s.mempoolOrchardNullifiersByTxID = make(map[string][]string)
 	}
+
+	newTxHex := make(map[string]string)
 
 	inMempool := make(map[string]struct{}, len(txids))
 	for _, txid := range txids {
@@ -211,6 +216,10 @@ func (s *Scanner) updatePendingSpends(ctx context.Context) error {
 		}
 
 		s.mempoolOrchardNullifiersByTxID[txid] = nfs
+
+		if txHex := strings.TrimSpace(tx.Hex); txHex != "" {
+			newTxHex[txid] = txHex
+		}
 	}
 
 	pending := make(map[string]string)
@@ -223,9 +232,146 @@ func (s *Scanner) updatePendingSpends(ctx context.Context) error {
 		}
 	}
 
-	if err := s.st.UpdatePendingSpends(ctx, pending, time.Now().UTC()); err != nil {
+	if err := s.st.UpdatePendingSpends(ctx, pending, seenAt); err != nil {
 		return fmt.Errorf("scanner: update pending spends: %w", err)
 	}
+
+	if len(newTxHex) > 0 {
+		newTxIDs := make([]string, 0, len(newTxHex))
+		for txid := range newTxHex {
+			newTxIDs = append(newTxIDs, txid)
+		}
+
+		notes, err := s.st.ListNotesByPendingSpentTxIDs(ctx, newTxIDs)
+		if err != nil {
+			return fmt.Errorf("scanner: list pending spend notes: %w", err)
+		}
+
+		wallets, err := s.loadWallets(ctx)
+		if err != nil {
+			return err
+		}
+		walletByID := make(map[string]orchardscan.Wallet, len(wallets))
+		for _, w := range wallets {
+			walletByID[w.WalletID] = w
+		}
+
+		walletIDsByTxID := make(map[string]map[string]struct{})
+		for _, n := range notes {
+			if n.PendingSpentTxID == nil {
+				continue
+			}
+			txid := strings.ToLower(strings.TrimSpace(*n.PendingSpentTxID))
+			if _, ok := newTxHex[txid]; !ok {
+				continue
+			}
+			if _, ok := walletIDsByTxID[txid]; !ok {
+				walletIDsByTxID[txid] = make(map[string]struct{})
+			}
+			walletIDsByTxID[txid][n.WalletID] = struct{}{}
+		}
+
+		for txid, walletSet := range walletIDsByTxID {
+			txHex := newTxHex[txid]
+			if strings.TrimSpace(txHex) == "" || len(walletSet) == 0 {
+				continue
+			}
+
+			recoverWallets := make([]orchardscan.Wallet, 0, len(walletSet))
+			for walletID := range walletSet {
+				w, ok := walletByID[walletID]
+				if !ok {
+					continue
+				}
+				recoverWallets = append(recoverWallets, w)
+			}
+			if len(recoverWallets) == 0 {
+				continue
+			}
+
+			outs, err := orchardscan.RecoverOutgoingTx(ctx, s.uaHRP, recoverWallets, txHex)
+			if err != nil {
+				log.Printf("mempool: recover outgoing tx %s failed: %v", txid, err)
+				continue
+			}
+
+			if err := s.st.WithTx(ctx, func(tx store.Tx) error {
+				for _, o := range outs {
+					seenAtCopy := seenAt
+
+					var memoHexPtr *string
+					memoHex := strings.TrimSpace(o.MemoHex)
+					if memoHex != "" {
+						memoHexPtr = &memoHex
+					}
+
+					var recipientScopePtr *string
+					recipientScope := strings.TrimSpace(o.RecipientScope)
+					if recipientScope != "" {
+						recipientScopePtr = &recipientScope
+					}
+
+					changed, err := tx.InsertOutgoingOutput(ctx, store.OutgoingOutput{
+						WalletID: o.WalletID,
+						TxID:     txid,
+
+						ActionIndex: int32(o.ActionIndex),
+
+						MempoolSeenAt: &seenAtCopy,
+
+						RecipientAddress: o.RecipientAddress,
+						ValueZat:         int64(o.ValueZat),
+						MemoHex:          memoHexPtr,
+
+						OvkScope:       o.OvkScope,
+						RecipientScope: recipientScopePtr,
+					})
+					if err != nil {
+						return err
+					}
+					if !changed {
+						continue
+					}
+
+					payload := events.OutgoingOutputEventPayload{
+						Version:  types.V1,
+						WalletID: o.WalletID,
+
+						TxID: txid,
+
+						ActionIndex:    o.ActionIndex,
+						AmountZatoshis: o.ValueZat,
+
+						RecipientAddress: o.RecipientAddress,
+						MemoHex:          memoHex,
+
+						OvkScope:       o.OvkScope,
+						RecipientScope: recipientScope,
+
+						Status: types.TxStatus{
+							State: types.TxStateMempool,
+						},
+					}
+					payloadBytes, err := json.Marshal(payload)
+					if err != nil {
+						return fmt.Errorf("scanner: marshal outgoing output mempool payload: %w", err)
+					}
+					if err := tx.InsertEvent(ctx, store.Event{
+						Kind:     events.KindOutgoingOutputEvent,
+						WalletID: o.WalletID,
+						Height:   0,
+						Payload:  payloadBytes,
+					}); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -253,6 +399,11 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 	wallets, err := s.loadWallets(ctx)
 	if err != nil {
 		return err
+	}
+
+	walletByID := make(map[string]orchardscan.Wallet, len(wallets))
+	for _, w := range wallets {
+		walletByID[w.WalletID] = w
 	}
 
 	return s.st.WithTx(ctx, func(tx store.Tx) error {
@@ -356,6 +507,103 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 				}
 			}
 
+			// Record outgoing outputs for spends (recipient/value/memo via OVK output recovery).
+			if len(spentNotes) > 0 {
+				walletsSet := make(map[string]orchardscan.Wallet)
+				for _, n := range spentNotes {
+					w, ok := walletByID[n.WalletID]
+					if !ok {
+						continue
+					}
+					walletsSet[n.WalletID] = w
+				}
+
+				if len(walletsSet) > 0 {
+					recoverWallets := make([]orchardscan.Wallet, 0, len(walletsSet))
+					for _, w := range walletsSet {
+						recoverWallets = append(recoverWallets, w)
+					}
+
+					outs, err := orchardscan.RecoverOutgoingTx(ctx, s.uaHRP, recoverWallets, t.Hex)
+					if err != nil {
+						return fmt.Errorf("scanner: recover outgoing tx %s: %w", t.TxID, err)
+					}
+
+					for _, o := range outs {
+						heightCopy := blk.Height
+
+						var memoHexPtr *string
+						memoHex := strings.TrimSpace(o.MemoHex)
+						if memoHex != "" {
+							memoHexPtr = &memoHex
+						}
+
+						var recipientScopePtr *string
+						recipientScope := strings.TrimSpace(o.RecipientScope)
+						if recipientScope != "" {
+							recipientScopePtr = &recipientScope
+						}
+
+						changed, err := tx.InsertOutgoingOutput(ctx, store.OutgoingOutput{
+							WalletID: o.WalletID,
+							TxID:     t.TxID,
+
+							ActionIndex: int32(o.ActionIndex),
+
+							MinedHeight: &heightCopy,
+
+							RecipientAddress: o.RecipientAddress,
+							ValueZat:         int64(o.ValueZat),
+							MemoHex:          memoHexPtr,
+
+							OvkScope:       o.OvkScope,
+							RecipientScope: recipientScopePtr,
+						})
+						if err != nil {
+							return err
+						}
+						if !changed {
+							continue
+						}
+
+						payload := events.OutgoingOutputEventPayload{
+							Version:  types.V1,
+							WalletID: o.WalletID,
+
+							TxID:  t.TxID,
+							Height: &heightCopy,
+
+							ActionIndex:    o.ActionIndex,
+							AmountZatoshis: o.ValueZat,
+
+							RecipientAddress: o.RecipientAddress,
+							MemoHex:          memoHex,
+
+							OvkScope:       o.OvkScope,
+							RecipientScope: recipientScope,
+
+							Status: types.TxStatus{
+								State:         types.TxStateConfirmed,
+								Height:        blk.Height,
+								Confirmations: 1,
+							},
+						}
+						payloadBytes, err := json.Marshal(payload)
+						if err != nil {
+							return fmt.Errorf("scanner: marshal outgoing output payload: %w", err)
+						}
+						if err := tx.InsertEvent(ctx, store.Event{
+							Kind:     events.KindOutgoingOutputEvent,
+							WalletID: o.WalletID,
+							Height:   blk.Height,
+							Payload:  payloadBytes,
+						}); err != nil {
+							return err
+						}
+					}
+				}
+			}
+
 			// Record deposits.
 			for _, n := range res.Notes {
 				pos := posByTxAction[t.TxID][n.ActionIndex]
@@ -421,6 +669,9 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 			return err
 		}
 		if err := s.confirmSpendConfirmations(ctx, tx, blk.Height); err != nil {
+			return err
+		}
+		if err := s.confirmOutgoingOutputConfirmations(ctx, tx, blk.Height); err != nil {
 			return err
 		}
 
@@ -546,6 +797,76 @@ func (s *Scanner) confirmSpendConfirmations(ctx context.Context, tx store.Tx, sc
 	return nil
 }
 
+func (s *Scanner) confirmOutgoingOutputConfirmations(ctx context.Context, tx store.Tx, scanHeight int64) error {
+	maxMinedHeight := scanHeight - s.confirmations + 1
+	if maxMinedHeight < 0 {
+		return nil
+	}
+
+	outs, err := tx.ConfirmOutgoingOutputs(ctx, scanHeight, maxMinedHeight)
+	if err != nil {
+		return err
+	}
+
+	for _, o := range outs {
+		if o.MinedHeight == nil {
+			continue
+		}
+
+		confCount := scanHeight - *o.MinedHeight + 1
+		if confCount < 1 {
+			confCount = 1
+		}
+
+		memoHex := ""
+		if o.MemoHex != nil {
+			memoHex = *o.MemoHex
+		}
+
+		heightCopy := *o.MinedHeight
+		payload := events.OutgoingOutputConfirmedPayload{
+			OutgoingOutputEventPayload: events.OutgoingOutputEventPayload{
+				Version:  types.V1,
+				WalletID: o.WalletID,
+
+				TxID:  o.TxID,
+				Height: &heightCopy,
+
+				ActionIndex:    uint32(o.ActionIndex),
+				AmountZatoshis: uint64(o.ValueZat),
+
+				RecipientAddress: o.RecipientAddress,
+				MemoHex:          memoHex,
+
+				OvkScope:       o.OvkScope,
+				RecipientScope: derefString(o.RecipientScope),
+
+				Status: types.TxStatus{
+					State:         types.TxStateConfirmed,
+					Height:        *o.MinedHeight,
+					Confirmations: confCount,
+				},
+			},
+			ConfirmedHeight:       scanHeight,
+			RequiredConfirmations: s.confirmations,
+		}
+		payloadBytes, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("scanner: marshal outgoing output confirmed payload: %w", err)
+		}
+		if err := tx.InsertEvent(ctx, store.Event{
+			Kind:     events.KindOutgoingOutputConfirmed,
+			WalletID: o.WalletID,
+			Height:   scanHeight,
+			Payload:  payloadBytes,
+		}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (s *Scanner) loadWallets(ctx context.Context) ([]orchardscan.Wallet, error) {
 	wallets, err := s.st.ListEnabledWalletUFVKs(ctx)
 	if err != nil {
@@ -572,4 +893,11 @@ type blockVerbose2 struct {
 type txVerbose2 struct {
 	TxID string `json:"txid"`
 	Hex  string `json:"hex"`
+}
+
+func derefString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
 }
