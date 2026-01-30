@@ -29,6 +29,19 @@ func ScanTxJSON(req string) (string, error) {
 	return C.GoString(out), nil
 }
 
+func RecoverOutgoingTxJSON(req string) (string, error) {
+	cReq := C.CString(req)
+	defer C.free(unsafe.Pointer(cReq))
+
+	out := C.juno_scan_recover_outgoing_tx_json(cReq)
+	if out == nil {
+		return "", errNull
+	}
+	defer C.juno_scan_string_free(out)
+
+	return C.GoString(out), nil
+}
+
 func ValidateUFVKJSON(req string) (string, error) {
 	cReq := C.CString(req)
 	defer C.free(unsafe.Pointer(cReq))

@@ -8,7 +8,7 @@ use orchard::note_encryption::{CompactAction, OrchardDomain};
 use orchard::tree::MerkleHashOrchard;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use zcash_note_encryption::{batch, try_note_decryption, ShieldedOutput};
+use zcash_note_encryption::{batch, try_note_decryption, try_output_recovery_with_ovk, ShieldedOutput};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::BranchId;
 use zeroize::Zeroize;
@@ -91,6 +91,26 @@ enum ScanTxResponse {
     },
 }
 
+#[derive(Debug, Serialize)]
+struct OutgoingOutputOut {
+    wallet_id: String,
+    action_index: u32,
+    recipient_address: String,
+    value_zat: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memo_hex: Option<String>,
+    ovk_scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recipient_scope: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum RecoverOutgoingTxResponse {
+    Ok { outputs: Vec<OutgoingOutputOut> },
+    Err { error: String },
+}
+
 #[derive(Debug, Deserialize)]
 struct ValidateUFVKRequest {
     ufvk: String,
@@ -153,6 +173,20 @@ pub extern "C" fn juno_scan_scan_tx_json(req_json: *const c_char) -> *mut c_char
             error: e.to_string(),
         }),
         Err(_) => to_c_string(ScanTxResponse::Err {
+            error: ScanError::Panic.to_string(),
+        }),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn juno_scan_recover_outgoing_tx_json(req_json: *const c_char) -> *mut c_char {
+    let res = std::panic::catch_unwind(|| recover_outgoing_tx_json_inner(req_json));
+    match res {
+        Ok(Ok(v)) => to_c_string(v),
+        Ok(Err(e)) => to_c_string(RecoverOutgoingTxResponse::Err {
+            error: e.to_string(),
+        }),
+        Err(_) => to_c_string(RecoverOutgoingTxResponse::Err {
             error: ScanError::Panic.to_string(),
         }),
     }
@@ -367,6 +401,113 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
     Ok(ScanTxResponse::Ok {
         actions: actions_out,
         notes: notes_out,
+    })
+}
+
+fn recover_outgoing_tx_json_inner(
+    req_json: *const c_char,
+) -> Result<RecoverOutgoingTxResponse, ScanError> {
+    if req_json.is_null() {
+        return Err(ScanError::ReqJSONInvalid);
+    }
+
+    let s = unsafe { std::ffi::CStr::from_ptr(req_json) }
+        .to_string_lossy()
+        .to_string();
+    let req: ScanTxRequest = serde_json::from_str(&s).map_err(|_| ScanError::ReqJSONInvalid)?;
+
+    let ua_hrp = req.ua_hrp.trim().to_string();
+    if ua_hrp.is_empty() || ua_hrp.len() > 16 {
+        return Err(ScanError::UAHrpInvalid);
+    }
+
+    let mut tx_bytes = hex::decode(req.tx_hex.trim()).map_err(|_| ScanError::TxHexInvalid)?;
+    let tx =
+        Transaction::read(&tx_bytes[..], BranchId::Nu6_1).map_err(|_| ScanError::TxParseFailed)?;
+    tx_bytes.zeroize();
+
+    let orchard_bundle = match tx.orchard_bundle() {
+        Some(b) => b,
+        None => {
+            return Ok(RecoverOutgoingTxResponse::Ok { outputs: vec![] });
+        }
+    };
+
+    if orchard_bundle.actions().is_empty() || req.wallets.is_empty() {
+        return Ok(RecoverOutgoingTxResponse::Ok { outputs: vec![] });
+    }
+
+    let mut outputs_out = Vec::new();
+
+    for w in &req.wallets {
+        if w.wallet_id.trim().is_empty() {
+            return Err(ScanError::UFVKInvalid);
+        }
+
+        let fvk = parse_orchard_fvk_from_ufvk(&w.ufvk)?;
+
+        let ovk_external = fvk.to_ovk(Scope::External);
+        let ovk_internal = fvk.to_ovk(Scope::Internal);
+
+        for (action_index, action) in orchard_bundle.actions().iter().enumerate() {
+            let domain = OrchardDomain::for_action(action);
+
+            let mut recovered: Option<([u8; 512], orchard::note::Note, orchard::Address, &str)> =
+                None;
+
+            if let Some((note, addr, memo)) = try_output_recovery_with_ovk(
+                &domain,
+                &ovk_external,
+                action,
+                action.cv_net(),
+                &action.encrypted_note().out_ciphertext,
+            ) {
+                recovered = Some((memo, note, addr, "external"));
+            } else if let Some((note, addr, memo)) = try_output_recovery_with_ovk(
+                &domain,
+                &ovk_internal,
+                action,
+                action.cv_net(),
+                &action.encrypted_note().out_ciphertext,
+            ) {
+                recovered = Some((memo, note, addr, "internal"));
+            }
+
+            let Some((memo, note, addr, ovk_scope)) = recovered else {
+                continue;
+            };
+
+            let memo_hex = if is_empty_memo(&memo) {
+                None
+            } else {
+                Some(hex::encode(memo))
+            };
+
+            let addr_bytes = addr.to_raw_address_bytes();
+            let recipient_address =
+                zip316::encode_unified_container(&ua_hrp, TYPECODE_ORCHARD, &addr_bytes)
+                    .map_err(|_| ScanError::UAHrpInvalid)?;
+
+            let recipient_scope = match fvk.scope_for_address(&addr) {
+                Some(Scope::External) => Some("external".to_string()),
+                Some(Scope::Internal) => Some("internal".to_string()),
+                None => None,
+            };
+
+            outputs_out.push(OutgoingOutputOut {
+                wallet_id: w.wallet_id.trim().to_string(),
+                action_index: action_index as u32,
+                recipient_address,
+                value_zat: note.value().inner().to_string(),
+                memo_hex,
+                ovk_scope: ovk_scope.to_string(),
+                recipient_scope,
+            });
+        }
+    }
+
+    Ok(RecoverOutgoingTxResponse::Ok {
+        outputs: outputs_out,
     })
 }
 

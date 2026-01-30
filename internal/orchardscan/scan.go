@@ -33,6 +33,16 @@ type Note struct {
 	NoteNullifier    string
 }
 
+type OutgoingOutput struct {
+	WalletID         string
+	ActionIndex      uint32
+	RecipientAddress string
+	ValueZat         uint64
+	MemoHex          string
+	OvkScope         string
+	RecipientScope   string
+}
+
 type Result struct {
 	Actions []Action
 	Notes   []Note
@@ -133,6 +143,65 @@ func ScanTx(ctx context.Context, uaHRP string, wallets []Wallet, txHex string) (
 	}
 }
 
+func RecoverOutgoingTx(ctx context.Context, uaHRP string, wallets []Wallet, txHex string) ([]OutgoingOutput, error) {
+	_ = ctx // reserved for future (ffi call is synchronous)
+
+	req := recoverOutgoingTxRequest{
+		UAHRP:   uaHRP,
+		Wallets: make([]walletIn, 0, len(wallets)),
+		TxHex:   txHex,
+	}
+	for _, w := range wallets {
+		req.Wallets = append(req.Wallets, walletIn{
+			WalletID: w.WalletID,
+			UFVK:     w.UFVK,
+		})
+	}
+
+	b, err := json.Marshal(req)
+	if err != nil {
+		return nil, errors.New("orchardscan: marshal request")
+	}
+
+	raw, err := ffi.RecoverOutgoingTxJSON(string(b))
+	if err != nil {
+		return nil, err
+	}
+
+	var resp recoverOutgoingTxResponse
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+		return nil, errors.New("orchardscan: invalid response")
+	}
+
+	switch resp.Status {
+	case "ok":
+		out := make([]OutgoingOutput, 0, len(resp.Outputs))
+		for _, o := range resp.Outputs {
+			v, err := strconv.ParseUint(o.ValueZat, 10, 64)
+			if err != nil {
+				return nil, errors.New("orchardscan: invalid response")
+			}
+			out = append(out, OutgoingOutput{
+				WalletID:         o.WalletID,
+				ActionIndex:      o.ActionIndex,
+				RecipientAddress: o.RecipientAddress,
+				ValueZat:         v,
+				MemoHex:          o.MemoHex,
+				OvkScope:         o.OvkScope,
+				RecipientScope:   o.RecipientScope,
+			})
+		}
+		return out, nil
+	case "err":
+		if resp.Error == "" {
+			return nil, errors.New("orchardscan: invalid response")
+		}
+		return nil, &Error{Code: ErrorCode(resp.Error)}
+	default:
+		return nil, errors.New("orchardscan: invalid response")
+	}
+}
+
 type scanTxRequest struct {
 	UAHRP   string     `json:"ua_hrp"`
 	Wallets []walletIn `json:"wallets"`
@@ -149,6 +218,28 @@ type scanTxResponse struct {
 	Actions []actionOut `json:"actions,omitempty"`
 	Notes   []noteOut   `json:"notes,omitempty"`
 	Error   string      `json:"error,omitempty"`
+}
+
+type recoverOutgoingTxRequest struct {
+	UAHRP   string     `json:"ua_hrp"`
+	Wallets []walletIn `json:"wallets"`
+	TxHex   string     `json:"tx_hex"`
+}
+
+type recoverOutgoingTxResponse struct {
+	Status  string              `json:"status"`
+	Outputs []outgoingOutputOut `json:"outputs,omitempty"`
+	Error   string              `json:"error,omitempty"`
+}
+
+type outgoingOutputOut struct {
+	WalletID         string `json:"wallet_id"`
+	ActionIndex      uint32 `json:"action_index"`
+	RecipientAddress string `json:"recipient_address"`
+	ValueZat         string `json:"value_zat"`
+	MemoHex          string `json:"memo_hex,omitempty"`
+	OvkScope         string `json:"ovk_scope"`
+	RecipientScope   string `json:"recipient_scope,omitempty"`
 }
 
 type actionOut struct {
