@@ -1187,12 +1187,12 @@ RETURNING 1
 
 	tag, err := t.tx.Exec(ctx, `
 UPDATE outgoing_outputs
-SET mined_height = COALESCE(outgoing_outputs.mined_height, $4),
-    mempool_seen_at = COALESCE(outgoing_outputs.mempool_seen_at, $5)
+SET mined_height = COALESCE(outgoing_outputs.mined_height, $4::bigint),
+    mempool_seen_at = COALESCE(outgoing_outputs.mempool_seen_at, $5::timestamptz)
 WHERE wallet_id = $1 AND txid = $2 AND action_index = $3
   AND (
-    (outgoing_outputs.mined_height IS NULL AND $4 IS NOT NULL) OR
-    (outgoing_outputs.mempool_seen_at IS NULL AND $5 IS NOT NULL)
+    (outgoing_outputs.mined_height IS NULL AND $4::bigint IS NOT NULL) OR
+    (outgoing_outputs.mempool_seen_at IS NULL AND $5::timestamptz IS NOT NULL)
   )
 `, o.WalletID, o.TxID, o.ActionIndex, minedHeight, mempoolSeenAt)
 	if err != nil {
