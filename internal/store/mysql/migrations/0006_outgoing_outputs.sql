@@ -1,5 +1,5 @@
 CREATE TABLE outgoing_outputs (
-  wallet_id TEXT NOT NULL,
+  wallet_id VARCHAR(255) NOT NULL,
   txid VARCHAR(64) NOT NULL,
   action_index INT NOT NULL,
   mined_height BIGINT,
