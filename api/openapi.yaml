@@ -113,6 +113,23 @@ paths:
             type: integer
             format: int64
             minimum: 0
+        - name: kind
+          in: query
+          required: false
+          description: Filter to one or more event kinds (repeat `kind=` or pass a comma-separated list).
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+        - name: txid
+          in: query
+          required: false
+          description: Filter to events where `payload.txid` matches this txid (lowercase hex).
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
       responses:
         "200":
           description: OK

@@ -6,7 +6,7 @@ Designed for exchange/custody integrations where recipient/value data are encryp
 
 - scans blocks using UFVKs (trial decryption), not plaintext address matching
 - tracks notes + nullifiers (shielded “UTXO set”) per `wallet_id`
-- emits deposit/spend events (including confirmation + reorg lifecycle)
+- emits deposit/spend/outgoing output events (including confirmation + reorg lifecycle)
 - exposes an HTTP API for wallets, notes, events, and Orchard witnesses
 - optionally publishes events to a broker (Kafka/NATS/RabbitMQ) via an outbox loop
 
@@ -172,7 +172,7 @@ The broker message key is derived from `payload.txid` when present (falls back t
 - `GET /v1/health` → scanner status + scanned tip (if any)
 - `GET /v1/wallets` → list wallets
 - `POST /v1/wallets` → upsert wallet `{wallet_id, ufvk}`
-- `GET /v1/wallets/{wallet_id}/events?cursor=<id>&limit=<n>[&block_height=<h>]` → wallet event stream (default limit: 100, max: 1000)
+- `GET /v1/wallets/{wallet_id}/events?cursor=<id>&limit=<n>[&block_height=<h>][&kind=<k>][&txid=<txid>]` → wallet event stream (default limit: 100, max: 1000)
 - `POST /v1/wallets/{wallet_id}/backfill` → backfill wallet history (incremental)
 - `GET /v1/wallets/{wallet_id}/notes[?spent=true]` → unspent notes (default) or all notes
 - `POST /v1/orchard/witness` → compute Orchard witnesses for commitment positions
@@ -217,11 +217,20 @@ Spend lifecycle:
 - `SpendOrphaned`
 - `SpendUnconfirmed`
 
+Outgoing output lifecycle:
+
+- `OutgoingOutputEvent` (mempool or mined)
+- `OutgoingOutputConfirmed`
+- `OutgoingOutputOrphaned`
+- `OutgoingOutputUnconfirmed`
+
 The confirmation threshold defaults to `100` and can be configured via `-confirmations` / `JUNO_SCAN_CONFIRMATIONS`.
 
 Debug/audit querying:
 
 - `block_height` filters `GET /v1/wallets/{wallet_id}/events` to events emitted at a specific height. This is not recommended for normal consumption because chain reorgs can change event heights; prefer cursor-based consumption and handle `*Orphaned` / `*Unconfirmed`.
+- `kind` filters to one or more event kinds (repeat `kind=` or pass a comma-separated list).
+- `txid` filters to events where `payload.txid` matches the given txid.
 
 ## Development
 
