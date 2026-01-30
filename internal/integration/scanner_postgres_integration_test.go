@@ -94,11 +94,14 @@ func TestScanner_DepositDetected_Postgres(t *testing.T) {
 	mustWaitOpSuccess(t, ctx, jd, opid2)
 	spendTxID := mustTxIDForOpID(t, ctx, jd, opid2)
 	waitForPendingSpend(t, ctx, st, "hot", spendTxID)
+	waitForOutgoingOutputEventState(t, ctx, st, "hot", spendTxID, "mempool")
 
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	waitForEventKind(t, ctx, st, "hot", "SpendEvent")
+	waitForOutgoingOutputEventState(t, ctx, st, "hot", spendTxID, "confirmed")
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	waitForEventKind(t, ctx, st, "hot", "SpendConfirmed")
+	waitForEventKind(t, ctx, st, "hot", "OutgoingOutputConfirmed")
 
 	notesAll, err := st.ListWalletNotes(ctx, "hot", false, 1000)
 	if err != nil {

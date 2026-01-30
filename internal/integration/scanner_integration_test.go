@@ -116,12 +116,15 @@ func TestScanner_DepositDetected(t *testing.T) {
 	mustWaitOpSuccess(t, ctx, jd, opid2)
 	spendTxID := mustTxIDForOpID(t, ctx, jd, opid2)
 	waitForPendingSpend(t, ctx, st, "hot", spendTxID)
+	waitForOutgoingOutputEventState(t, ctx, st, "hot", spendTxID, "mempool")
 
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	waitForEventKind(t, ctx, st, "hot", "SpendEvent")
+	waitForOutgoingOutputEventState(t, ctx, st, "hot", spendTxID, "confirmed")
 
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	spendConfirmed := waitForEventKind(t, ctx, st, "hot", "SpendConfirmed")
+	outgoingConfirmed := waitForEventKind(t, ctx, st, "hot", "OutgoingOutputConfirmed")
 
 	var spendConfirmedPayload struct {
 		TxID                  string `json:"txid"`
@@ -149,6 +152,24 @@ func TestScanner_DepositDetected(t *testing.T) {
 	}
 	if spendConfirmedPayload.ConfirmedHeight <= 0 {
 		t.Fatalf("invalid confirmed_height=%d", spendConfirmedPayload.ConfirmedHeight)
+	}
+
+	var outgoingConfirmedPayload struct {
+		TxID                  string `json:"txid"`
+		RequiredConfirmations int64  `json:"required_confirmations"`
+		ConfirmedHeight       int64  `json:"confirmed_height"`
+	}
+	if err := json.Unmarshal(outgoingConfirmed.Payload, &outgoingConfirmedPayload); err != nil {
+		t.Fatalf("unmarshal outgoing confirmed payload: %v", err)
+	}
+	if outgoingConfirmedPayload.TxID != spendTxID {
+		t.Fatalf("outgoing confirmed txid mismatch")
+	}
+	if outgoingConfirmedPayload.RequiredConfirmations != 2 {
+		t.Fatalf("required_confirmations=%d want 2", outgoingConfirmedPayload.RequiredConfirmations)
+	}
+	if outgoingConfirmedPayload.ConfirmedHeight <= 0 {
+		t.Fatalf("invalid confirmed_height=%d", outgoingConfirmedPayload.ConfirmedHeight)
 	}
 
 	notesAll, err := st.ListWalletNotes(ctx, "hot", false, 1000)
@@ -521,7 +542,7 @@ func waitForEventKind(t *testing.T, ctx context.Context, st store.Store, walletI
 	}
 
 	for time.Now().Before(deadline) {
-		events, _, err := st.ListWalletEvents(ctx, walletID, 0, 10, nil)
+		events, _, err := st.ListWalletEvents(ctx, walletID, 0, 1000, store.EventFilter{})
 		if err == nil {
 			for _, e := range events {
 				if e.Kind == kind {
@@ -549,7 +570,7 @@ func waitForEventWithMemoPrefix(t *testing.T, ctx context.Context, st store.Stor
 	}
 
 	for time.Now().Before(deadline) {
-		events, _, err := st.ListWalletEvents(ctx, walletID, 0, 1000, nil)
+		events, _, err := st.ListWalletEvents(ctx, walletID, 0, 1000, store.EventFilter{})
 		if err == nil {
 			for _, e := range events {
 				if e.Kind != kind {
@@ -571,6 +592,71 @@ func waitForEventWithMemoPrefix(t *testing.T, ctx context.Context, st store.Stor
 	}
 
 	t.Fatalf("%s with memo_prefix=%q not found", kind, memoPrefix)
+	return store.Event{}
+}
+
+func waitForOutgoingOutputEventState(t *testing.T, ctx context.Context, st store.Store, walletID string, txid string, wantState string) store.Event {
+	t.Helper()
+
+	txid = strings.ToLower(strings.TrimSpace(txid))
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	type payload struct {
+		TxID            string `json:"txid"`
+		Height          *int64 `json:"height,omitempty"`
+		ActionIndex     uint32 `json:"action_index"`
+		AmountZatoshis  uint64 `json:"amount_zatoshis"`
+		RecipientAddress string `json:"recipient_address"`
+		Status          struct {
+			State string `json:"state"`
+		} `json:"status"`
+	}
+
+	filter := store.EventFilter{
+		Kinds: []string{"OutgoingOutputEvent"},
+		TxID:  txid,
+	}
+
+	for time.Now().Before(deadline) {
+		events, _, err := st.ListWalletEvents(ctx, walletID, 0, 1000, filter)
+		if err == nil {
+			for _, e := range events {
+				if e.Kind != "OutgoingOutputEvent" {
+					continue
+				}
+				var p payload
+				if err := json.Unmarshal(e.Payload, &p); err != nil {
+					continue
+				}
+				if strings.TrimSpace(p.TxID) != txid {
+					continue
+				}
+				if p.Status.State != wantState {
+					continue
+				}
+				if strings.TrimSpace(p.RecipientAddress) == "" {
+					t.Fatalf("missing recipient_address in outgoing output payload")
+				}
+				if p.AmountZatoshis == 0 {
+					t.Fatalf("missing amount_zatoshis in outgoing output payload")
+				}
+				if wantState == "mempool" && p.Height != nil {
+					t.Fatalf("expected no payload.height for mempool outgoing output")
+				}
+				if wantState == "confirmed" && p.Height == nil {
+					t.Fatalf("expected payload.height for confirmed outgoing output")
+				}
+				return e
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatalf("OutgoingOutputEvent txid=%s state=%s not found", txid, wantState)
 	return store.Event{}
 }
 

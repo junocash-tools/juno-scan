@@ -143,10 +143,16 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 	toAddr := mustCreateUnifiedAddress(t, ctx, jd)
 	opid2 := mustSendMany(t, ctx, jd, addr, toAddr, "0.01")
 	mustWaitOpSuccess(t, ctx, jd, opid2)
+	spendTxID := mustTxIDForOpID(t, ctx, jd, opid2)
+
+	// Mempool outgoing outputs should be available before mining.
+	mustWaitForOutgoingOutputEventState(t, ctx, baseURL, "hot", spendTxID, "mempool")
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	mustWaitForEventKind(t, ctx, baseURL, "hot", "SpendEvent")
+	mustWaitForOutgoingOutputEventState(t, ctx, baseURL, "hot", spendTxID, "confirmed")
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	mustWaitForEventKind(t, ctx, baseURL, "hot", "SpendConfirmed")
+	mustWaitForEventKindTxID(t, ctx, baseURL, "hot", "OutgoingOutputConfirmed", spendTxID)
 
 	allNotes := mustGetNotes(t, ctx, baseURL, "hot", true)
 	foundSpent := false
@@ -193,7 +199,7 @@ func mustWaitForEventKind(t *testing.T, ctx context.Context, baseURL, walletID, 
 	}
 
 	for time.Now().Before(deadline) {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/wallets/"+walletID+"/events?cursor=0&limit=50", nil)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/wallets/"+walletID+"/events?cursor=0&limit=50&kind="+kind, nil)
 		resp, err := client.Do(req)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			var payload struct {
@@ -215,6 +221,112 @@ func mustWaitForEventKind(t *testing.T, ctx context.Context, baseURL, walletID, 
 	}
 
 	t.Fatalf("%s not found via API", kind)
+}
+
+func mustWaitForEventKindTxID(t *testing.T, ctx context.Context, baseURL, walletID, kind, txid string) {
+	t.Helper()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	for time.Now().Before(deadline) {
+		url := baseURL + "/v1/wallets/" + walletID + "/events?cursor=0&limit=100&kind=" + kind + "&txid=" + txid
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			var payload struct {
+				Events []struct {
+					Kind string `json:"kind"`
+				} `json:"events"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&payload)
+			_ = resp.Body.Close()
+			for _, e := range payload.Events {
+				if e.Kind == kind {
+					return
+				}
+			}
+		} else if resp != nil {
+			_ = resp.Body.Close()
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatalf("%s txid=%s not found via API", kind, txid)
+}
+
+func mustWaitForOutgoingOutputEventState(t *testing.T, ctx context.Context, baseURL, walletID, txid, wantState string) {
+	t.Helper()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	type payload struct {
+		TxID   string `json:"txid"`
+		Height *int64 `json:"height,omitempty"`
+		Status struct {
+			State string `json:"state"`
+		} `json:"status"`
+	}
+
+	for time.Now().Before(deadline) {
+		url := baseURL + "/v1/wallets/" + walletID + "/events?cursor=0&limit=1000&kind=OutgoingOutputEvent&txid=" + txid
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			var out struct {
+				Events []struct {
+					Kind    string          `json:"kind"`
+					Height  int64           `json:"height"`
+					Payload json.RawMessage `json:"payload"`
+				} `json:"events"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&out)
+			_ = resp.Body.Close()
+
+			for _, e := range out.Events {
+				if e.Kind != "OutgoingOutputEvent" {
+					t.Fatalf("unexpected kind in filtered response: %s", e.Kind)
+				}
+				var p payload
+				if err := json.Unmarshal(e.Payload, &p); err != nil {
+					continue
+				}
+				if p.TxID != txid || p.Status.State != wantState {
+					continue
+				}
+				if wantState == "mempool" {
+					if e.Height != 0 {
+						t.Fatalf("expected top-level height=0 for mempool outgoing output, got %d", e.Height)
+					}
+					if p.Height != nil {
+						t.Fatalf("expected no payload.height for mempool outgoing output")
+					}
+				}
+				if wantState == "confirmed" {
+					if e.Height <= 0 {
+						t.Fatalf("expected top-level height>0 for confirmed outgoing output, got %d", e.Height)
+					}
+					if p.Height == nil {
+						t.Fatalf("expected payload.height for confirmed outgoing output")
+					}
+				}
+				return
+			}
+		} else if resp != nil {
+			_ = resp.Body.Close()
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatalf("OutgoingOutputEvent txid=%s state=%s not found via API", txid, wantState)
 }
 
 type apiEvent struct {
@@ -432,7 +544,7 @@ func mustWaitOpSuccess(t *testing.T, ctx context.Context, jd *testutil.RunningJu
 	}
 
 	for time.Now().Before(deadline) {
-		out := mustRun(t, jd.CLICommand(ctx, "z_getoperationresult", `["`+opid+`"]`))
+		out := mustRun(t, jd.CLICommand(ctx, "z_getoperationstatus", `["`+opid+`"]`))
 		var res []struct {
 			Status string `json:"status"`
 			Error  *struct {
@@ -456,6 +568,34 @@ func mustWaitOpSuccess(t *testing.T, ctx context.Context, jd *testutil.RunningJu
 	}
 
 	t.Fatalf("operation did not succeed: %s", opid)
+}
+
+func mustTxIDForOpID(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, opid string) string {
+	t.Helper()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	for time.Now().Before(deadline) {
+		out := mustRun(t, jd.CLICommand(ctx, "z_getoperationresult", `["`+opid+`"]`))
+		var res []struct {
+			Status string `json:"status"`
+			Result *struct {
+				TxID string `json:"txid"`
+			} `json:"result,omitempty"`
+		}
+		if err := json.Unmarshal(out, &res); err == nil && len(res) > 0 {
+			if res[0].Status == "success" && res[0].Result != nil && strings.TrimSpace(res[0].Result.TxID) != "" {
+				return strings.TrimSpace(res[0].Result.TxID)
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatalf("txid not available for opid=%s", opid)
+	return ""
 }
 
 func mustWaitOrchardBalanceForViewingKey(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, ufvk string, minconf int) int64 {
