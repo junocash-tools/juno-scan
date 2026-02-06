@@ -51,9 +51,11 @@ Fetch events / notes:
 curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/events"
 curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes"           # unspent only (default)
 curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes?spent=true" # include spent
+curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes?min_value_zat=50000&limit=500" # filter + page size
 ```
 
 Note: when a note’s nullifier is observed in the node mempool, the note will include `pending_spent_txid` / `pending_spent_at` until the spend is mined (or disappears from the mempool).
+When additional pages exist, the notes response includes `next_cursor`; pass it back as `cursor` to continue.
 
 If you configured `-api-bearer-token`, include `-H 'Authorization: Bearer <token>'` in all requests.
 
@@ -174,7 +176,7 @@ The broker message key is derived from `payload.txid` when present (falls back t
 - `POST /v1/wallets` → upsert wallet `{wallet_id, ufvk}`
 - `GET /v1/wallets/{wallet_id}/events?cursor=<id>&limit=<n>[&block_height=<h>][&kind=<k>][&txid=<txid>]` → wallet event stream (default limit: 100, max: 1000)
 - `POST /v1/wallets/{wallet_id}/backfill` → backfill wallet history (incremental)
-- `GET /v1/wallets/{wallet_id}/notes[?spent=true]` → unspent notes (default) or all notes
+- `GET /v1/wallets/{wallet_id}/notes[?spent=true][&min_value_zat=<zat>][&limit=<n>][&cursor=<c>]` → paged note list (default: unspent-only, limit: 1000, max: 1000)
 - `POST /v1/orchard/witness` → compute Orchard witnesses for commitment positions
 
 HTTP API authentication (optional):

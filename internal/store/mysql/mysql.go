@@ -703,28 +703,55 @@ WHERE wallet_id = ? AND id > ?
 	return out, nextCursor, nil
 }
 
-func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]store.Note, error) {
-	if limit <= 0 || limit > 1000 {
-		limit = 1000
+func sanitizeNotesQuery(query store.NotesQuery) store.NotesQuery {
+	if query.Limit <= 0 || query.Limit > 1000 {
+		query.Limit = 1000
 	}
+	if query.MinValueZat < 0 {
+		query.MinValueZat = 0
+	}
+	if query.Cursor != nil {
+		cursor := *query.Cursor
+		cursor.TxID = strings.ToLower(strings.TrimSpace(cursor.TxID))
+		query.Cursor = &cursor
+		if query.Cursor.TxID == "" {
+			query.Cursor = nil
+		}
+	}
+	return query
+}
 
-	query := `
+func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query store.NotesQuery) ([]store.Note, *store.NotesCursor, error) {
+	query = sanitizeNotesQuery(query)
+
+	sb := strings.Builder{}
+	sb.WriteString(`
 SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, pending_spent_txid, pending_spent_at, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
 FROM notes
 WHERE wallet_id = ?
-`
-	if onlyUnspent {
-		query += " AND spent_height IS NULL"
+`)
+	args := []any{walletID}
+	if query.OnlyUnspent {
+		sb.WriteString(" AND spent_height IS NULL")
 	}
-	query += " ORDER BY height, txid, action_index LIMIT ?"
+	if query.MinValueZat > 0 {
+		sb.WriteString(" AND value_zat >= ?")
+		args = append(args, query.MinValueZat)
+	}
+	if query.Cursor != nil {
+		sb.WriteString(" AND (height > ? OR (height = ? AND (txid > ? OR (txid = ? AND action_index > ?))))")
+		args = append(args, query.Cursor.Height, query.Cursor.Height, query.Cursor.TxID, query.Cursor.TxID, query.Cursor.ActionIndex)
+	}
+	sb.WriteString(" ORDER BY height, txid, action_index LIMIT ?")
+	args = append(args, query.Limit+1)
 
-	rows, err := s.db.QueryContext(ctx, query, walletID, limit)
+	rows, err := s.db.QueryContext(ctx, sb.String(), args...)
 	if err != nil {
-		return nil, fmt.Errorf("mysql: list notes: %w", err)
+		return nil, nil, fmt.Errorf("mysql: list notes: %w", err)
 	}
 	defer rows.Close()
 
-	var out []store.Note
+	out := make([]store.Note, 0, query.Limit+1)
 	for rows.Next() {
 		var n store.Note
 		var position sql.NullInt64
@@ -755,7 +782,7 @@ WHERE wallet_id = ?
 			&spentConfirmedHeight,
 			&n.CreatedAt,
 		); err != nil {
-			return nil, fmt.Errorf("mysql: list notes: %w", err)
+			return nil, nil, fmt.Errorf("mysql: list notes: %w", err)
 		}
 		if position.Valid {
 			n.Position = &position.Int64
@@ -788,9 +815,27 @@ WHERE wallet_id = ?
 		out = append(out, n)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("mysql: list notes: %w", err)
+		return nil, nil, fmt.Errorf("mysql: list notes: %w", err)
 	}
-	return out, nil
+
+	if len(out) <= query.Limit {
+		return out, nil, nil
+	}
+	last := out[query.Limit-1]
+	next := &store.NotesCursor{
+		Height:      last.Height,
+		TxID:        last.TxID,
+		ActionIndex: last.ActionIndex,
+	}
+	return out[:query.Limit], next, nil
+}
+
+func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]store.Note, error) {
+	notes, _, err := s.ListWalletNotesPage(ctx, walletID, store.NotesQuery{
+		OnlyUnspent: onlyUnspent,
+		Limit:       limit,
+	})
+	return notes, err
 }
 
 func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]string, seenAt time.Time) error {

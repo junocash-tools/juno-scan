@@ -24,6 +24,7 @@ type Store interface {
 	SetWalletEventPublishCursor(ctx context.Context, walletID string, cursor int64) error
 
 	ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, filter EventFilter) (events []Event, nextCursor int64, err error)
+	ListWalletNotesPage(ctx context.Context, walletID string, query NotesQuery) (notes []Note, nextCursor *NotesCursor, err error)
 	ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]Note, error)
 	UpdatePendingSpends(ctx context.Context, pending map[string]string, seenAt time.Time) error
 	ListNotesByPendingSpentTxIDs(ctx context.Context, txids []string) ([]Note, error)
@@ -121,6 +122,19 @@ type EventFilter struct {
 	BlockHeight *int64
 	Kinds       []string
 	TxID        string
+}
+
+type NotesCursor struct {
+	Height      int64
+	TxID        string
+	ActionIndex int32
+}
+
+type NotesQuery struct {
+	OnlyUnspent bool
+	MinValueZat int64
+	Limit       int
+	Cursor      *NotesCursor
 }
 
 type OutgoingOutput struct {

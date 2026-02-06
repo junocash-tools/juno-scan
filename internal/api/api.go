@@ -435,6 +435,32 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 	spent := r.URL.Query().Get("spent")
 	onlyUnspent := spent == "" || spent == "false"
 
+	limit := int64(1000)
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 || n > 1000 {
+			http.Error(w, "invalid limit", http.StatusBadRequest)
+			return
+		}
+		limit = n
+	}
+
+	minValueZat := int64(0)
+	if v := strings.TrimSpace(r.URL.Query().Get("min_value_zat")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			http.Error(w, "invalid min_value_zat", http.StatusBadRequest)
+			return
+		}
+		minValueZat = n
+	}
+
+	cursor, err := parseNotesCursor(strings.TrimSpace(r.URL.Query().Get("cursor")))
+	if err != nil {
+		http.Error(w, "invalid cursor", http.StatusBadRequest)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
@@ -453,7 +479,12 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 		CreatedAt     time.Time  `json:"created_at"`
 	}
 
-	ns, err := s.st.ListWalletNotes(ctx, walletID, onlyUnspent, 1000)
+	ns, nextCursor, err := s.st.ListWalletNotesPage(ctx, walletID, store.NotesQuery{
+		OnlyUnspent: onlyUnspent,
+		MinValueZat: minValueZat,
+		Limit:       int(limit),
+		Cursor:      cursor,
+	})
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
@@ -477,7 +508,11 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 		})
 	}
 
-	writeJSON(w, map[string]any{"notes": notes})
+	resp := map[string]any{"notes": notes}
+	if nextCursor != nil {
+		resp["next_cursor"] = encodeNotesCursor(*nextCursor)
+	}
+	writeJSON(w, resp)
 }
 
 type witnessRequest struct {
@@ -582,6 +617,39 @@ func parseInt64Query(r *http.Request, key string, def int64) int64 {
 		return def
 	}
 	return n
+}
+
+func encodeNotesCursor(cursor store.NotesCursor) string {
+	txid := strings.ToLower(strings.TrimSpace(cursor.TxID))
+	return strconv.FormatInt(cursor.Height, 10) + ":" + txid + ":" + strconv.FormatInt(int64(cursor.ActionIndex), 10)
+}
+
+func parseNotesCursor(raw string) (*store.NotesCursor, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ":")
+	if len(parts) != 3 {
+		return nil, errors.New("invalid cursor")
+	}
+	height, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || height < 0 {
+		return nil, errors.New("invalid cursor")
+	}
+	txid := strings.ToLower(strings.TrimSpace(parts[1]))
+	if len(txid) != 64 || !isLowerHex(txid) {
+		return nil, errors.New("invalid cursor")
+	}
+	actionIndex, err := strconv.ParseInt(parts[2], 10, 32)
+	if err != nil || actionIndex < 0 {
+		return nil, errors.New("invalid cursor")
+	}
+	return &store.NotesCursor{
+		Height:      height,
+		TxID:        txid,
+		ActionIndex: int32(actionIndex),
+	}, nil
 }
 
 func isSafeWalletID(s string) bool {

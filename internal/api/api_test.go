@@ -24,3 +24,29 @@ func TestIsSafeWalletID(t *testing.T) {
 		}
 	}
 }
+
+func TestParseNotesCursor(t *testing.T) {
+	valid := "123:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7"
+	cursor, err := parseNotesCursor(valid)
+	if err != nil {
+		t.Fatalf("parseNotesCursor(valid): %v", err)
+	}
+	if cursor == nil {
+		t.Fatalf("cursor=nil")
+	}
+	if got := encodeNotesCursor(*cursor); got != valid {
+		t.Fatalf("roundtrip=%q want %q", got, valid)
+	}
+
+	bad := []string{
+		"bad",
+		"1:zzz:0",
+		"-1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+		"1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:-1",
+	}
+	for _, in := range bad {
+		if _, err := parseNotesCursor(in); err == nil {
+			t.Fatalf("expected parse error for %q", in)
+		}
+	}
+}

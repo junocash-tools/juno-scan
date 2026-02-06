@@ -216,6 +216,28 @@ paths:
           schema:
             type: string
             description: When set to true, include spent notes
+        - name: min_value_zat
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            description: Minimum note value in zatoshis
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            description: Page size (default 1000)
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+            description: Pagination cursor from a previous response
       responses:
         "200":
           description: OK
@@ -468,6 +490,8 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/WalletNote"
+        next_cursor:
+          type: string
       additionalProperties: true
     WitnessRequest:
       type: object

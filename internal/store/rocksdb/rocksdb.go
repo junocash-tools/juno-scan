@@ -1199,30 +1199,52 @@ func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID i
 	return out, nextCursor, nil
 }
 
-func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]store.Note, error) {
-	_ = ctx
-	if limit <= 0 || limit > 1000 {
-		limit = 1000
+func sanitizeNotesQuery(query store.NotesQuery) store.NotesQuery {
+	if query.Limit <= 0 || query.Limit > 1000 {
+		query.Limit = 1000
 	}
+	if query.MinValueZat < 0 {
+		query.MinValueZat = 0
+	}
+	if query.Cursor != nil {
+		cursor := *query.Cursor
+		cursor.TxID = strings.ToLower(strings.TrimSpace(cursor.TxID))
+		query.Cursor = &cursor
+		if query.Cursor.TxID == "" {
+			query.Cursor = nil
+		}
+	}
+	return query
+}
+
+func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query store.NotesQuery) ([]store.Note, *store.NotesCursor, error) {
+	_ = ctx
+	query = sanitizeNotesQuery(query)
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: keyWalletNoteIndexMin(walletID),
 		UpperBound: prefixUpperBound(keyWalletNotePrefix(walletID)),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("rocksdb: iter: %w", err)
+		return nil, nil, fmt.Errorf("rocksdb: iter: %w", err)
 	}
 	defer iter.Close()
 
-	out := make([]store.Note, 0, limit)
-	for iter.First(); iter.Valid(); iter.Next() {
-		if len(out) >= limit {
-			break
+	if query.Cursor == nil {
+		iter.First()
+	} else {
+		cursorKey := keyWalletNoteIndex(uint64(query.Cursor.Height), walletID, query.Cursor.TxID, query.Cursor.ActionIndex)
+		iter.SeekGE(cursorKey)
+		if iter.Valid() && bytes.Equal(iter.Key(), cursorKey) {
+			iter.Next()
 		}
+	}
 
+	out := make([]store.Note, 0, query.Limit+1)
+	for ; iter.Valid(); iter.Next() {
 		noteKey, err := noteKeyFromWalletNoteIndex(iter.Key(), walletID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		v, closer, err := s.db.Get(noteKey)
@@ -1230,18 +1252,19 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 			if errors.Is(err, pebble.ErrNotFound) {
 				continue
 			}
-			return nil, fmt.Errorf("rocksdb: get note: %w", err)
+			return nil, nil, fmt.Errorf("rocksdb: get note: %w", err)
 		}
 		var rec noteRecord
 		if err := json.Unmarshal(v, &rec); err != nil {
 			_ = closer.Close()
-			return nil, fmt.Errorf("rocksdb: decode note: %w", err)
+			return nil, nil, fmt.Errorf("rocksdb: decode note: %w", err)
 		}
 		_ = closer.Close()
 
-		if onlyUnspent && rec.SpentHeight == nil {
-			// ok
-		} else if onlyUnspent {
+		if query.OnlyUnspent && rec.SpentHeight != nil {
+			continue
+		}
+		if query.MinValueZat > 0 && rec.ValueZat < query.MinValueZat {
 			continue
 		}
 
@@ -1274,11 +1297,32 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 			SpentConfirmedHeight: rec.SpentConfirmedHeight,
 			CreatedAt:            time.Unix(rec.CreatedAtUnix, 0).UTC(),
 		})
+		if len(out) >= query.Limit+1 {
+			break
+		}
 	}
 	if err := iter.Error(); err != nil {
-		return nil, fmt.Errorf("rocksdb: list notes: %w", err)
+		return nil, nil, fmt.Errorf("rocksdb: list notes: %w", err)
 	}
-	return out, nil
+
+	if len(out) <= query.Limit {
+		return out, nil, nil
+	}
+	last := out[query.Limit-1]
+	next := &store.NotesCursor{
+		Height:      last.Height,
+		TxID:        last.TxID,
+		ActionIndex: last.ActionIndex,
+	}
+	return out[:query.Limit], next, nil
+}
+
+func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]store.Note, error) {
+	notes, _, err := s.ListWalletNotesPage(ctx, walletID, store.NotesQuery{
+		OnlyUnspent: onlyUnspent,
+		Limit:       limit,
+	})
+	return notes, err
 }
 
 func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]string, seenAt time.Time) error {
