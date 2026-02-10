@@ -13,6 +13,7 @@ TESTFLAGS += -v
 endif
 
 GOCACHE ?= $(CURDIR)/.cache/go-build
+GO_TEST_TIMEOUT ?= 20m
 build: rust-build
 	@mkdir -p $(BIN_DIR)
 	GOCACHE=$(GOCACHE) go build -o $(BIN) ./cmd/juno-scan
@@ -30,13 +31,13 @@ test-integration: rust-build
 	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=integration ./...
 
 test-integration-docker: rust-build
-	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=integration,docker,kafka,nats,rabbitmq,mysql ./...
+	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -timeout=$(GO_TEST_TIMEOUT) -tags=integration,docker,kafka,nats,rabbitmq,mysql ./...
 
 test-e2e: build
 	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=e2e ./...
 
 test-e2e-docker: build
-	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=e2e,docker ./...
+	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -timeout=$(GO_TEST_TIMEOUT) -tags=e2e,docker ./...
 
 test: rust-test test-unit test-integration test-e2e
 
