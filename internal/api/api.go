@@ -330,6 +330,8 @@ func canonicalEventKind(kind string) (string, bool) {
 		return events.KindOutgoingOutputOrphaned, true
 	case strings.ToLower(events.KindOutgoingOutputUnconfirmed):
 		return events.KindOutgoingOutputUnconfirmed, true
+	case strings.ToLower(events.KindOutgoingOutputExpired):
+		return events.KindOutgoingOutputExpired, true
 	default:
 		return "", false
 	}
@@ -465,18 +467,19 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 	defer cancel()
 
 	type note struct {
-		TxID          string     `json:"txid"`
-		ActionIndex   int32      `json:"action_index"`
-		Height        int64      `json:"height"`
-		Position      *int64     `json:"position,omitempty"`
-		Recipient     string     `json:"recipient_address"`
-		ValueZat      int64      `json:"value_zat"`
-		NoteNullifier string     `json:"note_nullifier"`
-		PendingTxID   *string    `json:"pending_spent_txid,omitempty"`
-		PendingAt     *time.Time `json:"pending_spent_at,omitempty"`
-		SpentHeight   *int64     `json:"spent_height,omitempty"`
-		SpentTxID     *string    `json:"spent_txid,omitempty"`
-		CreatedAt     time.Time  `json:"created_at"`
+		TxID                string     `json:"txid"`
+		ActionIndex         int32      `json:"action_index"`
+		Height              int64      `json:"height"`
+		Position            *int64     `json:"position,omitempty"`
+		Recipient           string     `json:"recipient_address"`
+		ValueZat            int64      `json:"value_zat"`
+		NoteNullifier       string     `json:"note_nullifier"`
+		PendingTxID         *string    `json:"pending_spent_txid,omitempty"`
+		PendingAt           *time.Time `json:"pending_spent_at,omitempty"`
+		PendingExpiryHeight *int64     `json:"pending_spent_expiry_height,omitempty"`
+		SpentHeight         *int64     `json:"spent_height,omitempty"`
+		SpentTxID           *string    `json:"spent_txid,omitempty"`
+		CreatedAt           time.Time  `json:"created_at"`
 	}
 
 	ns, nextCursor, err := s.st.ListWalletNotesPage(ctx, walletID, store.NotesQuery{
@@ -493,18 +496,19 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 	notes := make([]note, 0, len(ns))
 	for _, n := range ns {
 		notes = append(notes, note{
-			TxID:          n.TxID,
-			ActionIndex:   n.ActionIndex,
-			Height:        n.Height,
-			Position:      n.Position,
-			Recipient:     n.RecipientAddress,
-			ValueZat:      n.ValueZat,
-			NoteNullifier: n.NoteNullifier,
-			PendingTxID:   n.PendingSpentTxID,
-			PendingAt:     n.PendingSpentAt,
-			SpentHeight:   n.SpentHeight,
-			SpentTxID:     n.SpentTxID,
-			CreatedAt:     n.CreatedAt,
+			TxID:                n.TxID,
+			ActionIndex:         n.ActionIndex,
+			Height:              n.Height,
+			Position:            n.Position,
+			Recipient:           n.RecipientAddress,
+			ValueZat:            n.ValueZat,
+			NoteNullifier:       n.NoteNullifier,
+			PendingTxID:         n.PendingSpentTxID,
+			PendingAt:           n.PendingSpentAt,
+			PendingExpiryHeight: n.PendingSpentExpiryHeight,
+			SpentHeight:         n.SpentHeight,
+			SpentTxID:           n.SpentTxID,
+			CreatedAt:           n.CreatedAt,
 		})
 	}
 

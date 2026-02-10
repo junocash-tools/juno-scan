@@ -17,6 +17,7 @@ const (
 	KindOutgoingOutputConfirmed   = "OutgoingOutputConfirmed"
 	KindOutgoingOutputOrphaned    = "OutgoingOutputOrphaned"
 	KindOutgoingOutputUnconfirmed = "OutgoingOutputUnconfirmed"
+	KindOutgoingOutputExpired     = "OutgoingOutputExpired"
 )
 
 type DepositEventPayload struct {
@@ -82,8 +83,9 @@ type OutgoingOutputEventPayload struct {
 	Version  types.Version `json:"version"`
 	WalletID string        `json:"wallet_id"`
 
-	TxID  string `json:"txid"`
-	Height *int64 `json:"height,omitempty"`
+	TxID         string `json:"txid"`
+	Height       *int64 `json:"height,omitempty"`
+	ExpiryHeight *int64 `json:"expiry_height,omitempty"`
 
 	ActionIndex    uint32 `json:"action_index"`
 	AmountZatoshis uint64 `json:"amount_zatoshis"`

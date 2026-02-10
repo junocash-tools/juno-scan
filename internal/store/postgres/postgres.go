@@ -732,10 +732,10 @@ func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query 
 
 	sb := strings.Builder{}
 	sb.WriteString(`
-SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, pending_spent_txid, pending_spent_at, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
-FROM notes
-WHERE wallet_id = $1
-`)
+	SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, pending_spent_txid, pending_spent_at, pending_spent_expiry_height, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
+	FROM notes
+	WHERE wallet_id = $1
+	`)
 	args := []any{walletID}
 	argN := 2
 
@@ -766,6 +766,7 @@ WHERE wallet_id = $1
 		var n store.Note
 		var divIdx int64
 		var memo sql.NullString
+		var pendingExpiryHeight sql.NullInt64
 		var confirmedHeight sql.NullInt64
 		var spentConfirmedHeight sql.NullInt64
 		n.WalletID = walletID
@@ -781,6 +782,7 @@ WHERE wallet_id = $1
 			&n.NoteNullifier,
 			&n.PendingSpentTxID,
 			&n.PendingSpentAt,
+			&pendingExpiryHeight,
 			&n.SpentHeight,
 			&n.SpentTxID,
 			&confirmedHeight,
@@ -792,6 +794,9 @@ WHERE wallet_id = $1
 		n.DiversifierIndex = uint32(divIdx)
 		if memo.Valid {
 			n.MemoHex = &memo.String
+		}
+		if pendingExpiryHeight.Valid {
+			n.PendingSpentExpiryHeight = &pendingExpiryHeight.Int64
 		}
 		if confirmedHeight.Valid {
 			n.ConfirmedHeight = &confirmedHeight.Int64
@@ -825,21 +830,28 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 	return notes, err
 }
 
-func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]string, seenAt time.Time) error {
+func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]store.PendingSpend, chainHeight int64, seenAt time.Time) error {
 	if seenAt.IsZero() {
 		seenAt = time.Now().UTC()
 	}
 
 	nullifiers := make([]string, 0, len(pending))
 	txids := make([]string, 0, len(pending))
-	for nf, txid := range pending {
+	expiryHeights := make([]int64, 0, len(pending))
+	for nf, ps := range pending {
 		nf = strings.TrimSpace(nf)
-		txid = strings.TrimSpace(txid)
+		txid := strings.TrimSpace(ps.TxID)
 		if nf == "" || txid == "" {
 			continue
 		}
 		nullifiers = append(nullifiers, nf)
 		txids = append(txids, txid)
+
+		exp := int64(-1)
+		if ps.ExpiryHeight != nil {
+			exp = *ps.ExpiryHeight
+		}
+		expiryHeights = append(expiryHeights, exp)
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -848,36 +860,40 @@ func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]stri
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if len(nullifiers) == 0 {
-		if _, err := tx.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 UPDATE notes
-SET pending_spent_txid = NULL, pending_spent_at = NULL
-WHERE spent_height IS NULL AND pending_spent_txid IS NOT NULL
-`); err != nil {
-			return fmt.Errorf("postgres: clear pending spends: %w", err)
-		}
-	} else {
-		if _, err := tx.Exec(ctx, `
-UPDATE notes
-SET pending_spent_txid = NULL, pending_spent_at = NULL
+SET pending_spent_txid = NULL,
+    pending_spent_at = NULL,
+    pending_spent_expiry_height = NULL
 WHERE spent_height IS NULL
   AND pending_spent_txid IS NOT NULL
   AND NOT (note_nullifier = ANY($1::text[]))
-`, nullifiers); err != nil {
-			return fmt.Errorf("postgres: clear pending spends: %w", err)
-		}
+  AND (
+    pending_spent_expiry_height IS NULL OR
+    $2::bigint > pending_spent_expiry_height
+  )
+	`, nullifiers, chainHeight); err != nil {
+		return fmt.Errorf("postgres: clear pending spends: %w", err)
+	}
 
+	if len(nullifiers) > 0 {
 		if _, err := tx.Exec(ctx, `
-WITH pending (note_nullifier, pending_spent_txid) AS (SELECT * FROM UNNEST($1::text[], $2::text[]))
+WITH pending (note_nullifier, pending_spent_txid, pending_spent_expiry_height_raw) AS (
+  SELECT * FROM UNNEST($1::text[], $2::text[], $3::bigint[])
+)
 UPDATE notes n
 SET pending_spent_txid = pending.pending_spent_txid,
+    pending_spent_expiry_height = CASE
+      WHEN n.pending_spent_txid IS DISTINCT FROM pending.pending_spent_txid THEN NULLIF(pending.pending_spent_expiry_height_raw, -1)
+      ELSE COALESCE(n.pending_spent_expiry_height, NULLIF(pending.pending_spent_expiry_height_raw, -1))
+    END,
     pending_spent_at = CASE
-      WHEN n.pending_spent_txid IS DISTINCT FROM pending.pending_spent_txid THEN $3
-      ELSE COALESCE(n.pending_spent_at, $3)
+      WHEN n.pending_spent_txid IS DISTINCT FROM pending.pending_spent_txid THEN $4
+      ELSE COALESCE(n.pending_spent_at, $4)
     END
 FROM pending
 WHERE n.spent_height IS NULL AND n.note_nullifier = pending.note_nullifier
-`, nullifiers, txids, seenAt); err != nil {
+	`, nullifiers, txids, expiryHeights, seenAt); err != nil {
 			return fmt.Errorf("postgres: set pending spends: %w", err)
 		}
 	}
@@ -895,11 +911,11 @@ func (s *Store) ListNotesByPendingSpentTxIDs(ctx context.Context, txids []string
 	}
 
 	rows, err := s.pool.Query(ctx, `
-SELECT wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, pending_spent_txid, pending_spent_at, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
-FROM notes
-WHERE spent_height IS NULL AND pending_spent_txid = ANY($1::text[])
-ORDER BY wallet_id, txid, action_index
-`, txids)
+	SELECT wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, pending_spent_txid, pending_spent_at, pending_spent_expiry_height, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
+	FROM notes
+	WHERE spent_height IS NULL AND pending_spent_txid = ANY($1::text[])
+	ORDER BY wallet_id, txid, action_index
+	`, txids)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list pending spend notes: %w", err)
 	}
@@ -910,6 +926,7 @@ ORDER BY wallet_id, txid, action_index
 		var n store.Note
 		var divIdx int64
 		var memo sql.NullString
+		var pendingExpiryHeight sql.NullInt64
 		var confirmedHeight sql.NullInt64
 		var spentConfirmedHeight sql.NullInt64
 		if err := rows.Scan(
@@ -925,6 +942,7 @@ ORDER BY wallet_id, txid, action_index
 			&n.NoteNullifier,
 			&n.PendingSpentTxID,
 			&n.PendingSpentAt,
+			&pendingExpiryHeight,
 			&n.SpentHeight,
 			&n.SpentTxID,
 			&confirmedHeight,
@@ -936,6 +954,9 @@ ORDER BY wallet_id, txid, action_index
 		n.DiversifierIndex = uint32(divIdx)
 		if memo.Valid {
 			n.MemoHex = &memo.String
+		}
+		if pendingExpiryHeight.Valid {
+			n.PendingSpentExpiryHeight = &pendingExpiryHeight.Int64
 		}
 		if confirmedHeight.Valid {
 			n.ConfirmedHeight = &confirmedHeight.Int64
@@ -959,11 +980,11 @@ func (s *Store) ListOutgoingOutputsByTxID(ctx context.Context, walletID, txid st
 	}
 
 	rows, err := s.pool.Query(ctx, `
-SELECT txid, action_index, mined_height, confirmed_height, mempool_seen_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
-FROM outgoing_outputs
-WHERE wallet_id = $1 AND txid = $2
-ORDER BY action_index
-`, walletID, txid)
+	SELECT txid, action_index, mined_height, confirmed_height, mempool_seen_at, tx_expiry_height, expired_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
+	FROM outgoing_outputs
+	WHERE wallet_id = $1 AND txid = $2
+	ORDER BY action_index
+	`, walletID, txid)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list outgoing outputs: %w", err)
 	}
@@ -975,6 +996,8 @@ ORDER BY action_index
 		var minedHeight sql.NullInt64
 		var confirmedHeight sql.NullInt64
 		var mempoolSeenAt sql.NullTime
+		var txExpiryHeight sql.NullInt64
+		var expiredAt sql.NullTime
 		var memo sql.NullString
 		var recipientScope sql.NullString
 		o.WalletID = walletID
@@ -984,6 +1007,8 @@ ORDER BY action_index
 			&minedHeight,
 			&confirmedHeight,
 			&mempoolSeenAt,
+			&txExpiryHeight,
+			&expiredAt,
 			&o.RecipientAddress,
 			&o.ValueZat,
 			&memo,
@@ -1002,6 +1027,13 @@ ORDER BY action_index
 		if mempoolSeenAt.Valid {
 			t := mempoolSeenAt.Time.UTC()
 			o.MempoolSeenAt = &t
+		}
+		if txExpiryHeight.Valid {
+			o.TxExpiryHeight = &txExpiryHeight.Int64
+		}
+		if expiredAt.Valid {
+			tm := expiredAt.Time.UTC()
+			o.ExpiredAt = &tm
 		}
 		if memo.Valid {
 			o.MemoHex = &memo.String
@@ -1104,15 +1136,16 @@ ON CONFLICT (position) DO NOTHING
 
 func (t *pgTx) MarkNotesSpent(ctx context.Context, height int64, txid string, nullifiers []string) ([]store.Note, error) {
 	rows, err := t.tx.Query(ctx, `
-UPDATE notes
-SET spent_height = $1,
-    spent_txid = $2,
-    spent_confirmed_height = NULL,
-    pending_spent_txid = NULL,
-    pending_spent_at = NULL
-WHERE spent_height IS NULL AND note_nullifier = ANY($3::text[])
-RETURNING wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
-`, height, txid, nullifiers)
+	UPDATE notes
+	SET spent_height = $1,
+	    spent_txid = $2,
+	    spent_confirmed_height = NULL,
+	    pending_spent_txid = NULL,
+	    pending_spent_at = NULL,
+	    pending_spent_expiry_height = NULL
+	WHERE spent_height IS NULL AND note_nullifier = ANY($3::text[])
+	RETURNING wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
+	`, height, txid, nullifiers)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: mark spent: %w", err)
 	}
@@ -1212,6 +1245,11 @@ func (t *pgTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutput)
 		mempoolSeenAt = sql.NullTime{Time: o.MempoolSeenAt.UTC(), Valid: true}
 	}
 
+	var txExpiryHeight sql.NullInt64
+	if o.TxExpiryHeight != nil {
+		txExpiryHeight = sql.NullInt64{Int64: *o.TxExpiryHeight, Valid: true}
+	}
+
 	var recipientScope sql.NullString
 	if o.RecipientScope != nil && strings.TrimSpace(*o.RecipientScope) != "" {
 		recipientScope = sql.NullString{String: strings.TrimSpace(*o.RecipientScope), Valid: true}
@@ -1219,14 +1257,14 @@ func (t *pgTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutput)
 
 	var inserted int
 	err := t.tx.QueryRow(ctx, `
-INSERT INTO outgoing_outputs (
-  wallet_id, txid, action_index, mined_height, mempool_seen_at,
-  recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope
-)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-ON CONFLICT (wallet_id, txid, action_index) DO NOTHING
-RETURNING 1
-`, o.WalletID, o.TxID, o.ActionIndex, minedHeight, mempoolSeenAt, o.RecipientAddress, o.ValueZat, memo, o.OvkScope, recipientScope).Scan(&inserted)
+	INSERT INTO outgoing_outputs (
+	  wallet_id, txid, action_index, mined_height, mempool_seen_at, tx_expiry_height,
+	  recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope
+	)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	ON CONFLICT (wallet_id, txid, action_index) DO NOTHING
+	RETURNING 1
+	`, o.WalletID, o.TxID, o.ActionIndex, minedHeight, mempoolSeenAt, txExpiryHeight, o.RecipientAddress, o.ValueZat, memo, o.OvkScope, recipientScope).Scan(&inserted)
 	if err == nil {
 		return true, nil
 	}
@@ -1235,15 +1273,17 @@ RETURNING 1
 	}
 
 	tag, err := t.tx.Exec(ctx, `
-UPDATE outgoing_outputs
-SET mined_height = COALESCE(outgoing_outputs.mined_height, $4::bigint),
-    mempool_seen_at = COALESCE(outgoing_outputs.mempool_seen_at, $5::timestamptz)
-WHERE wallet_id = $1 AND txid = $2 AND action_index = $3
-  AND (
-    (outgoing_outputs.mined_height IS NULL AND $4::bigint IS NOT NULL) OR
-    (outgoing_outputs.mempool_seen_at IS NULL AND $5::timestamptz IS NOT NULL)
-  )
-`, o.WalletID, o.TxID, o.ActionIndex, minedHeight, mempoolSeenAt)
+	UPDATE outgoing_outputs
+	SET mined_height = COALESCE(outgoing_outputs.mined_height, $4::bigint),
+	    mempool_seen_at = COALESCE(outgoing_outputs.mempool_seen_at, $5::timestamptz),
+	    tx_expiry_height = COALESCE(outgoing_outputs.tx_expiry_height, $6::bigint)
+	WHERE wallet_id = $1 AND txid = $2 AND action_index = $3
+	  AND (
+	    (outgoing_outputs.mined_height IS NULL AND $4::bigint IS NOT NULL) OR
+	    (outgoing_outputs.mempool_seen_at IS NULL AND $5::timestamptz IS NOT NULL) OR
+	    (outgoing_outputs.tx_expiry_height IS NULL AND $6::bigint IS NOT NULL)
+	  )
+	`, o.WalletID, o.TxID, o.ActionIndex, minedHeight, mempoolSeenAt, txExpiryHeight)
 	if err != nil {
 		return false, fmt.Errorf("postgres: update outgoing output: %w", err)
 	}
@@ -1362,6 +1402,75 @@ RETURNING wallet_id, txid, action_index, mined_height, confirmed_height, mempool
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("postgres: confirm outgoing outputs: %w", err)
+	}
+	return out, nil
+}
+
+func (t *pgTx) ExpireOutgoingOutputs(ctx context.Context, chainHeight int64, expiredAt time.Time) ([]store.OutgoingOutput, error) {
+	if expiredAt.IsZero() {
+		expiredAt = time.Now().UTC()
+	}
+
+	rows, err := t.tx.Query(ctx, `
+UPDATE outgoing_outputs
+SET expired_at = $1
+WHERE mined_height IS NULL
+  AND expired_at IS NULL
+  AND mempool_seen_at IS NOT NULL
+  AND tx_expiry_height IS NOT NULL
+  AND $2::bigint > tx_expiry_height
+RETURNING wallet_id, txid, action_index, mempool_seen_at, tx_expiry_height, expired_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
+`, expiredAt, chainHeight)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: expire outgoing outputs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []store.OutgoingOutput
+	for rows.Next() {
+		var o store.OutgoingOutput
+		var mempoolSeenAt sql.NullTime
+		var txExpiryHeight sql.NullInt64
+		var expiredAtDB sql.NullTime
+		var memo sql.NullString
+		var recipientScope sql.NullString
+		if err := rows.Scan(
+			&o.WalletID,
+			&o.TxID,
+			&o.ActionIndex,
+			&mempoolSeenAt,
+			&txExpiryHeight,
+			&expiredAtDB,
+			&o.RecipientAddress,
+			&o.ValueZat,
+			&memo,
+			&o.OvkScope,
+			&recipientScope,
+			&o.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("postgres: expire outgoing outputs: %w", err)
+		}
+		if mempoolSeenAt.Valid {
+			tm := mempoolSeenAt.Time.UTC()
+			o.MempoolSeenAt = &tm
+		}
+		if txExpiryHeight.Valid {
+			o.TxExpiryHeight = &txExpiryHeight.Int64
+		}
+		if expiredAtDB.Valid {
+			tm := expiredAtDB.Time.UTC()
+			o.ExpiredAt = &tm
+		}
+		if memo.Valid {
+			o.MemoHex = &memo.String
+		}
+		if recipientScope.Valid {
+			o.RecipientScope = &recipientScope.String
+		}
+		out = append(out, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: expire outgoing outputs: %w", err)
 	}
 	return out, nil
 }

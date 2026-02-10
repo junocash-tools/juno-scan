@@ -117,6 +117,9 @@ func TestScanner_DepositDetected_Postgres(t *testing.T) {
 			if n.PendingSpentAt != nil {
 				t.Fatalf("pending_spent_at not cleared")
 			}
+			if n.PendingSpentExpiryHeight != nil {
+				t.Fatalf("pending_spent_expiry_height not cleared")
+			}
 		}
 	}
 	if !foundSpent {

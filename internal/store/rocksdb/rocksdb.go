@@ -324,6 +324,11 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 			t := time.Unix(*rec.MempoolSeenUnix, 0).UTC()
 			mempoolSeenAt = &t
 		}
+		var expiredAt *time.Time
+		if rec.ExpiredAtUnix != nil {
+			t := time.Unix(*rec.ExpiredAtUnix, 0).UTC()
+			expiredAt = &t
+		}
 		return store.OutgoingOutput{
 			WalletID:         rec.WalletID,
 			TxID:             rec.TxID,
@@ -331,6 +336,8 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 			MinedHeight:      rec.MinedHeight,
 			ConfirmedHeight:  rec.ConfirmedHeight,
 			MempoolSeenAt:    mempoolSeenAt,
+			TxExpiryHeight:   rec.TxExpiryHeight,
+			ExpiredAt:        expiredAt,
 			RecipientAddress: rec.RecipientAddress,
 			ValueZat:         rec.ValueZat,
 			MemoHex:          rec.MemoHex,
@@ -1279,23 +1286,24 @@ func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query 
 			pendingAt = &t
 		}
 		out = append(out, store.Note{
-			WalletID:             walletID,
-			TxID:                 rec.TxID,
-			ActionIndex:          rec.ActionIndex,
-			Height:               rec.Height,
-			Position:             posPtr,
-			DiversifierIndex:     rec.DiversifierIndex,
-			RecipientAddress:     rec.RecipientAddress,
-			ValueZat:             rec.ValueZat,
-			MemoHex:              rec.MemoHex,
-			NoteNullifier:        rec.NoteNullifier,
-			PendingSpentTxID:     rec.PendingSpentTxID,
-			PendingSpentAt:       pendingAt,
-			SpentHeight:          rec.SpentHeight,
-			SpentTxID:            rec.SpentTxID,
-			ConfirmedHeight:      rec.ConfirmedHeight,
-			SpentConfirmedHeight: rec.SpentConfirmedHeight,
-			CreatedAt:            time.Unix(rec.CreatedAtUnix, 0).UTC(),
+			WalletID:                 walletID,
+			TxID:                     rec.TxID,
+			ActionIndex:              rec.ActionIndex,
+			Height:                   rec.Height,
+			Position:                 posPtr,
+			DiversifierIndex:         rec.DiversifierIndex,
+			RecipientAddress:         rec.RecipientAddress,
+			ValueZat:                 rec.ValueZat,
+			MemoHex:                  rec.MemoHex,
+			NoteNullifier:            rec.NoteNullifier,
+			PendingSpentTxID:         rec.PendingSpentTxID,
+			PendingSpentAt:           pendingAt,
+			PendingSpentExpiryHeight: rec.PendingSpentExpiryHeight,
+			SpentHeight:              rec.SpentHeight,
+			SpentTxID:                rec.SpentTxID,
+			ConfirmedHeight:          rec.ConfirmedHeight,
+			SpentConfirmedHeight:     rec.SpentConfirmedHeight,
+			CreatedAt:                time.Unix(rec.CreatedAtUnix, 0).UTC(),
 		})
 		if len(out) >= query.Limit+1 {
 			break
@@ -1325,21 +1333,29 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 	return notes, err
 }
 
-func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]string, seenAt time.Time) error {
+func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]store.PendingSpend, chainHeight int64, seenAt time.Time) error {
 	_ = ctx
 	if seenAt.IsZero() {
 		seenAt = time.Now().UTC()
 	}
 	nowUnix := seenAt.Unix()
 
-	desired := make(map[string]string, len(pending))
-	for nf, txid := range pending {
+	desired := make(map[string]store.PendingSpend, len(pending))
+	for nf, ps := range pending {
 		nf = strings.ToLower(strings.TrimSpace(nf))
-		txid = strings.ToLower(strings.TrimSpace(txid))
+		txid := strings.ToLower(strings.TrimSpace(ps.TxID))
 		if nf == "" || txid == "" {
 			continue
 		}
-		desired[nf] = txid
+		var expPtr *int64
+		if ps.ExpiryHeight != nil {
+			exp := *ps.ExpiryHeight
+			expPtr = &exp
+		}
+		desired[nf] = store.PendingSpend{
+			TxID:         txid,
+			ExpiryHeight: expPtr,
+		}
 	}
 
 	s.mu.Lock()
@@ -1361,6 +1377,10 @@ func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]stri
 			continue
 		}
 
+		// Clear pending markers only once the tx is deterministically expired:
+		// chainHeight > pending_spent_expiry_height, or if expiry height is unknown.
+		shouldClear := true
+
 		// Clear pending markers on the note record, if we still have it.
 		locBytes, closer, err := s.db.Get(keyNullifier(nf))
 		if err == nil {
@@ -1381,17 +1401,23 @@ func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]stri
 					_ = closer.Close()
 				}
 
-				rec.PendingSpentTxID = nil
-				rec.PendingSpentAtUnix = nil
-
-				b, err := json.Marshal(rec)
-				if err != nil {
-					_ = iter.Close()
-					return fmt.Errorf("rocksdb: encode note: %w", err)
+				if rec.PendingSpentExpiryHeight != nil && chainHeight <= *rec.PendingSpentExpiryHeight {
+					shouldClear = false
 				}
-				if err := batch.Set(noteKey, b, pebble.NoSync); err != nil {
-					_ = iter.Close()
-					return fmt.Errorf("rocksdb: clear pending note: %w", err)
+				if shouldClear {
+					rec.PendingSpentTxID = nil
+					rec.PendingSpentAtUnix = nil
+					rec.PendingSpentExpiryHeight = nil
+
+					b, err := json.Marshal(rec)
+					if err != nil {
+						_ = iter.Close()
+						return fmt.Errorf("rocksdb: encode note: %w", err)
+					}
+					if err := batch.Set(noteKey, b, pebble.NoSync); err != nil {
+						_ = iter.Close()
+						return fmt.Errorf("rocksdb: clear pending note: %w", err)
+					}
 				}
 			} else if !errors.Is(err, pebble.ErrNotFound) {
 				if closer != nil {
@@ -1408,10 +1434,12 @@ func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]stri
 			return fmt.Errorf("rocksdb: get nullifier: %w", err)
 		}
 
-		keyCopy := append([]byte{}, iter.Key()...)
-		if err := batch.Delete(keyCopy, pebble.NoSync); err != nil {
-			_ = iter.Close()
-			return fmt.Errorf("rocksdb: delete pending key: %w", err)
+		if shouldClear {
+			keyCopy := append([]byte{}, iter.Key()...)
+			if err := batch.Delete(keyCopy, pebble.NoSync); err != nil {
+				_ = iter.Close()
+				return fmt.Errorf("rocksdb: delete pending key: %w", err)
+			}
 		}
 	}
 	if err := iter.Error(); err != nil {
@@ -1420,7 +1448,7 @@ func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]stri
 	}
 	_ = iter.Close()
 
-	for nf, txid := range desired {
+	for nf, ps := range desired {
 		locBytes, closer, err := s.db.Get(keyNullifier(nf))
 		if err != nil {
 			if errors.Is(err, pebble.ErrNotFound) {
@@ -1455,12 +1483,22 @@ func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]stri
 			continue
 		}
 
-		txidCopy := txid
+		txidCopy := ps.TxID
+		var expiryCopy *int64
+		if ps.ExpiryHeight != nil {
+			v := *ps.ExpiryHeight
+			expiryCopy = &v
+		}
+
 		if rec.PendingSpentTxID == nil || *rec.PendingSpentTxID != txidCopy {
 			rec.PendingSpentTxID = &txidCopy
 			rec.PendingSpentAtUnix = &nowUnix
+			rec.PendingSpentExpiryHeight = expiryCopy
 		} else if rec.PendingSpentAtUnix == nil {
 			rec.PendingSpentAtUnix = &nowUnix
+			if rec.PendingSpentExpiryHeight == nil && expiryCopy != nil {
+				rec.PendingSpentExpiryHeight = expiryCopy
+			}
 		}
 
 		b, err := json.Marshal(rec)
@@ -1553,23 +1591,24 @@ func (s *Store) ListNotesByPendingSpentTxIDs(ctx context.Context, txids []string
 		}
 
 		out = append(out, store.Note{
-			WalletID:             rec.WalletID,
-			TxID:                 rec.TxID,
-			ActionIndex:          rec.ActionIndex,
-			Height:               rec.Height,
-			Position:             posPtr,
-			DiversifierIndex:     rec.DiversifierIndex,
-			RecipientAddress:     rec.RecipientAddress,
-			ValueZat:             rec.ValueZat,
-			MemoHex:              rec.MemoHex,
-			NoteNullifier:        rec.NoteNullifier,
-			PendingSpentTxID:     rec.PendingSpentTxID,
-			PendingSpentAt:       pendingAt,
-			SpentHeight:          rec.SpentHeight,
-			SpentTxID:            rec.SpentTxID,
-			ConfirmedHeight:      rec.ConfirmedHeight,
-			SpentConfirmedHeight: rec.SpentConfirmedHeight,
-			CreatedAt:            time.Unix(rec.CreatedAtUnix, 0).UTC(),
+			WalletID:                 rec.WalletID,
+			TxID:                     rec.TxID,
+			ActionIndex:              rec.ActionIndex,
+			Height:                   rec.Height,
+			Position:                 posPtr,
+			DiversifierIndex:         rec.DiversifierIndex,
+			RecipientAddress:         rec.RecipientAddress,
+			ValueZat:                 rec.ValueZat,
+			MemoHex:                  rec.MemoHex,
+			NoteNullifier:            rec.NoteNullifier,
+			PendingSpentTxID:         rec.PendingSpentTxID,
+			PendingSpentAt:           pendingAt,
+			PendingSpentExpiryHeight: rec.PendingSpentExpiryHeight,
+			SpentHeight:              rec.SpentHeight,
+			SpentTxID:                rec.SpentTxID,
+			ConfirmedHeight:          rec.ConfirmedHeight,
+			SpentConfirmedHeight:     rec.SpentConfirmedHeight,
+			CreatedAt:                time.Unix(rec.CreatedAtUnix, 0).UTC(),
 		})
 	}
 	if err := iter.Error(); err != nil {
@@ -1619,6 +1658,16 @@ func (s *Store) ListOutgoingOutputsByTxID(ctx context.Context, walletID, txid st
 			t := time.Unix(*rec.MempoolSeenUnix, 0).UTC()
 			mempoolSeenAt = &t
 		}
+		var txExpiryHeight *int64
+		if rec.TxExpiryHeight != nil {
+			h := *rec.TxExpiryHeight
+			txExpiryHeight = &h
+		}
+		var expiredAt *time.Time
+		if rec.ExpiredAtUnix != nil {
+			t := time.Unix(*rec.ExpiredAtUnix, 0).UTC()
+			expiredAt = &t
+		}
 		out = append(out, store.OutgoingOutput{
 			WalletID:         rec.WalletID,
 			TxID:             rec.TxID,
@@ -1626,6 +1675,8 @@ func (s *Store) ListOutgoingOutputsByTxID(ctx context.Context, walletID, txid st
 			MinedHeight:      minedHeight,
 			ConfirmedHeight:  confirmedHeight,
 			MempoolSeenAt:    mempoolSeenAt,
+			TxExpiryHeight:   txExpiryHeight,
+			ExpiredAt:        expiredAt,
 			RecipientAddress: rec.RecipientAddress,
 			ValueZat:         rec.ValueZat,
 			MemoHex:          rec.MemoHex,
@@ -1896,6 +1947,7 @@ func (t *rocksTx) MarkNotesSpent(ctx context.Context, height int64, txid string,
 		rec.SpentConfirmedHeight = nil
 		rec.PendingSpentTxID = nil
 		rec.PendingSpentAtUnix = nil
+		rec.PendingSpentExpiryHeight = nil
 
 		b, err := json.Marshal(rec)
 		if err != nil {
@@ -2168,6 +2220,86 @@ func (t *rocksTx) ConfirmOutgoingOutputs(ctx context.Context, confirmationHeight
 	return out, nil
 }
 
+func (t *rocksTx) ExpireOutgoingOutputs(ctx context.Context, chainHeight int64, expiredAt time.Time) ([]store.OutgoingOutput, error) {
+	_ = ctx
+	if chainHeight < 0 {
+		return nil, errors.New("rocksdb: negative chain height")
+	}
+	if expiredAt.IsZero() {
+		expiredAt = time.Now().UTC()
+	}
+	expiredAt = expiredAt.UTC()
+	expiredUnix := expiredAt.Unix()
+
+	iter, err := t.batch.NewIter(&pebble.IterOptions{
+		LowerBound: outgoingOutputPrefix,
+		UpperBound: prefixUpperBound(outgoingOutputPrefix),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("rocksdb: iter outgoing outputs: %w", err)
+	}
+	defer iter.Close()
+
+	var out []store.OutgoingOutput
+	for iter.First(); iter.Valid(); iter.Next() {
+		keyCopy := append([]byte{}, iter.Key()...)
+
+		var rec outgoingOutputRecord
+		if err := json.Unmarshal(iter.Value(), &rec); err != nil {
+			return nil, fmt.Errorf("rocksdb: decode outgoing output: %w", err)
+		}
+
+		if rec.MinedHeight != nil {
+			continue
+		}
+		if rec.ExpiredAtUnix != nil {
+			continue
+		}
+		if rec.MempoolSeenUnix == nil {
+			continue
+		}
+		if rec.TxExpiryHeight == nil {
+			continue
+		}
+		if chainHeight <= *rec.TxExpiryHeight {
+			continue
+		}
+
+		u := expiredUnix
+		rec.ExpiredAtUnix = &u
+
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return nil, fmt.Errorf("rocksdb: encode outgoing output: %w", err)
+		}
+		if err := t.batch.Set(keyCopy, b, pebble.NoSync); err != nil {
+			return nil, fmt.Errorf("rocksdb: expire outgoing output: %w", err)
+		}
+
+		mempoolSeenAt := time.Unix(*rec.MempoolSeenUnix, 0).UTC()
+		txExpiryHeight := *rec.TxExpiryHeight
+		expiredAtCopy := expiredAt
+		out = append(out, store.OutgoingOutput{
+			WalletID:         rec.WalletID,
+			TxID:             rec.TxID,
+			ActionIndex:      rec.ActionIndex,
+			MempoolSeenAt:    &mempoolSeenAt,
+			TxExpiryHeight:   &txExpiryHeight,
+			ExpiredAt:        &expiredAtCopy,
+			RecipientAddress: rec.RecipientAddress,
+			ValueZat:         rec.ValueZat,
+			MemoHex:          rec.MemoHex,
+			OvkScope:         rec.OvkScope,
+			RecipientScope:   rec.RecipientScope,
+			CreatedAt:        time.Unix(rec.CreatedAtUnix, 0).UTC(),
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("rocksdb: expire outgoing outputs iter: %w", err)
+	}
+	return out, nil
+}
+
 func (t *rocksTx) ConfirmSpends(ctx context.Context, confirmationHeight int64, maxSpentHeight int64) ([]store.Note, error) {
 	_ = ctx
 	if confirmationHeight < 0 {
@@ -2397,6 +2529,16 @@ func (t *rocksTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutp
 			rec.MempoolSeenUnix = &u
 			changed = true
 		}
+		if rec.TxExpiryHeight == nil && o.TxExpiryHeight != nil {
+			h := *o.TxExpiryHeight
+			rec.TxExpiryHeight = &h
+			changed = true
+		}
+		if rec.ExpiredAtUnix == nil && o.ExpiredAt != nil && !o.ExpiredAt.IsZero() {
+			u := o.ExpiredAt.UTC().Unix()
+			rec.ExpiredAtUnix = &u
+			changed = true
+		}
 		if !changed {
 			return false, nil
 		}
@@ -2426,6 +2568,14 @@ func (t *rocksTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutp
 	if o.MempoolSeenAt != nil && !o.MempoolSeenAt.IsZero() {
 		u := o.MempoolSeenAt.UTC().Unix()
 		rec.MempoolSeenUnix = &u
+	}
+	if o.TxExpiryHeight != nil {
+		h := *o.TxExpiryHeight
+		rec.TxExpiryHeight = &h
+	}
+	if o.ExpiredAt != nil && !o.ExpiredAt.IsZero() {
+		u := o.ExpiredAt.UTC().Unix()
+		rec.ExpiredAtUnix = &u
 	}
 
 	b, err := json.Marshal(rec)
@@ -2521,23 +2671,24 @@ type commitmentRecord struct {
 }
 
 type noteRecord struct {
-	WalletID             string  `json:"wallet_id"`
-	TxID                 string  `json:"txid"`
-	ActionIndex          int32   `json:"action_index"`
-	Height               int64   `json:"height"`
-	Position             *uint64 `json:"position,omitempty"`
-	DiversifierIndex     uint32  `json:"diversifier_index,omitempty"`
-	RecipientAddress     string  `json:"recipient_address"`
-	ValueZat             int64   `json:"value_zat"`
-	MemoHex              *string `json:"memo_hex,omitempty"`
-	NoteNullifier        string  `json:"note_nullifier"`
-	PendingSpentTxID     *string `json:"pending_spent_txid,omitempty"`
-	PendingSpentAtUnix   *int64  `json:"pending_spent_at_unix,omitempty"`
-	SpentHeight          *int64  `json:"spent_height,omitempty"`
-	SpentTxID            *string `json:"spent_txid,omitempty"`
-	ConfirmedHeight      *int64  `json:"confirmed_height,omitempty"`
-	SpentConfirmedHeight *int64  `json:"spent_confirmed_height,omitempty"`
-	CreatedAtUnix        int64   `json:"created_at_unix"`
+	WalletID                 string  `json:"wallet_id"`
+	TxID                     string  `json:"txid"`
+	ActionIndex              int32   `json:"action_index"`
+	Height                   int64   `json:"height"`
+	Position                 *uint64 `json:"position,omitempty"`
+	DiversifierIndex         uint32  `json:"diversifier_index,omitempty"`
+	RecipientAddress         string  `json:"recipient_address"`
+	ValueZat                 int64   `json:"value_zat"`
+	MemoHex                  *string `json:"memo_hex,omitempty"`
+	NoteNullifier            string  `json:"note_nullifier"`
+	PendingSpentTxID         *string `json:"pending_spent_txid,omitempty"`
+	PendingSpentAtUnix       *int64  `json:"pending_spent_at_unix,omitempty"`
+	PendingSpentExpiryHeight *int64  `json:"pending_spent_expiry_height,omitempty"`
+	SpentHeight              *int64  `json:"spent_height,omitempty"`
+	SpentTxID                *string `json:"spent_txid,omitempty"`
+	ConfirmedHeight          *int64  `json:"confirmed_height,omitempty"`
+	SpentConfirmedHeight     *int64  `json:"spent_confirmed_height,omitempty"`
+	CreatedAtUnix            int64   `json:"created_at_unix"`
 }
 
 type outgoingOutputRecord struct {
@@ -2549,6 +2700,8 @@ type outgoingOutputRecord struct {
 	MinedHeight     *int64 `json:"mined_height,omitempty"`
 	ConfirmedHeight *int64 `json:"confirmed_height,omitempty"`
 	MempoolSeenUnix *int64 `json:"mempool_seen_at_unix,omitempty"`
+	TxExpiryHeight  *int64 `json:"tx_expiry_height,omitempty"`
+	ExpiredAtUnix   *int64 `json:"expired_at_unix,omitempty"`
 
 	RecipientAddress string  `json:"recipient_address"`
 	ValueZat         int64   `json:"value_zat"`

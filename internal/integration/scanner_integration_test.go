@@ -186,6 +186,9 @@ func TestScanner_DepositDetected(t *testing.T) {
 			if n.PendingSpentAt != nil {
 				t.Fatalf("pending_spent_at not cleared")
 			}
+			if n.PendingSpentExpiryHeight != nil {
+				t.Fatalf("pending_spent_expiry_height not cleared")
+			}
 		}
 	}
 	if !foundSpent {
@@ -612,12 +615,12 @@ func waitForOutgoingOutputEventState(t *testing.T, ctx context.Context, st store
 	}
 
 	type payload struct {
-		TxID            string `json:"txid"`
-		Height          *int64 `json:"height,omitempty"`
-		ActionIndex     uint32 `json:"action_index"`
-		AmountZatoshis  uint64 `json:"amount_zatoshis"`
+		TxID             string `json:"txid"`
+		Height           *int64 `json:"height,omitempty"`
+		ActionIndex      uint32 `json:"action_index"`
+		AmountZatoshis   uint64 `json:"amount_zatoshis"`
 		RecipientAddress string `json:"recipient_address"`
-		Status          struct {
+		Status           struct {
 			State string `json:"state"`
 		} `json:"status"`
 	}

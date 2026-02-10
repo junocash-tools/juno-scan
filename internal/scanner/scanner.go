@@ -28,6 +28,7 @@ type Scanner struct {
 	zmqHashBlockEndpoint string
 
 	mempoolOrchardNullifiersByTxID map[string][]string
+	mempoolTxExpiryHeightByTxID    map[string]*int64
 }
 
 func New(st store.Store, rpc *sdkjunocashd.Client, uaHRP string, pollInterval time.Duration, confirmations int64, zmqHashBlockEndpoint string) (*Scanner, error) {
@@ -107,7 +108,7 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 			return fmt.Errorf("scanner: getblockcount: %w", err)
 		}
 		if nextHeight > chainHeight {
-			if err := s.updatePendingSpends(ctx); err != nil {
+			if err := s.updatePendingSpends(ctx, chainHeight); err != nil {
 				return err
 			}
 			return nil
@@ -150,7 +151,7 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (s *Scanner) updatePendingSpends(ctx context.Context) error {
+func (s *Scanner) updatePendingSpends(ctx context.Context, chainHeight int64) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -162,8 +163,9 @@ func (s *Scanner) updatePendingSpends(ctx context.Context) error {
 	}
 
 	type rawTx struct {
-		Hex     string `json:"hex"`
-		Orchard struct {
+		Hex          string `json:"hex"`
+		ExpiryHeight int64  `json:"expiryheight"`
+		Orchard      struct {
 			Actions []struct {
 				Nullifier string `json:"nullifier"`
 			} `json:"actions"`
@@ -173,8 +175,12 @@ func (s *Scanner) updatePendingSpends(ctx context.Context) error {
 	if s.mempoolOrchardNullifiersByTxID == nil {
 		s.mempoolOrchardNullifiersByTxID = make(map[string][]string)
 	}
+	if s.mempoolTxExpiryHeightByTxID == nil {
+		s.mempoolTxExpiryHeightByTxID = make(map[string]*int64)
+	}
 
 	newTxHex := make(map[string]string)
+	newTxExpiryHeight := make(map[string]*int64)
 
 	inMempool := make(map[string]struct{}, len(txids))
 	for _, txid := range txids {
@@ -188,6 +194,12 @@ func (s *Scanner) updatePendingSpends(ctx context.Context) error {
 	for txid := range s.mempoolOrchardNullifiersByTxID {
 		if _, ok := inMempool[txid]; !ok {
 			delete(s.mempoolOrchardNullifiersByTxID, txid)
+			delete(s.mempoolTxExpiryHeightByTxID, txid)
+		}
+	}
+	for txid := range s.mempoolTxExpiryHeightByTxID {
+		if _, ok := inMempool[txid]; !ok {
+			delete(s.mempoolTxExpiryHeightByTxID, txid)
 		}
 	}
 
@@ -217,22 +229,38 @@ func (s *Scanner) updatePendingSpends(ctx context.Context) error {
 
 		s.mempoolOrchardNullifiersByTxID[txid] = nfs
 
+		var expPtr *int64
+		if tx.ExpiryHeight > 0 {
+			exp := tx.ExpiryHeight
+			expPtr = &exp
+		}
+		s.mempoolTxExpiryHeightByTxID[txid] = expPtr
+		newTxExpiryHeight[txid] = expPtr
+
 		if txHex := strings.TrimSpace(tx.Hex); txHex != "" {
 			newTxHex[txid] = txHex
 		}
 	}
 
-	pending := make(map[string]string)
+	pending := make(map[string]store.PendingSpend)
 	for txid, nfs := range s.mempoolOrchardNullifiersByTxID {
+		expPtr := s.mempoolTxExpiryHeightByTxID[txid]
+		// Treat expired txs as non-pending even if the daemon briefly reports them in the mempool.
+		if expPtr != nil && chainHeight > *expPtr {
+			continue
+		}
 		for _, nf := range nfs {
 			if nf == "" {
 				continue
 			}
-			pending[nf] = txid
+			pending[nf] = store.PendingSpend{
+				TxID:         txid,
+				ExpiryHeight: expPtr,
+			}
 		}
 	}
 
-	if err := s.st.UpdatePendingSpends(ctx, pending, seenAt); err != nil {
+	if err := s.st.UpdatePendingSpends(ctx, pending, chainHeight, seenAt); err != nil {
 		return fmt.Errorf("scanner: update pending spends: %w", err)
 	}
 
@@ -276,6 +304,7 @@ func (s *Scanner) updatePendingSpends(ctx context.Context) error {
 			if strings.TrimSpace(txHex) == "" || len(walletSet) == 0 {
 				continue
 			}
+			expiryHeight := newTxExpiryHeight[txid]
 
 			recoverWallets := make([]orchardscan.Wallet, 0, len(walletSet))
 			for walletID := range walletSet {
@@ -317,7 +346,8 @@ func (s *Scanner) updatePendingSpends(ctx context.Context) error {
 
 						ActionIndex: int32(o.ActionIndex),
 
-						MempoolSeenAt: &seenAtCopy,
+						MempoolSeenAt:  &seenAtCopy,
+						TxExpiryHeight: expiryHeight,
 
 						RecipientAddress: o.RecipientAddress,
 						ValueZat:         int64(o.ValueZat),
@@ -337,7 +367,8 @@ func (s *Scanner) updatePendingSpends(ctx context.Context) error {
 						Version:  types.V1,
 						WalletID: o.WalletID,
 
-						TxID: txid,
+						TxID:         txid,
+						ExpiryHeight: expiryHeight,
 
 						ActionIndex:    o.ActionIndex,
 						AmountZatoshis: o.ValueZat,
@@ -370,6 +401,56 @@ func (s *Scanner) updatePendingSpends(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+
+	// Deterministic expiry: we only emit an event once chainHeight has passed tx_expiry_height.
+	if err := s.st.WithTx(ctx, func(tx store.Tx) error {
+		expired, err := tx.ExpireOutgoingOutputs(ctx, chainHeight, seenAt)
+		if err != nil {
+			return err
+		}
+		for _, o := range expired {
+			memoHex := ""
+			if o.MemoHex != nil {
+				memoHex = strings.TrimSpace(*o.MemoHex)
+			}
+
+			payload := events.OutgoingOutputEventPayload{
+				Version:  types.V1,
+				WalletID: o.WalletID,
+
+				TxID:         o.TxID,
+				ExpiryHeight: o.TxExpiryHeight,
+
+				ActionIndex:    uint32(o.ActionIndex),
+				AmountZatoshis: uint64(o.ValueZat),
+
+				RecipientAddress: o.RecipientAddress,
+				MemoHex:          memoHex,
+
+				OvkScope:       o.OvkScope,
+				RecipientScope: derefString(o.RecipientScope),
+
+				Status: types.TxStatus{
+					State: types.TxStateExpired,
+				},
+			}
+			payloadBytes, err := json.Marshal(payload)
+			if err != nil {
+				return fmt.Errorf("scanner: marshal outgoing output expired payload: %w", err)
+			}
+			if err := tx.InsertEvent(ctx, store.Event{
+				Kind:     events.KindOutgoingOutputExpired,
+				WalletID: o.WalletID,
+				Height:   chainHeight,
+				Payload:  payloadBytes,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	return nil
@@ -570,7 +651,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 							Version:  types.V1,
 							WalletID: o.WalletID,
 
-							TxID:  t.TxID,
+							TxID:   t.TxID,
 							Height: &heightCopy,
 
 							ActionIndex:    o.ActionIndex,
@@ -829,7 +910,7 @@ func (s *Scanner) confirmOutgoingOutputConfirmations(ctx context.Context, tx sto
 				Version:  types.V1,
 				WalletID: o.WalletID,
 
-				TxID:  o.TxID,
+				TxID:   o.TxID,
 				Height: &heightCopy,
 
 				ActionIndex:    uint32(o.ActionIndex),

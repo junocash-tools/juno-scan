@@ -726,10 +726,10 @@ func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query 
 
 	sb := strings.Builder{}
 	sb.WriteString(`
-SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, pending_spent_txid, pending_spent_at, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
-FROM notes
-WHERE wallet_id = ?
-`)
+	SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, pending_spent_txid, pending_spent_at, pending_spent_expiry_height, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
+	FROM notes
+	WHERE wallet_id = ?
+	`)
 	args := []any{walletID}
 	if query.OnlyUnspent {
 		sb.WriteString(" AND spent_height IS NULL")
@@ -759,6 +759,7 @@ WHERE wallet_id = ?
 		var memo sql.NullString
 		var pendingTxid sql.NullString
 		var pendingAt sql.NullTime
+		var pendingExpiryHeight sql.NullInt64
 		var spentHeight sql.NullInt64
 		var spentTxid sql.NullString
 		var confirmedHeight sql.NullInt64
@@ -776,6 +777,7 @@ WHERE wallet_id = ?
 			&n.NoteNullifier,
 			&pendingTxid,
 			&pendingAt,
+			&pendingExpiryHeight,
 			&spentHeight,
 			&spentTxid,
 			&confirmedHeight,
@@ -799,6 +801,9 @@ WHERE wallet_id = ?
 		if pendingAt.Valid {
 			t := pendingAt.Time.UTC()
 			n.PendingSpentAt = &t
+		}
+		if pendingExpiryHeight.Valid {
+			n.PendingSpentExpiryHeight = &pendingExpiryHeight.Int64
 		}
 		if spentHeight.Valid {
 			n.SpentHeight = &spentHeight.Int64
@@ -838,7 +843,7 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 	return notes, err
 }
 
-func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]string, seenAt time.Time) error {
+func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]store.PendingSpend, chainHeight int64, seenAt time.Time) error {
 	if seenAt.IsZero() {
 		seenAt = time.Now().UTC()
 	}
@@ -849,25 +854,80 @@ func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]stri
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.ExecContext(ctx, `
-UPDATE notes
-SET pending_spent_txid = NULL, pending_spent_at = NULL
-WHERE spent_height IS NULL AND pending_spent_txid IS NOT NULL
-`); err != nil {
-		return fmt.Errorf("mysql: clear pending spends: %w", err)
+	nullifiers := make([]string, 0, len(pending))
+	for nf := range pending {
+		nf = strings.TrimSpace(nf)
+		if nf == "" {
+			continue
+		}
+		nullifiers = append(nullifiers, nf)
 	}
 
-	for nf, txid := range pending {
+	if len(nullifiers) == 0 {
+		if _, err := tx.ExecContext(ctx, `
+	UPDATE notes
+	SET pending_spent_txid = NULL,
+	    pending_spent_at = NULL,
+	    pending_spent_expiry_height = NULL
+	WHERE spent_height IS NULL
+	  AND pending_spent_txid IS NOT NULL
+	  AND (
+	    pending_spent_expiry_height IS NULL OR
+	    ? > pending_spent_expiry_height
+	  )
+	`, chainHeight); err != nil {
+			return fmt.Errorf("mysql: clear pending spends: %w", err)
+		}
+	} else {
+		query := `
+UPDATE notes
+SET pending_spent_txid = NULL,
+    pending_spent_at = NULL,
+    pending_spent_expiry_height = NULL
+WHERE spent_height IS NULL
+  AND pending_spent_txid IS NOT NULL
+  AND note_nullifier NOT IN (?` + strings.Repeat(",?", len(nullifiers)-1) + `)
+  AND (
+    pending_spent_expiry_height IS NULL OR
+    ? > pending_spent_expiry_height
+  )
+`
+		args := make([]any, 0, len(nullifiers)+1)
+		for _, nf := range nullifiers {
+			args = append(args, nf)
+		}
+		args = append(args, chainHeight)
+
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("mysql: clear pending spends: %w", err)
+		}
+	}
+
+	for nf, ps := range pending {
 		nf = strings.TrimSpace(nf)
-		txid = strings.TrimSpace(txid)
+		txid := strings.TrimSpace(ps.TxID)
 		if nf == "" || txid == "" {
 			continue
 		}
+
+		expiryHeight := any(nil)
+		if ps.ExpiryHeight != nil {
+			expiryHeight = *ps.ExpiryHeight
+		}
+
 		if _, err := tx.ExecContext(ctx, `
 UPDATE notes
-SET pending_spent_txid = ?, pending_spent_at = ?
+SET pending_spent_txid = ?,
+    pending_spent_expiry_height = CASE
+      WHEN pending_spent_txid IS NULL OR pending_spent_txid <> ? THEN ?
+      ELSE COALESCE(pending_spent_expiry_height, ?)
+    END,
+    pending_spent_at = CASE
+      WHEN pending_spent_txid IS NULL OR pending_spent_txid <> ? THEN ?
+      ELSE COALESCE(pending_spent_at, ?)
+    END
 WHERE spent_height IS NULL AND note_nullifier = ?
-`, txid, seenAt, nf); err != nil {
+`, txid, txid, expiryHeight, expiryHeight, txid, seenAt, seenAt, nf); err != nil {
 			return fmt.Errorf("mysql: set pending spend: %w", err)
 		}
 	}
@@ -885,11 +945,11 @@ func (s *Store) ListNotesByPendingSpentTxIDs(ctx context.Context, txids []string
 	}
 
 	query := `
-SELECT wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, pending_spent_txid, pending_spent_at, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
-FROM notes
-WHERE spent_height IS NULL AND pending_spent_txid IN (?` + strings.Repeat(",?", len(txids)-1) + `)
-ORDER BY wallet_id, txid, action_index
-`
+	SELECT wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, pending_spent_txid, pending_spent_at, pending_spent_expiry_height, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
+	FROM notes
+	WHERE spent_height IS NULL AND pending_spent_txid IN (?` + strings.Repeat(",?", len(txids)-1) + `)
+	ORDER BY wallet_id, txid, action_index
+	`
 	args := make([]any, 0, len(txids))
 	for _, txid := range txids {
 		args = append(args, txid)
@@ -909,6 +969,7 @@ ORDER BY wallet_id, txid, action_index
 		var memo sql.NullString
 		var pendingTxid sql.NullString
 		var pendingAt sql.NullTime
+		var pendingExpiryHeight sql.NullInt64
 		var spentHeight sql.NullInt64
 		var spentTxid sql.NullString
 		var confirmedHeight sql.NullInt64
@@ -926,6 +987,7 @@ ORDER BY wallet_id, txid, action_index
 			&n.NoteNullifier,
 			&pendingTxid,
 			&pendingAt,
+			&pendingExpiryHeight,
 			&spentHeight,
 			&spentTxid,
 			&confirmedHeight,
@@ -949,6 +1011,9 @@ ORDER BY wallet_id, txid, action_index
 		if pendingAt.Valid {
 			t := pendingAt.Time.UTC()
 			n.PendingSpentAt = &t
+		}
+		if pendingExpiryHeight.Valid {
+			n.PendingSpentExpiryHeight = &pendingExpiryHeight.Int64
 		}
 		if spentHeight.Valid {
 			n.SpentHeight = &spentHeight.Int64
@@ -978,11 +1043,11 @@ func (s *Store) ListOutgoingOutputsByTxID(ctx context.Context, walletID, txid st
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-SELECT txid, action_index, mined_height, confirmed_height, mempool_seen_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
-FROM outgoing_outputs
-WHERE wallet_id = ? AND txid = ?
-ORDER BY action_index
-`, walletID, txid)
+	SELECT txid, action_index, mined_height, confirmed_height, mempool_seen_at, tx_expiry_height, expired_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
+	FROM outgoing_outputs
+	WHERE wallet_id = ? AND txid = ?
+	ORDER BY action_index
+	`, walletID, txid)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: list outgoing outputs: %w", err)
 	}
@@ -994,6 +1059,8 @@ ORDER BY action_index
 		var minedHeight sql.NullInt64
 		var confirmedHeight sql.NullInt64
 		var mempoolSeenAt sql.NullTime
+		var txExpiryHeight sql.NullInt64
+		var expiredAt sql.NullTime
 		var memo sql.NullString
 		var recipientScope sql.NullString
 		o.WalletID = walletID
@@ -1003,6 +1070,8 @@ ORDER BY action_index
 			&minedHeight,
 			&confirmedHeight,
 			&mempoolSeenAt,
+			&txExpiryHeight,
+			&expiredAt,
 			&o.RecipientAddress,
 			&o.ValueZat,
 			&memo,
@@ -1021,6 +1090,13 @@ ORDER BY action_index
 		if mempoolSeenAt.Valid {
 			t := mempoolSeenAt.Time.UTC()
 			o.MempoolSeenAt = &t
+		}
+		if txExpiryHeight.Valid {
+			o.TxExpiryHeight = &txExpiryHeight.Int64
+		}
+		if expiredAt.Valid {
+			tm := expiredAt.Time.UTC()
+			o.ExpiredAt = &tm
 		}
 		if memo.Valid {
 			o.MemoHex = &memo.String
@@ -1210,13 +1286,14 @@ WHERE spent_height IS NULL AND note_nullifier IN (`)
 
 	b.Reset()
 	b.WriteString(`
-UPDATE notes
-SET spent_height = ?,
-    spent_txid = ?,
-    spent_confirmed_height = NULL,
-    pending_spent_txid = NULL,
-    pending_spent_at = NULL
-WHERE spent_height IS NULL AND note_nullifier IN (`)
+	UPDATE notes
+	SET spent_height = ?,
+	    spent_txid = ?,
+	    spent_confirmed_height = NULL,
+	    pending_spent_txid = NULL,
+	    pending_spent_at = NULL,
+	    pending_spent_expiry_height = NULL
+	WHERE spent_height IS NULL AND note_nullifier IN (`)
 	for i, nf := range nullifiers {
 		if i > 0 {
 			b.WriteString(",")
@@ -1286,18 +1363,23 @@ func (t *myTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutput)
 		mempoolSeenAt = o.MempoolSeenAt.UTC()
 	}
 
+	txExpiryHeight := any(nil)
+	if o.TxExpiryHeight != nil {
+		txExpiryHeight = *o.TxExpiryHeight
+	}
+
 	recipientScope := any(nil)
 	if o.RecipientScope != nil && strings.TrimSpace(*o.RecipientScope) != "" {
 		recipientScope = strings.TrimSpace(*o.RecipientScope)
 	}
 
 	res, err := t.tx.ExecContext(ctx, `
-INSERT IGNORE INTO outgoing_outputs (
-  wallet_id, txid, action_index, mined_height, mempool_seen_at,
-  recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope
-)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`, o.WalletID, o.TxID, o.ActionIndex, minedHeight, mempoolSeenAt, o.RecipientAddress, o.ValueZat, memoHex, o.OvkScope, recipientScope)
+	INSERT IGNORE INTO outgoing_outputs (
+	  wallet_id, txid, action_index, mined_height, mempool_seen_at, tx_expiry_height,
+	  recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope
+	)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, o.WalletID, o.TxID, o.ActionIndex, minedHeight, mempoolSeenAt, txExpiryHeight, o.RecipientAddress, o.ValueZat, memoHex, o.OvkScope, recipientScope)
 	if err != nil {
 		return false, fmt.Errorf("mysql: insert outgoing output: %w", err)
 	}
@@ -1307,15 +1389,17 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	}
 
 	res, err = t.tx.ExecContext(ctx, `
-UPDATE outgoing_outputs
-SET mined_height = COALESCE(mined_height, ?),
-    mempool_seen_at = COALESCE(mempool_seen_at, ?)
-WHERE wallet_id = ? AND txid = ? AND action_index = ?
-  AND (
-    (mined_height IS NULL AND ? IS NOT NULL) OR
-    (mempool_seen_at IS NULL AND ? IS NOT NULL)
-  )
-`, minedHeight, mempoolSeenAt, o.WalletID, o.TxID, o.ActionIndex, minedHeight, mempoolSeenAt)
+	UPDATE outgoing_outputs
+	SET mined_height = COALESCE(mined_height, ?),
+	    mempool_seen_at = COALESCE(mempool_seen_at, ?),
+	    tx_expiry_height = COALESCE(tx_expiry_height, ?)
+	WHERE wallet_id = ? AND txid = ? AND action_index = ?
+	  AND (
+	    (mined_height IS NULL AND ? IS NOT NULL) OR
+	    (mempool_seen_at IS NULL AND ? IS NOT NULL) OR
+	    (tx_expiry_height IS NULL AND ? IS NOT NULL)
+	  )
+	`, minedHeight, mempoolSeenAt, txExpiryHeight, o.WalletID, o.TxID, o.ActionIndex, minedHeight, mempoolSeenAt, txExpiryHeight)
 	if err != nil {
 		return false, fmt.Errorf("mysql: update outgoing output: %w", err)
 	}
@@ -1479,6 +1563,95 @@ SET confirmed_height = ?
 WHERE mined_height IS NOT NULL AND confirmed_height IS NULL AND mined_height <= ?
 `, confirmationHeight, maxMinedHeight); err != nil {
 		return nil, fmt.Errorf("mysql: confirm outgoing outputs update: %w", err)
+	}
+	return out, nil
+}
+
+func (t *myTx) ExpireOutgoingOutputs(ctx context.Context, chainHeight int64, expiredAt time.Time) ([]store.OutgoingOutput, error) {
+	if expiredAt.IsZero() {
+		expiredAt = time.Now().UTC()
+	}
+
+	rows, err := t.tx.QueryContext(ctx, `
+SELECT wallet_id, txid, action_index, mempool_seen_at, tx_expiry_height, expired_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
+FROM outgoing_outputs
+WHERE mined_height IS NULL
+  AND expired_at IS NULL
+  AND mempool_seen_at IS NOT NULL
+  AND tx_expiry_height IS NOT NULL
+  AND ? > tx_expiry_height
+ORDER BY wallet_id, txid, action_index
+`, chainHeight)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: expire outgoing outputs list: %w", err)
+	}
+	defer rows.Close()
+
+	var out []store.OutgoingOutput
+	for rows.Next() {
+		var o store.OutgoingOutput
+		var mempoolSeenAt sql.NullTime
+		var txExpiryHeight sql.NullInt64
+		var expiredAtDB sql.NullTime
+		var memo sql.NullString
+		var recipientScope sql.NullString
+		if err := rows.Scan(
+			&o.WalletID,
+			&o.TxID,
+			&o.ActionIndex,
+			&mempoolSeenAt,
+			&txExpiryHeight,
+			&expiredAtDB,
+			&o.RecipientAddress,
+			&o.ValueZat,
+			&memo,
+			&o.OvkScope,
+			&recipientScope,
+			&o.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("mysql: expire outgoing outputs list: %w", err)
+		}
+		if mempoolSeenAt.Valid {
+			tm := mempoolSeenAt.Time.UTC()
+			o.MempoolSeenAt = &tm
+		}
+		if txExpiryHeight.Valid {
+			o.TxExpiryHeight = &txExpiryHeight.Int64
+		}
+		if expiredAtDB.Valid {
+			tm := expiredAtDB.Time.UTC()
+			o.ExpiredAt = &tm
+		}
+		if memo.Valid {
+			o.MemoHex = &memo.String
+		}
+		if recipientScope.Valid {
+			o.RecipientScope = &recipientScope.String
+		}
+		out = append(out, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql: expire outgoing outputs list: %w", err)
+	}
+
+	if len(out) == 0 {
+		return nil, nil
+	}
+
+	if _, err := t.tx.ExecContext(ctx, `
+UPDATE outgoing_outputs
+SET expired_at = ?
+WHERE mined_height IS NULL
+  AND expired_at IS NULL
+  AND mempool_seen_at IS NOT NULL
+  AND tx_expiry_height IS NOT NULL
+  AND ? > tx_expiry_height
+`, expiredAt, chainHeight); err != nil {
+		return nil, fmt.Errorf("mysql: expire outgoing outputs update: %w", err)
+	}
+
+	for i := range out {
+		out[i].ExpiredAt = &expiredAt
 	}
 	return out, nil
 }
