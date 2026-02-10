@@ -29,12 +29,12 @@ All event payloads include `version` (string). The current event payload version
 Event payloads include `status` describing the observed tx lifecycle:
 
 ```json
-{ "state": "mempool|confirmed|orphaned", "height": 123, "confirmations": 5 }
+{ "state": "mempool|confirmed|orphaned|expired", "height": 123, "confirmations": 5 }
 ```
 
 Fields:
 
-- `state`: `"mempool"`, `"confirmed"`, or `"orphaned"`
+- `state`: `"mempool"`, `"confirmed"`, `"orphaned"`, or `"expired"`
 - `height`: present when applicable
 - `confirmations`: present when applicable
 
@@ -125,6 +125,7 @@ Fields:
 - `version`, `wallet_id`
 - `txid`
 - `height` (optional): present when mined
+- `expiry_height` (optional): the tx's expiry height (`nExpiryHeight`) when known (typically for mempool observations)
 - `action_index`
 - `amount_zatoshis`
 - `recipient_address`: unified address (j1...)
@@ -153,3 +154,14 @@ Fields:
 - `rollback_height`
 - `required_confirmations` (optional)
 - `previous_confirmed_height`
+
+### `OutgoingOutputExpired`
+
+Emitted when an outgoing output was observed in the mempool and the underlying tx expires before being mined.
+
+Semantics:
+
+- only emitted when `chain_height > payload.expiry_height` and the tx has not been mined
+- `payload.status.state == "expired"`
+- `payload.height` is omitted
+- `payload.expiry_height` is present

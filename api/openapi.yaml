@@ -473,6 +473,9 @@ components:
         pending_spent_at:
           type: string
           format: date-time
+        pending_spent_expiry_height:
+          type: integer
+          format: int64
         spent_height:
           type: integer
           format: int64

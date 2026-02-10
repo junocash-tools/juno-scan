@@ -54,7 +54,8 @@ curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes?spent=true" # 
 curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes?min_value_zat=50000&limit=500" # filter + page size
 ```
 
-Note: when a note’s nullifier is observed in the node mempool, the note will include `pending_spent_txid` / `pending_spent_at` until the spend is mined (or disappears from the mempool).
+Note: when a note’s nullifier is observed in the node mempool, the note will include `pending_spent_txid` / `pending_spent_at` and (when known) `pending_spent_expiry_height`.
+Pending spends are *sticky*: if a spend disappears from the mempool before it is mined, the note remains pending until the spend is mined or the chain height passes `pending_spent_expiry_height`.
 When additional pages exist, the notes response includes `next_cursor`; pass it back as `cursor` to continue.
 
 If you configured `-api-bearer-token`, include `-H 'Authorization: Bearer <token>'` in all requests.
@@ -225,6 +226,7 @@ Outgoing output lifecycle:
 - `OutgoingOutputConfirmed`
 - `OutgoingOutputOrphaned`
 - `OutgoingOutputUnconfirmed`
+- `OutgoingOutputExpired`
 
 The confirmation threshold defaults to `100` and can be configured via `-confirmations` / `JUNO_SCAN_CONFIRMATIONS`.
 
