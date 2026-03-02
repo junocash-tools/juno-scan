@@ -9,6 +9,7 @@ char *juno_scan_scan_tx_json(const char *req_json);
 char *juno_scan_recover_outgoing_tx_json(const char *req_json);
 char *juno_scan_validate_ufvk_json(const char *req_json);
 char *juno_scan_orchard_witness_json(const char *req_json);
+char *juno_scan_orchard_subtree_root_json(const char *req_json);
 void juno_scan_string_free(char *s);
 
 #ifdef __cplusplus

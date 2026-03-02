@@ -563,30 +563,20 @@ func (s *Server) handleOrchardWitness(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	commitments, err := s.st.ListOrchardCommitmentsUpToHeight(ctx, anchorHeight)
+	res, err := s.computeOrchardWitness(ctx, anchorHeight, req.Positions)
 	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-
-	if len(commitments) == 0 {
-		http.Error(w, "no commitments", http.StatusBadRequest)
-		return
-	}
-
-	var expectedPos int64 = 0
-	cmxHex := make([]string, 0, len(commitments))
-	for _, c := range commitments {
-		if c.Position != expectedPos {
+		if errors.Is(err, errDBAccess) {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		if errors.Is(err, errNoCommitments) {
+			http.Error(w, "no commitments", http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, errInvalidCommitmentPositions) {
 			http.Error(w, "invalid commitment positions", http.StatusInternalServerError)
 			return
 		}
-		expectedPos++
-		cmxHex = append(cmxHex, c.CMX)
-	}
-
-	res, err := orchardscan.OrchardWitness(ctx, cmxHex, req.Positions)
-	if err != nil {
 		var oe *orchardscan.Error
 		if errors.As(err, &oe) && oe.Code == orchardscan.ErrInvalidRequest {
 			http.Error(w, "invalid request", http.StatusBadRequest)

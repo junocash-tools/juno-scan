@@ -1,14 +1,20 @@
 use core::ffi::c_char;
+use std::collections::BTreeMap;
 
 use incrementalmerkletree::frontier::CommitmentTree;
 use incrementalmerkletree::witness::IncrementalWitness;
+use incrementalmerkletree::{Hashable, Position, Retention};
 use orchard::keys::{FullViewingKey, Scope};
 use orchard::note::ExtractedNoteCommitment;
 use orchard::note_encryption::{CompactAction, OrchardDomain};
 use orchard::tree::MerkleHashOrchard;
 use serde::{Deserialize, Serialize};
+use shardtree::store::memory::MemoryShardStore;
+use shardtree::ShardTree;
 use thiserror::Error;
-use zcash_note_encryption::{batch, try_note_decryption, try_output_recovery_with_ovk, ShieldedOutput};
+use zcash_note_encryption::{
+    batch, try_note_decryption, try_output_recovery_with_ovk, ShieldedOutput,
+};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::BranchId;
 use zeroize::Zeroize;
@@ -120,15 +126,39 @@ struct ValidateUFVKRequest {
 #[serde(tag = "status", rename_all = "snake_case")]
 enum ValidateUFVKResponse {
     Ok,
-    Err {
-        error: String,
-    },
+    Err { error: String },
 }
 
 #[derive(Debug, Deserialize)]
 struct WitnessRequest {
+    #[serde(default)]
     cmx_hex: Vec<String>,
+    #[serde(default)]
     positions: Vec<u32>,
+    #[serde(default)]
+    anchor_height: Option<u32>,
+    #[serde(default)]
+    targets: Option<Vec<WitnessTargetReq>>,
+    #[serde(default)]
+    ops: Option<Vec<WitnessOpReq>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WitnessTargetReq {
+    position: u32,
+    cmx_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WitnessOpReq {
+    AppendBatch { cmx_hex: Vec<String> },
+    InsertSubtreeRoots { subtree_roots: Vec<String> },
+}
+
+#[derive(Debug, Deserialize)]
+struct SubtreeRootRequest {
+    cmx_hex: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -147,6 +177,190 @@ enum WitnessResponse {
     Err {
         error: String,
     },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum SubtreeRootResponse {
+    Ok { root: String },
+    Err { error: String },
+}
+
+type OrchardShardTree = ShardTree<MemoryShardStore<MerkleHashOrchard, u32>, 32, 16>;
+
+struct WitnessState {
+    anchor_height: u32,
+    expected_by_position: BTreeMap<u32, MerkleHashOrchard>,
+    tree: OrchardShardTree,
+    leaf_count: u64,
+    error: Option<String>,
+}
+
+impl WitnessState {
+    fn new(anchor_height: u32, targets: Vec<WitnessTargetReq>) -> Result<Self, String> {
+        if targets.is_empty() {
+            return Err("targets_required".to_string());
+        }
+        if targets.len() > 1000 {
+            return Err("too_many_targets".to_string());
+        }
+
+        let mut expected_by_position = BTreeMap::new();
+        for t in targets {
+            let cmx = t.cmx_hex.trim();
+            if cmx.is_empty() {
+                return Err("invalid_cmx".to_string());
+            }
+            let leaf = parse_cmx_hex(cmx).map_err(|_| "invalid_cmx".to_string())?;
+            if expected_by_position.insert(t.position, leaf).is_some() {
+                return Err("invalid_request".to_string());
+            }
+        }
+
+        Ok(Self {
+            anchor_height,
+            expected_by_position,
+            tree: ShardTree::new(MemoryShardStore::empty(), 2),
+            leaf_count: 0,
+            error: None,
+        })
+    }
+
+    fn append(&mut self, cmx_hex: &str) {
+        if self.error.is_some() {
+            return;
+        }
+
+        let leaf = match parse_cmx_hex(cmx_hex) {
+            Ok(v) => v,
+            Err(_) => {
+                self.error = Some("invalid_cmx".to_string());
+                return;
+            }
+        };
+
+        if self.leaf_count > u64::from(u32::MAX) {
+            self.error = Some("tree_overflow".to_string());
+            return;
+        }
+        let pos_u32 = self.leaf_count as u32;
+
+        let mut retention = Retention::Ephemeral;
+        if let Some(expected) = self.expected_by_position.get(&pos_u32) {
+            if expected != &leaf {
+                self.error = Some("cmx_mismatch".to_string());
+                return;
+            }
+            retention = Retention::Marked;
+        }
+
+        if self.tree.append(leaf, retention).is_err() {
+            self.error = Some("tree_append_failed".to_string());
+            return;
+        }
+        self.leaf_count += 1;
+    }
+
+    fn insert_subtree_root(&mut self, root_hex: &str) {
+        if self.error.is_some() {
+            return;
+        }
+
+        const SUBTREE_LEAVES: u64 = 1 << 16;
+        if self.leaf_count % SUBTREE_LEAVES != 0 {
+            self.error = Some("subtree_unaligned".to_string());
+            return;
+        }
+        if self.leaf_count > u64::from(u32::MAX) {
+            self.error = Some("tree_overflow".to_string());
+            return;
+        }
+
+        let bytes = match hex::decode(root_hex) {
+            Ok(v) => v,
+            Err(_) => {
+                self.error = Some("invalid_subtree_root".to_string());
+                return;
+            }
+        };
+        let bytes: [u8; 32] = match bytes.try_into() {
+            Ok(v) => v,
+            Err(_) => {
+                self.error = Some("invalid_subtree_root".to_string());
+                return;
+            }
+        };
+        let root = match Option::from(MerkleHashOrchard::from_bytes(&bytes)) {
+            Some(v) => v,
+            None => {
+                self.error = Some("invalid_subtree_root".to_string());
+                return;
+            }
+        };
+
+        let pos = Position::from(self.leaf_count);
+        let addr = OrchardShardTree::subtree_addr(pos);
+        if self.tree.insert(addr, root).is_err() {
+            self.error = Some("subtree_insert_failed".to_string());
+            return;
+        }
+        self.leaf_count += SUBTREE_LEAVES;
+    }
+
+    fn finish(mut self) -> Result<(String, Vec<WitnessPathOut>, u64), String> {
+        if let Some(err) = self.error.take() {
+            return Err(err);
+        }
+
+        if !self
+            .tree
+            .checkpoint(self.anchor_height)
+            .map_err(|_| "checkpoint_failed".to_string())?
+        {
+            return Err("checkpoint_failed".to_string());
+        }
+
+        let root = self
+            .tree
+            .root_at_checkpoint_id(&self.anchor_height)
+            .map_err(|_| "tree_root_failed".to_string())?
+            .ok_or_else(|| "tree_root_failed".to_string())?;
+        let root_hex = hex::encode(root.to_bytes());
+
+        let mut out = Vec::with_capacity(self.expected_by_position.len());
+        for (pos_u32, expected_leaf) in &self.expected_by_position {
+            if u64::from(*pos_u32) >= self.leaf_count {
+                return Err("target_out_of_range".to_string());
+            }
+
+            let pos = Position::from(u64::from(*pos_u32));
+            let got_leaf = self
+                .tree
+                .get_marked_leaf(pos)
+                .map_err(|_| "witness_missing".to_string())?
+                .ok_or_else(|| "witness_missing".to_string())?;
+            if &got_leaf != expected_leaf {
+                return Err("cmx_mismatch".to_string());
+            }
+
+            let path = self
+                .tree
+                .witness_at_checkpoint_id(pos, &self.anchor_height)
+                .map_err(|_| "witness_missing".to_string())?
+                .ok_or_else(|| "witness_missing".to_string())?;
+
+            let mut elems = Vec::with_capacity(path.path_elems().len());
+            for h in path.path_elems() {
+                elems.push(hex::encode(h.to_bytes()));
+            }
+            out.push(WitnessPathOut {
+                position: *pos_u32,
+                auth_path: elems,
+            });
+        }
+
+        Ok((root_hex, out, self.leaf_count))
+    }
 }
 
 fn to_c_string<T: Serialize>(v: T) -> *mut c_char {
@@ -220,6 +434,20 @@ pub extern "C" fn juno_scan_orchard_witness_json(req_json: *const c_char) -> *mu
     }
 }
 
+#[no_mangle]
+pub extern "C" fn juno_scan_orchard_subtree_root_json(req_json: *const c_char) -> *mut c_char {
+    let res = std::panic::catch_unwind(|| orchard_subtree_root_json_inner(req_json));
+    match res {
+        Ok(Ok(v)) => to_c_string(v),
+        Ok(Err(e)) => to_c_string(SubtreeRootResponse::Err {
+            error: e.to_string(),
+        }),
+        Err(_) => to_c_string(SubtreeRootResponse::Err {
+            error: ScanError::Panic.to_string(),
+        }),
+    }
+}
+
 fn parse_orchard_fvk_from_ufvk(ufvk: &str) -> Result<FullViewingKey, ScanError> {
     let ufvk = ufvk.trim();
     if ufvk.is_empty() {
@@ -231,8 +459,7 @@ fn parse_orchard_fvk_from_ufvk(ufvk: &str) -> Result<FullViewingKey, ScanError> 
         return Err(ScanError::UFVKInvalid);
     }
 
-    let items =
-        zip316::decode_tlv_container(ufvk_hrp, ufvk).map_err(|_| ScanError::UFVKInvalid)?;
+    let items = zip316::decode_tlv_container(ufvk_hrp, ufvk).map_err(|_| ScanError::UFVKInvalid)?;
     let orchard_item = items
         .into_iter()
         .find(|(typecode, _)| *typecode == TYPECODE_ORCHARD)
@@ -260,7 +487,8 @@ fn validate_ufvk_json_inner(req_json: *const c_char) -> Result<ValidateUFVKRespo
     let s = unsafe { std::ffi::CStr::from_ptr(req_json) }
         .to_string_lossy()
         .to_string();
-    let req: ValidateUFVKRequest = serde_json::from_str(&s).map_err(|_| ScanError::ReqJSONInvalid)?;
+    let req: ValidateUFVKRequest =
+        serde_json::from_str(&s).map_err(|_| ScanError::ReqJSONInvalid)?;
 
     let _ = parse_orchard_fvk_from_ufvk(&req.ufvk)?;
     Ok(ValidateUFVKResponse::Ok)
@@ -521,6 +749,13 @@ fn orchard_witness_json_inner(req_json: *const c_char) -> Result<WitnessResponse
         .to_string();
     let req: WitnessRequest = serde_json::from_str(&s).map_err(|_| ScanError::ReqJSONInvalid)?;
 
+    if req.ops.is_some() || req.targets.is_some() || req.anchor_height.is_some() {
+        return orchard_witness_with_ops(req);
+    }
+    orchard_witness_legacy(req)
+}
+
+fn orchard_witness_legacy(req: WitnessRequest) -> Result<WitnessResponse, ScanError> {
     if req.positions.len() > 1000 {
         return Err(ScanError::InvalidRequest);
     }
@@ -593,6 +828,102 @@ fn orchard_witness_json_inner(req_json: *const c_char) -> Result<WitnessResponse
         root: root_hex,
         paths: out,
     })
+}
+
+fn orchard_witness_with_ops(req: WitnessRequest) -> Result<WitnessResponse, ScanError> {
+    let anchor_height = req.anchor_height.ok_or(ScanError::InvalidRequest)?;
+    let targets = req.targets.ok_or(ScanError::InvalidRequest)?;
+    let ops = req.ops.ok_or(ScanError::InvalidRequest)?;
+
+    let mut st = match WitnessState::new(anchor_height, targets) {
+        Ok(s) => s,
+        Err(err) => {
+            return Ok(WitnessResponse::Err { error: err });
+        }
+    };
+
+    for op in ops {
+        match op {
+            WitnessOpReq::AppendBatch { cmx_hex } => {
+                for cmx in cmx_hex {
+                    st.append(&cmx);
+                }
+            }
+            WitnessOpReq::InsertSubtreeRoots { subtree_roots } => {
+                for root in subtree_roots {
+                    st.insert_subtree_root(&root);
+                }
+            }
+        }
+    }
+
+    let (root, paths, _) = match st.finish() {
+        Ok(v) => v,
+        Err(err) => return Ok(WitnessResponse::Err { error: err }),
+    };
+
+    Ok(WitnessResponse::Ok { root, paths })
+}
+
+fn orchard_subtree_root_json_inner(
+    req_json: *const c_char,
+) -> Result<SubtreeRootResponse, ScanError> {
+    if req_json.is_null() {
+        return Err(ScanError::ReqJSONInvalid);
+    }
+
+    let s = unsafe { std::ffi::CStr::from_ptr(req_json) }
+        .to_string_lossy()
+        .to_string();
+    let req: SubtreeRootRequest =
+        serde_json::from_str(&s).map_err(|_| ScanError::ReqJSONInvalid)?;
+
+    match compute_subtree_root(&req.cmx_hex) {
+        Ok(root) => Ok(SubtreeRootResponse::Ok { root }),
+        Err(err) => Ok(SubtreeRootResponse::Err { error: err }),
+    }
+}
+
+fn parse_cmx_hex(cmx_hex: &str) -> Result<MerkleHashOrchard, ScanError> {
+    let bytes = parse_hex_32(cmx_hex).map_err(|_| ScanError::InvalidRequest)?;
+    let cmx_ct = ExtractedNoteCommitment::from_bytes(&bytes);
+    if bool::from(cmx_ct.is_none()) {
+        return Err(ScanError::InvalidRequest);
+    }
+    let cmx = cmx_ct.unwrap();
+    Ok(MerkleHashOrchard::from_cmx(&cmx))
+}
+
+fn compute_subtree_root(cmxs: &[String]) -> Result<String, String> {
+    const SUBTREE_LEAVES: usize = 1 << 16;
+    if cmxs.len() != SUBTREE_LEAVES {
+        return Err("invalid_subtree_leaf_count".to_string());
+    }
+
+    let mut level = Vec::with_capacity(SUBTREE_LEAVES);
+    for cmx in cmxs {
+        let leaf = parse_cmx_hex(cmx).map_err(|_| "invalid_cmx".to_string())?;
+        level.push(leaf);
+    }
+
+    for height in 0u8..16u8 {
+        if level.len() % 2 != 0 {
+            return Err("subtree_build_failed".to_string());
+        }
+        let mut next = Vec::with_capacity(level.len() / 2);
+        let mut idx = 0usize;
+        while idx < level.len() {
+            let left = level[idx];
+            let right = level[idx + 1];
+            next.push(MerkleHashOrchard::combine(height.into(), &left, &right));
+            idx += 2;
+        }
+        level = next;
+    }
+    if level.len() != 1 {
+        return Err("subtree_build_failed".to_string());
+    }
+    Ok(hex::encode(level[0].to_bytes()))
 }
 
 fn parse_hex_32(s: &str) -> Result<[u8; 32], ()> {

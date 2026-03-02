@@ -336,6 +336,9 @@ FROM outgoing_outputs
 		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM orchard_commitments WHERE height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback commitments: %w", err)
 		}
+		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM orchard_subtree_roots WHERE end_height > $1`, height); err != nil {
+			return fmt.Errorf("postgres: rollback subtree roots: %w", err)
+		}
 		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM notes WHERE height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback notes: %w", err)
 		}
@@ -1086,6 +1089,107 @@ func (s *Store) FirstOrchardCommitmentPositionFromHeight(ctx context.Context, he
 	return pos.Int64, true, nil
 }
 
+func (s *Store) OrchardTreeSizeAtHeight(ctx context.Context, height int64) (int64, error) {
+	var size int64
+	if err := s.pool.QueryRow(ctx, `
+SELECT COALESCE(MAX(position) + 1, 0)
+FROM orchard_commitments
+WHERE height <= $1
+`, height).Scan(&size); err != nil {
+		return 0, fmt.Errorf("postgres: orchard tree size: %w", err)
+	}
+	return size, nil
+}
+
+func (s *Store) ListOrchardCommitmentCMXByPositionRange(ctx context.Context, anchorHeight, startPos, endPos int64) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT cmx
+FROM orchard_commitments
+WHERE height <= $1 AND position >= $2 AND position < $3
+ORDER BY position
+`, anchorHeight, startPos, endPos)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list commitment cmx range: %w", err)
+	}
+	defer rows.Close()
+
+	capacity := 0
+	if endPos > startPos {
+		capacity = int(endPos - startPos)
+	}
+	out := make([]string, 0, capacity)
+	for rows.Next() {
+		var cmx string
+		if err := rows.Scan(&cmx); err != nil {
+			return nil, fmt.Errorf("postgres: list commitment cmx range: %w", err)
+		}
+		out = append(out, cmx)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list commitment cmx range: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) ListOrchardCommitmentsByPositionsUpToHeight(ctx context.Context, anchorHeight int64, positions []int64) ([]store.OrchardCommitment, error) {
+	if len(positions) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT position, height, txid, action_index, cmx
+FROM orchard_commitments
+WHERE height <= $1 AND position = ANY($2)
+ORDER BY position
+`, anchorHeight, positions)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list commitments by positions: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]store.OrchardCommitment, 0, len(positions))
+	for rows.Next() {
+		var c store.OrchardCommitment
+		if err := rows.Scan(&c.Position, &c.Height, &c.TxID, &c.ActionIndex, &c.CMX); err != nil {
+			return nil, fmt.Errorf("postgres: list commitments by positions: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list commitments by positions: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) ListOrchardSubtreeRootsByIndexRange(ctx context.Context, startIndex int64, limit int) ([]store.OrchardSubtreeRoot, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT subtree_index, end_position, end_height, end_block_hash, root
+FROM orchard_subtree_roots
+WHERE subtree_index >= $1
+ORDER BY subtree_index
+LIMIT $2
+`, startIndex, limit)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list subtree roots: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]store.OrchardSubtreeRoot, 0, limit)
+	for rows.Next() {
+		var r store.OrchardSubtreeRoot
+		if err := rows.Scan(&r.SubtreeIndex, &r.EndPosition, &r.EndHeight, &r.EndBlockHash, &r.Root); err != nil {
+			return nil, fmt.Errorf("postgres: list subtree roots: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list subtree roots: %w", err)
+	}
+	return out, nil
+}
+
 type pgTx struct {
 	tx pgx.Tx
 }
@@ -1132,6 +1236,53 @@ ON CONFLICT (position) DO NOTHING
 		return fmt.Errorf("postgres: insert commitment: %w", err)
 	}
 	return nil
+}
+
+func (t *pgTx) InsertOrchardSubtreeRoot(ctx context.Context, r store.OrchardSubtreeRoot) error {
+	_, err := t.tx.Exec(ctx, `
+INSERT INTO orchard_subtree_roots (subtree_index, end_position, end_height, end_block_hash, root)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (subtree_index)
+DO UPDATE SET
+  end_position = EXCLUDED.end_position,
+  end_height = EXCLUDED.end_height,
+  end_block_hash = EXCLUDED.end_block_hash,
+  root = EXCLUDED.root
+`, r.SubtreeIndex, r.EndPosition, r.EndHeight, r.EndBlockHash, r.Root)
+	if err != nil {
+		return fmt.Errorf("postgres: insert subtree root: %w", err)
+	}
+	return nil
+}
+
+func (t *pgTx) ListOrchardCommitmentCMXByPositionRange(ctx context.Context, startPos, endPos int64) ([]string, error) {
+	rows, err := t.tx.Query(ctx, `
+SELECT cmx
+FROM orchard_commitments
+WHERE position >= $1 AND position < $2
+ORDER BY position
+`, startPos, endPos)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list commitment cmx range tx: %w", err)
+	}
+	defer rows.Close()
+
+	capacity := 0
+	if endPos > startPos {
+		capacity = int(endPos - startPos)
+	}
+	out := make([]string, 0, capacity)
+	for rows.Next() {
+		var cmx string
+		if err := rows.Scan(&cmx); err != nil {
+			return nil, fmt.Errorf("postgres: list commitment cmx range tx: %w", err)
+		}
+		out = append(out, cmx)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list commitment cmx range tx: %w", err)
+	}
+	return out, nil
 }
 
 func (t *pgTx) MarkNotesSpent(ctx context.Context, height int64, txid string, nullifiers []string) ([]store.Note, error) {

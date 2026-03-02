@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -736,6 +737,9 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 
 	// Delete commitments above height and fix next position.
 	if err := rollbackCommitments(batch, s.db, uint64(height)); err != nil {
+		return err
+	}
+	if err := rollbackSubtreeRoots(batch, s.db, uint64(height)); err != nil {
 		return err
 	}
 
@@ -1759,6 +1763,164 @@ func (s *Store) FirstOrchardCommitmentPositionFromHeight(ctx context.Context, he
 	return 0, false, nil
 }
 
+func (s *Store) OrchardTreeSizeAtHeight(ctx context.Context, height int64) (int64, error) {
+	_ = ctx
+	if height < 0 {
+		return 0, nil
+	}
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: commitmentPrefix,
+		UpperBound: prefixUpperBound(commitmentPrefix),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("rocksdb: iter: %w", err)
+	}
+	defer iter.Close()
+
+	if !iter.Last() {
+		if errors.Is(iter.Error(), pebble.ErrNotFound) || iter.Error() == nil {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("rocksdb: orchard tree size: %w", iter.Error())
+	}
+
+	for iter.Valid() {
+		var rec commitmentRecord
+		if err := json.Unmarshal(iter.Value(), &rec); err != nil {
+			return 0, fmt.Errorf("rocksdb: decode commitment: %w", err)
+		}
+		if rec.Height <= height {
+			return int64(rec.Position) + 1, nil
+		}
+		iter.Prev()
+	}
+	if err := iter.Error(); err != nil {
+		return 0, fmt.Errorf("rocksdb: orchard tree size: %w", err)
+	}
+	return 0, nil
+}
+
+func (s *Store) ListOrchardCommitmentCMXByPositionRange(ctx context.Context, anchorHeight, startPos, endPos int64) ([]string, error) {
+	_ = ctx
+	if startPos >= endPos {
+		return nil, nil
+	}
+	if startPos < 0 {
+		startPos = 0
+	}
+
+	lower := keyCommitment(uint64(startPos))
+	upper := keyCommitment(uint64(endPos))
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("rocksdb: iter: %w", err)
+	}
+	defer iter.Close()
+
+	capacity := 0
+	if endPos > startPos {
+		capacity = int(endPos - startPos)
+	}
+	out := make([]string, 0, capacity)
+	for iter.First(); iter.Valid(); iter.Next() {
+		var rec commitmentRecord
+		if err := json.Unmarshal(iter.Value(), &rec); err != nil {
+			return nil, fmt.Errorf("rocksdb: decode commitment: %w", err)
+		}
+		if rec.Height > anchorHeight {
+			break
+		}
+		out = append(out, rec.CMX)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("rocksdb: list commitment cmx range: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) ListOrchardCommitmentsByPositionsUpToHeight(ctx context.Context, anchorHeight int64, positions []int64) ([]store.OrchardCommitment, error) {
+	_ = ctx
+	if len(positions) == 0 {
+		return nil, nil
+	}
+
+	out := make([]store.OrchardCommitment, 0, len(positions))
+	for _, pos := range positions {
+		if pos < 0 {
+			continue
+		}
+		v, closer, err := s.db.Get(keyCommitment(uint64(pos)))
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("rocksdb: get commitment: %w", err)
+		}
+		var rec commitmentRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			_ = closer.Close()
+			return nil, fmt.Errorf("rocksdb: decode commitment: %w", err)
+		}
+		_ = closer.Close()
+		if rec.Height > anchorHeight {
+			continue
+		}
+		out = append(out, store.OrchardCommitment{
+			Position:    int64(rec.Position),
+			Height:      rec.Height,
+			TxID:        rec.TxID,
+			ActionIndex: rec.ActionIndex,
+			CMX:         rec.CMX,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Position < out[j].Position })
+	return out, nil
+}
+
+func (s *Store) ListOrchardSubtreeRootsByIndexRange(ctx context.Context, startIndex int64, limit int) ([]store.OrchardSubtreeRoot, error) {
+	_ = ctx
+	if limit <= 0 {
+		return nil, nil
+	}
+	if startIndex < 0 {
+		startIndex = 0
+	}
+
+	lower := keySubtreeRoot(uint64(startIndex))
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: prefixUpperBound(subtreeRootPrefix),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("rocksdb: iter: %w", err)
+	}
+	defer iter.Close()
+
+	out := make([]store.OrchardSubtreeRoot, 0, limit)
+	for iter.First(); iter.Valid() && len(out) < limit; iter.Next() {
+		var rec subtreeRootRecord
+		if err := json.Unmarshal(iter.Value(), &rec); err != nil {
+			return nil, fmt.Errorf("rocksdb: decode subtree root: %w", err)
+		}
+		out = append(out, store.OrchardSubtreeRoot{
+			SubtreeIndex: int64(rec.SubtreeIndex),
+			EndPosition:  int64(rec.EndPosition),
+			EndHeight:    rec.EndHeight,
+			EndBlockHash: rec.EndBlockHash,
+			Root:         rec.Root,
+		})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("rocksdb: list subtree roots: %w", err)
+	}
+	return out, nil
+}
+
 type rocksTx struct {
 	db    *pebble.DB
 	batch *pebble.Batch
@@ -1901,6 +2063,71 @@ func (t *rocksTx) InsertOrchardCommitment(ctx context.Context, c store.OrchardCo
 		return fmt.Errorf("rocksdb: bump next_commitment_pos: %w", err)
 	}
 	return nil
+}
+
+func (t *rocksTx) InsertOrchardSubtreeRoot(ctx context.Context, r store.OrchardSubtreeRoot) error {
+	_ = ctx
+	if r.SubtreeIndex < 0 {
+		return errors.New("rocksdb: negative subtree index")
+	}
+	if r.EndPosition < 0 {
+		return errors.New("rocksdb: negative subtree end position")
+	}
+	if r.EndHeight < 0 {
+		return errors.New("rocksdb: negative subtree end height")
+	}
+
+	rec := subtreeRootRecord{
+		SubtreeIndex: uint64(r.SubtreeIndex),
+		EndPosition:  uint64(r.EndPosition),
+		EndHeight:    r.EndHeight,
+		EndBlockHash: r.EndBlockHash,
+		Root:         r.Root,
+	}
+	v, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("rocksdb: encode subtree root: %w", err)
+	}
+	if err := t.batch.Set(keySubtreeRoot(uint64(r.SubtreeIndex)), v, pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: insert subtree root: %w", err)
+	}
+	return nil
+}
+
+func (t *rocksTx) ListOrchardCommitmentCMXByPositionRange(ctx context.Context, startPos, endPos int64) ([]string, error) {
+	_ = ctx
+	if startPos >= endPos {
+		return nil, nil
+	}
+	if startPos < 0 {
+		startPos = 0
+	}
+
+	iter, err := t.batch.NewIter(&pebble.IterOptions{
+		LowerBound: keyCommitment(uint64(startPos)),
+		UpperBound: keyCommitment(uint64(endPos)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("rocksdb: iter: %w", err)
+	}
+	defer iter.Close()
+
+	capacity := 0
+	if endPos > startPos {
+		capacity = int(endPos - startPos)
+	}
+	out := make([]string, 0, capacity)
+	for iter.First(); iter.Valid(); iter.Next() {
+		var rec commitmentRecord
+		if err := json.Unmarshal(iter.Value(), &rec); err != nil {
+			return nil, fmt.Errorf("rocksdb: decode commitment: %w", err)
+		}
+		out = append(out, rec.CMX)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("rocksdb: list commitment cmx range tx: %w", err)
+	}
+	return out, nil
 }
 
 func (t *rocksTx) MarkNotesSpent(ctx context.Context, height int64, txid string, nullifiers []string) ([]store.Note, error) {
@@ -2670,6 +2897,14 @@ type commitmentRecord struct {
 	CMX         string `json:"cmx"`
 }
 
+type subtreeRootRecord struct {
+	SubtreeIndex uint64 `json:"subtree_index"`
+	EndPosition  uint64 `json:"end_position"`
+	EndHeight    int64  `json:"end_height"`
+	EndBlockHash string `json:"end_block_hash"`
+	Root         string `json:"root"`
+}
+
 type noteRecord struct {
 	WalletID                 string  `json:"wallet_id"`
 	TxID                     string  `json:"txid"`
@@ -2727,6 +2962,7 @@ var (
 	orchardActionPrefix            = []byte("oa/")
 	orchardActionHeightPrefix      = []byte("oah/")
 	commitmentPrefix               = []byte("oc/")
+	subtreeRootPrefix              = []byte("osr/")
 	notePrefix                     = []byte("n/")
 	noteHeightPrefix               = []byte("nh/")
 	walletNotePrefix               = []byte("nwh/")
@@ -2800,6 +3036,13 @@ func keyCommitment(position uint64) []byte {
 	b := make([]byte, 0, len(commitmentPrefix)+20)
 	b = append(b, commitmentPrefix...)
 	b = appendUint64Fixed20(b, position)
+	return b
+}
+
+func keySubtreeRoot(subtreeIndex uint64) []byte {
+	b := make([]byte, 0, len(subtreeRootPrefix)+20)
+	b = append(b, subtreeRootPrefix...)
+	b = appendUint64Fixed20(b, subtreeIndex)
 	return b
 }
 
@@ -3453,6 +3696,33 @@ func rollbackCommitments(batch *pebble.Batch, db *pebble.DB, height uint64) erro
 
 	if err := batch.Set(keyMeta("next_commitment_pos"), uint64To8(nextPos), pebble.NoSync); err != nil {
 		return fmt.Errorf("rocksdb: set next_commitment_pos: %w", err)
+	}
+	return nil
+}
+
+func rollbackSubtreeRoots(batch *pebble.Batch, db *pebble.DB, height uint64) error {
+	iter, err := db.NewIter(&pebble.IterOptions{
+		LowerBound: subtreeRootPrefix,
+		UpperBound: prefixUpperBound(subtreeRootPrefix),
+	})
+	if err != nil {
+		return fmt.Errorf("rocksdb: iter: %w", err)
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var rec subtreeRootRecord
+		if err := json.Unmarshal(iter.Value(), &rec); err != nil {
+			return fmt.Errorf("rocksdb: decode subtree root: %w", err)
+		}
+		if rec.EndHeight > int64(height) {
+			if err := batch.Delete(iter.Key(), pebble.NoSync); err != nil {
+				return fmt.Errorf("rocksdb: delete subtree root: %w", err)
+			}
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("rocksdb: subtree roots scan: %w", err)
 	}
 	return nil
 }

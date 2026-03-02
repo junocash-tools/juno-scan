@@ -26,7 +26,86 @@ func OrchardWitness(ctx context.Context, cmxHex []string, positions []uint32) (W
 		CMXHex:    cmxHex,
 		Positions: positions,
 	}
+	return callOrchardWitness(req)
+}
 
+type WitnessTarget struct {
+	Position uint32
+	CMXHex   string
+}
+
+type WitnessOperationType string
+
+const (
+	WitnessOpAppendBatch        WitnessOperationType = "append_batch"
+	WitnessOpInsertSubtreeRoots WitnessOperationType = "insert_subtree_roots"
+)
+
+type WitnessOperation struct {
+	Type         WitnessOperationType
+	CMXHex       []string
+	SubtreeRoots []string
+}
+
+func OrchardWitnessWithOps(ctx context.Context, anchorHeight uint32, targets []WitnessTarget, ops []WitnessOperation) (WitnessResult, error) {
+	_ = ctx // reserved for future (ffi call is synchronous)
+
+	req := witnessRequest{
+		AnchorHeight: &anchorHeight,
+		Targets:      make([]witnessTargetReq, 0, len(targets)),
+		Ops:          make([]witnessOperationReq, 0, len(ops)),
+	}
+	for _, t := range targets {
+		req.Targets = append(req.Targets, witnessTargetReq{
+			Position: t.Position,
+			CMXHex:   t.CMXHex,
+		})
+	}
+	for _, op := range ops {
+		req.Ops = append(req.Ops, witnessOperationReq{
+			Type:         string(op.Type),
+			CMXHex:       op.CMXHex,
+			SubtreeRoots: op.SubtreeRoots,
+		})
+	}
+	return callOrchardWitness(req)
+}
+
+func OrchardSubtreeRoot(ctx context.Context, cmxHex []string) (string, error) {
+	_ = ctx // reserved for future (ffi call is synchronous)
+
+	b, err := json.Marshal(subtreeRootRequest{CMXHex: cmxHex})
+	if err != nil {
+		return "", errors.New("orchardscan: marshal request")
+	}
+
+	raw, err := ffi.OrchardSubtreeRootJSON(string(b))
+	if err != nil {
+		return "", err
+	}
+
+	var resp subtreeRootResponse
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+		return "", errors.New("orchardscan: invalid response")
+	}
+
+	switch resp.Status {
+	case "ok":
+		if resp.Root == "" {
+			return "", errors.New("orchardscan: invalid response")
+		}
+		return resp.Root, nil
+	case "err":
+		if resp.Error == "" {
+			return "", errors.New("orchardscan: invalid response")
+		}
+		return "", &Error{Code: ErrorCode(resp.Error)}
+	default:
+		return "", errors.New("orchardscan: invalid response")
+	}
+}
+
+func callOrchardWitness(req witnessRequest) (WitnessResult, error) {
 	b, err := json.Marshal(req)
 	if err != nil {
 		return WitnessResult{}, errors.New("orchardscan: marshal request")
@@ -69,8 +148,26 @@ func OrchardWitness(ctx context.Context, cmxHex []string, positions []uint32) (W
 }
 
 type witnessRequest struct {
-	CMXHex    []string `json:"cmx_hex"`
-	Positions []uint32 `json:"positions"`
+	CMXHex       []string              `json:"cmx_hex,omitempty"`
+	Positions    []uint32              `json:"positions,omitempty"`
+	AnchorHeight *uint32               `json:"anchor_height,omitempty"`
+	Targets      []witnessTargetReq    `json:"targets,omitempty"`
+	Ops          []witnessOperationReq `json:"ops,omitempty"`
+}
+
+type witnessTargetReq struct {
+	Position uint32 `json:"position"`
+	CMXHex   string `json:"cmx_hex"`
+}
+
+type witnessOperationReq struct {
+	Type         string   `json:"type"`
+	CMXHex       []string `json:"cmx_hex,omitempty"`
+	SubtreeRoots []string `json:"subtree_roots,omitempty"`
+}
+
+type subtreeRootRequest struct {
+	CMXHex []string `json:"cmx_hex"`
 }
 
 type witnessResponse struct {
@@ -78,6 +175,12 @@ type witnessResponse struct {
 	Root   string            `json:"root,omitempty"`
 	Paths  []witnessPathResp `json:"paths,omitempty"`
 	Error  string            `json:"error,omitempty"`
+}
+
+type subtreeRootResponse struct {
+	Status string `json:"status"`
+	Root   string `json:"root,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 type witnessPathResp struct {

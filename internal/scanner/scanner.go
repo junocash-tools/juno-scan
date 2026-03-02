@@ -31,6 +31,24 @@ type Scanner struct {
 	mempoolTxExpiryHeightByTxID    map[string]*int64
 }
 
+const (
+	orchardSubtreeLeafCount       int64 = 1 << 16
+	orchardSubtreeRootChunkSize         = 2048
+	orchardSubtreeBackfillPerScan       = 2
+)
+
+type orchardSubtreeRootTx interface {
+	ListOrchardCommitmentCMXByPositionRange(ctx context.Context, startPos, endPos int64) ([]string, error)
+	InsertOrchardSubtreeRoot(ctx context.Context, r store.OrchardSubtreeRoot) error
+}
+
+type orchardSubtreeRootBackfillStore interface {
+	OrchardTreeSizeAtHeight(ctx context.Context, height int64) (int64, error)
+	ListOrchardCommitmentCMXByPositionRange(ctx context.Context, anchorHeight, startPos, endPos int64) ([]string, error)
+	ListOrchardCommitmentsByPositionsUpToHeight(ctx context.Context, anchorHeight int64, positions []int64) ([]store.OrchardCommitment, error)
+	ListOrchardSubtreeRootsByIndexRange(ctx context.Context, startIndex int64, limit int) ([]store.OrchardSubtreeRoot, error)
+}
+
 func New(st store.Store, rpc *sdkjunocashd.Client, uaHRP string, pollInterval time.Duration, confirmations int64, zmqHashBlockEndpoint string) (*Scanner, error) {
 	if st == nil {
 		return nil, errors.New("scanner: store is nil")
@@ -108,6 +126,9 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 			return fmt.Errorf("scanner: getblockcount: %w", err)
 		}
 		if nextHeight > chainHeight {
+			if err := s.backfillMissingSubtreeRoots(ctx, chainHeight, orchardSubtreeBackfillPerScan); err != nil {
+				return err
+			}
 			if err := s.updatePendingSpends(ctx, chainHeight); err != nil {
 				return err
 			}
@@ -501,6 +522,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 		if err != nil {
 			return err
 		}
+		subtreeTx, supportsSubtreeRoots := tx.(orchardSubtreeRootTx)
 
 		posByTxAction := make(map[string]map[uint32]int64)
 
@@ -543,6 +565,11 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 					CMX:         a.CMX,
 				}); err != nil {
 					return err
+				}
+				if supportsSubtreeRoots && nextPos > 0 && nextPos%orchardSubtreeLeafCount == 0 {
+					if err := persistCompletedSubtreeRoot(ctx, subtreeTx, blk, nextPos); err != nil {
+						return err
+					}
 				}
 			}
 
@@ -758,6 +785,135 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 
 		return nil
 	})
+}
+
+func persistCompletedSubtreeRoot(ctx context.Context, tx orchardSubtreeRootTx, blk blockVerbose2, nextPos int64) error {
+	subtreeIndex := (nextPos / orchardSubtreeLeafCount) - 1
+	if subtreeIndex < 0 {
+		return errors.New("scanner: negative subtree index")
+	}
+	startPos := subtreeIndex * orchardSubtreeLeafCount
+	endPos := startPos + orchardSubtreeLeafCount
+
+	cmxHex, err := tx.ListOrchardCommitmentCMXByPositionRange(ctx, startPos, endPos)
+	if err != nil {
+		return fmt.Errorf("scanner: list subtree cmx range: %w", err)
+	}
+	if int64(len(cmxHex)) != orchardSubtreeLeafCount {
+		return fmt.Errorf("scanner: incomplete subtree commitments index=%d count=%d", subtreeIndex, len(cmxHex))
+	}
+
+	rootHex, err := orchardscan.OrchardSubtreeRoot(ctx, cmxHex)
+	if err != nil {
+		return fmt.Errorf("scanner: compute subtree root: %w", err)
+	}
+
+	if err := tx.InsertOrchardSubtreeRoot(ctx, store.OrchardSubtreeRoot{
+		SubtreeIndex: subtreeIndex,
+		EndPosition:  endPos - 1,
+		EndHeight:    blk.Height,
+		EndBlockHash: blk.Hash,
+		Root:         rootHex,
+	}); err != nil {
+		return fmt.Errorf("scanner: insert subtree root: %w", err)
+	}
+	return nil
+}
+
+func (s *Scanner) backfillMissingSubtreeRoots(ctx context.Context, anchorHeight int64, maxSubtrees int) error {
+	if maxSubtrees <= 0 {
+		return nil
+	}
+	backfillStore, ok := s.st.(orchardSubtreeRootBackfillStore)
+	if !ok {
+		return nil
+	}
+
+	leafCount, err := backfillStore.OrchardTreeSizeAtHeight(ctx, anchorHeight)
+	if err != nil {
+		return fmt.Errorf("scanner: subtree backfill tree size: %w", err)
+	}
+	fullSubtrees := leafCount / orchardSubtreeLeafCount
+	if fullSubtrees <= 0 {
+		return nil
+	}
+
+	rootExists := make(map[int64]struct{})
+	for start := int64(0); start < fullSubtrees; start += orchardSubtreeRootChunkSize {
+		limit := int(fullSubtrees - start)
+		if limit > orchardSubtreeRootChunkSize {
+			limit = orchardSubtreeRootChunkSize
+		}
+		roots, err := backfillStore.ListOrchardSubtreeRootsByIndexRange(ctx, start, limit)
+		if err != nil {
+			return fmt.Errorf("scanner: subtree backfill list roots: %w", err)
+		}
+		for _, r := range roots {
+			if r.SubtreeIndex < 0 || r.SubtreeIndex >= fullSubtrees {
+				continue
+			}
+			rootExists[r.SubtreeIndex] = struct{}{}
+		}
+	}
+
+	inserted := 0
+	for subtreeIndex := int64(0); subtreeIndex < fullSubtrees && inserted < maxSubtrees; subtreeIndex++ {
+		if _, ok := rootExists[subtreeIndex]; ok {
+			continue
+		}
+
+		startPos := subtreeIndex * orchardSubtreeLeafCount
+		endPos := startPos + orchardSubtreeLeafCount
+
+		cmxHex, err := backfillStore.ListOrchardCommitmentCMXByPositionRange(ctx, anchorHeight, startPos, endPos)
+		if err != nil {
+			return fmt.Errorf("scanner: subtree backfill list cmx: %w", err)
+		}
+		if int64(len(cmxHex)) != orchardSubtreeLeafCount {
+			return fmt.Errorf("scanner: subtree backfill incomplete commitments index=%d count=%d", subtreeIndex, len(cmxHex))
+		}
+
+		rootHex, err := orchardscan.OrchardSubtreeRoot(ctx, cmxHex)
+		if err != nil {
+			return fmt.Errorf("scanner: subtree backfill compute root: %w", err)
+		}
+
+		endCommitment, err := backfillStore.ListOrchardCommitmentsByPositionsUpToHeight(ctx, anchorHeight, []int64{endPos - 1})
+		if err != nil {
+			return fmt.Errorf("scanner: subtree backfill lookup end commitment: %w", err)
+		}
+		if len(endCommitment) != 1 {
+			return fmt.Errorf("scanner: subtree backfill missing end commitment index=%d", subtreeIndex)
+		}
+		endHeight := endCommitment[0].Height
+
+		endBlockHash, ok, err := s.st.HashAtHeight(ctx, endHeight)
+		if err != nil {
+			return fmt.Errorf("scanner: subtree backfill lookup end block hash: %w", err)
+		}
+		if !ok {
+			return fmt.Errorf("scanner: subtree backfill missing end block hash height=%d", endHeight)
+		}
+
+		if err := s.st.WithTx(ctx, func(tx store.Tx) error {
+			subtreeTx, ok := tx.(orchardSubtreeRootTx)
+			if !ok {
+				return nil
+			}
+			return subtreeTx.InsertOrchardSubtreeRoot(ctx, store.OrchardSubtreeRoot{
+				SubtreeIndex: subtreeIndex,
+				EndPosition:  endPos - 1,
+				EndHeight:    endHeight,
+				EndBlockHash: endBlockHash,
+				Root:         rootHex,
+			})
+		}); err != nil {
+			return fmt.Errorf("scanner: subtree backfill insert root: %w", err)
+		}
+		inserted++
+	}
+
+	return nil
 }
 
 func (s *Scanner) confirmDepositConfirmations(ctx context.Context, tx store.Tx, scanHeight int64) error {

@@ -331,6 +331,9 @@ FROM outgoing_outputs
 		if _, err := mytx.tx.ExecContext(ctx, `DELETE FROM orchard_commitments WHERE height > ?`, height); err != nil {
 			return fmt.Errorf("mysql: rollback commitments: %w", err)
 		}
+		if _, err := mytx.tx.ExecContext(ctx, `DELETE FROM orchard_subtree_roots WHERE end_height > ?`, height); err != nil {
+			return fmt.Errorf("mysql: rollback subtree roots: %w", err)
+		}
 		if _, err := mytx.tx.ExecContext(ctx, `DELETE FROM notes WHERE height > ?`, height); err != nil {
 			return fmt.Errorf("mysql: rollback notes: %w", err)
 		}
@@ -1149,6 +1152,121 @@ func (s *Store) FirstOrchardCommitmentPositionFromHeight(ctx context.Context, he
 	return pos.Int64, true, nil
 }
 
+func (s *Store) OrchardTreeSizeAtHeight(ctx context.Context, height int64) (int64, error) {
+	var size int64
+	if err := s.db.QueryRowContext(ctx, `
+SELECT COALESCE(MAX(position) + 1, 0)
+FROM orchard_commitments
+WHERE height <= ?
+`, height).Scan(&size); err != nil {
+		return 0, fmt.Errorf("mysql: orchard tree size: %w", err)
+	}
+	return size, nil
+}
+
+func (s *Store) ListOrchardCommitmentCMXByPositionRange(ctx context.Context, anchorHeight, startPos, endPos int64) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT cmx
+FROM orchard_commitments
+WHERE height <= ? AND position >= ? AND position < ?
+ORDER BY position
+`, anchorHeight, startPos, endPos)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: list commitment cmx range: %w", err)
+	}
+	defer rows.Close()
+
+	capacity := 0
+	if endPos > startPos {
+		capacity = int(endPos - startPos)
+	}
+	out := make([]string, 0, capacity)
+	for rows.Next() {
+		var cmx string
+		if err := rows.Scan(&cmx); err != nil {
+			return nil, fmt.Errorf("mysql: list commitment cmx range: %w", err)
+		}
+		out = append(out, cmx)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql: list commitment cmx range: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) ListOrchardCommitmentsByPositionsUpToHeight(ctx context.Context, anchorHeight int64, positions []int64) ([]store.OrchardCommitment, error) {
+	if len(positions) == 0 {
+		return nil, nil
+	}
+	var b strings.Builder
+	b.WriteString(`
+SELECT position, height, txid, action_index, cmx
+FROM orchard_commitments
+WHERE height <= ? AND position IN (`)
+	for i := range positions {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("?")
+	}
+	b.WriteString(") ORDER BY position")
+
+	args := make([]any, 0, 1+len(positions))
+	args = append(args, anchorHeight)
+	for _, pos := range positions {
+		args = append(args, pos)
+	}
+
+	rows, err := s.db.QueryContext(ctx, b.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: list commitments by positions: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]store.OrchardCommitment, 0, len(positions))
+	for rows.Next() {
+		var c store.OrchardCommitment
+		if err := rows.Scan(&c.Position, &c.Height, &c.TxID, &c.ActionIndex, &c.CMX); err != nil {
+			return nil, fmt.Errorf("mysql: list commitments by positions: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql: list commitments by positions: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) ListOrchardSubtreeRootsByIndexRange(ctx context.Context, startIndex int64, limit int) ([]store.OrchardSubtreeRoot, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT subtree_index, end_position, end_height, end_block_hash, root
+FROM orchard_subtree_roots
+WHERE subtree_index >= ?
+ORDER BY subtree_index
+LIMIT ?
+`, startIndex, limit)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: list subtree roots: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]store.OrchardSubtreeRoot, 0, limit)
+	for rows.Next() {
+		var r store.OrchardSubtreeRoot
+		if err := rows.Scan(&r.SubtreeIndex, &r.EndPosition, &r.EndHeight, &r.EndBlockHash, &r.Root); err != nil {
+			return nil, fmt.Errorf("mysql: list subtree roots: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql: list subtree roots: %w", err)
+	}
+	return out, nil
+}
+
 type myTx struct {
 	tx *sql.Tx
 }
@@ -1192,6 +1310,52 @@ VALUES (?, ?, ?, ?, ?)
 		return fmt.Errorf("mysql: insert commitment: %w", err)
 	}
 	return nil
+}
+
+func (t *myTx) InsertOrchardSubtreeRoot(ctx context.Context, r store.OrchardSubtreeRoot) error {
+	_, err := t.tx.ExecContext(ctx, `
+INSERT INTO orchard_subtree_roots (subtree_index, end_position, end_height, end_block_hash, root)
+VALUES (?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  end_position = VALUES(end_position),
+  end_height = VALUES(end_height),
+  end_block_hash = VALUES(end_block_hash),
+  root = VALUES(root)
+`, r.SubtreeIndex, r.EndPosition, r.EndHeight, r.EndBlockHash, r.Root)
+	if err != nil {
+		return fmt.Errorf("mysql: insert subtree root: %w", err)
+	}
+	return nil
+}
+
+func (t *myTx) ListOrchardCommitmentCMXByPositionRange(ctx context.Context, startPos, endPos int64) ([]string, error) {
+	rows, err := t.tx.QueryContext(ctx, `
+SELECT cmx
+FROM orchard_commitments
+WHERE position >= ? AND position < ?
+ORDER BY position
+`, startPos, endPos)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: list commitment cmx range tx: %w", err)
+	}
+	defer rows.Close()
+
+	capacity := 0
+	if endPos > startPos {
+		capacity = int(endPos - startPos)
+	}
+	out := make([]string, 0, capacity)
+	for rows.Next() {
+		var cmx string
+		if err := rows.Scan(&cmx); err != nil {
+			return nil, fmt.Errorf("mysql: list commitment cmx range tx: %w", err)
+		}
+		out = append(out, cmx)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql: list commitment cmx range tx: %w", err)
+	}
+	return out, nil
 }
 
 func (t *myTx) MarkNotesSpent(ctx context.Context, height int64, txid string, nullifiers []string) ([]store.Note, error) {

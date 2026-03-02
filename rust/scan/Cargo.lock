@@ -610,6 +610,7 @@ dependencies = [
  "orchard",
  "serde",
  "serde_json",
+ "shardtree",
  "thiserror 2.0.17",
  "zcash_note_encryption",
  "zcash_primitives",
@@ -1082,6 +1083,18 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest 0.11.0-pre.9",
+]
+
+[[package]]
+name = "shardtree"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "359e552886ae54d1642091645980d83f7db465fd9b5b0248e3680713c1773388"
+dependencies = [
+ "bitflags",
+ "either",
+ "incrementalmerkletree",
+ "tracing",
 ]
 
 [[package]]

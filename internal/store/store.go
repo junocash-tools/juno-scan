@@ -95,6 +95,14 @@ type OrchardCommitment struct {
 	CMX         string
 }
 
+type OrchardSubtreeRoot struct {
+	SubtreeIndex int64
+	EndPosition  int64
+	EndHeight    int64
+	EndBlockHash string
+	Root         string
+}
+
 type Note struct {
 	WalletID                 string
 	TxID                     string

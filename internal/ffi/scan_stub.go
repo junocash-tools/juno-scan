@@ -19,3 +19,7 @@ func ValidateUFVKJSON(string) (string, error) {
 func OrchardWitnessJSON(string) (string, error) {
 	return "", errors.New("scan: cgo disabled")
 }
+
+func OrchardSubtreeRootJSON(string) (string, error) {
+	return "", errors.New("scan: cgo disabled")
+}
