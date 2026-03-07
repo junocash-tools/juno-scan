@@ -448,7 +448,7 @@ components:
       additionalProperties: true
     WalletNote:
       type: object
-      required: [txid, action_index, height, recipient_address, value_zat, note_nullifier, created_at]
+      required: [txid, action_index, height, recipient_address, value_zat, memo_hex, note_nullifier, created_at]
       properties:
         txid:
           type: string
@@ -466,6 +466,10 @@ components:
         value_zat:
           type: integer
           format: int64
+        memo_hex:
+          type: string
+          nullable: true
+          description: Hex-encoded 512-byte Orchard memo, or null when no memo is stored
         note_nullifier:
           type: string
         pending_spent_txid:

@@ -70,19 +70,7 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 
 	mustWaitHTTP(t, ctx, baseURL+"/v1/health")
 
-	// Add wallet via API.
-	body, _ := json.Marshal(map[string]any{
-		"wallet_id": "hot",
-		"ufvk":      ufvk,
-	})
-	resp, err := http.Post(baseURL+"/v1/wallets", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("POST /v1/wallets: %v", err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("POST /v1/wallets status=%d", resp.StatusCode)
-	}
+	mustUpsertWallet(t, baseURL, "hot", ufvk)
 
 	// Produce a shielded deposit to the wallet's unified address.
 	mustRun(t, jd.CLICommand(ctx, "generate", "101"))
@@ -165,6 +153,18 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 	if !foundSpent {
 		t.Fatalf("expected at least 1 spent note")
 	}
+
+	memoAddr, memoUFVK := mustCreateWalletAndUFVK(t, ctx, jd)
+	mustUpsertWallet(t, baseURL, "memo", memoUFVK)
+
+	opidMemo := mustSendManyWithMemo(t, ctx, jd, addr, memoAddr, "0.01", "00")
+	mustWaitOpSuccess(t, ctx, jd, opidMemo)
+	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
+
+	noteWithMemo := mustWaitForNoteWithMemoPrefixViaAPI(t, ctx, baseURL, "memo", false, "00")
+	if noteWithMemo.MemoHex == nil {
+		t.Fatalf("expected memo_hex on note")
+	}
 }
 
 func mustWaitHTTP(t *testing.T, ctx context.Context, url string) {
@@ -187,6 +187,23 @@ func mustWaitHTTP(t *testing.T, ctx context.Context, url string) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("timeout waiting for %s", url)
+}
+
+func mustUpsertWallet(t *testing.T, baseURL, walletID, ufvk string) {
+	t.Helper()
+
+	body, _ := json.Marshal(map[string]any{
+		"wallet_id": walletID,
+		"ufvk":      ufvk,
+	})
+	resp, err := http.Post(baseURL+"/v1/wallets", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1/wallets: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/wallets status=%d", resp.StatusCode)
+	}
 }
 
 func mustWaitForEventKind(t *testing.T, ctx context.Context, baseURL, walletID, kind string) {
@@ -362,10 +379,11 @@ func mustGetEvents(t *testing.T, ctx context.Context, baseURL, walletID string, 
 }
 
 type apiNote struct {
-	TxID        string `json:"txid"`
-	ActionIndex int32  `json:"action_index"`
-	Position    *int64 `json:"position,omitempty"`
-	SpentHeight *int64 `json:"spent_height,omitempty"`
+	TxID        string  `json:"txid"`
+	ActionIndex int32   `json:"action_index"`
+	Position    *int64  `json:"position,omitempty"`
+	MemoHex     *string `json:"memo_hex"`
+	SpentHeight *int64  `json:"spent_height,omitempty"`
 }
 
 func mustGetNotes(t *testing.T, ctx context.Context, baseURL, walletID string, spent bool) []apiNote {
@@ -388,6 +406,41 @@ func mustGetNotes(t *testing.T, ctx context.Context, baseURL, walletID string, s
 		t.Fatalf("decode notes: %v", err)
 	}
 	return out.Notes
+}
+
+func mustWaitForNoteWithMemoPrefixViaAPI(t *testing.T, ctx context.Context, baseURL, walletID string, spent bool, memoPrefix string) apiNote {
+	t.Helper()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	for time.Now().Before(deadline) {
+		url := fmt.Sprintf("%s/v1/wallets/%s/notes?spent=%t", baseURL, walletID, spent)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			var out struct {
+				Notes []apiNote `json:"notes"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&out)
+			_ = resp.Body.Close()
+
+			for _, n := range out.Notes {
+				if n.MemoHex != nil && strings.HasPrefix(*n.MemoHex, memoPrefix) {
+					return n
+				}
+			}
+		} else if resp != nil {
+			_ = resp.Body.Close()
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatalf("note with memo_prefix=%q not found via API", memoPrefix)
+	return apiNote{}
 }
 
 type witnessResponse struct {
@@ -520,6 +573,25 @@ func mustSendMany(t *testing.T, ctx context.Context, jd *testutil.RunningJunocas
 	t.Helper()
 
 	recipients := `[{"address":"` + toAddr + `","amount":` + amount + `}]`
+	out := mustRun(t, jd.CLICommand(ctx, "z_sendmany", fromAddr, recipients, "1"))
+
+	var resp struct {
+		OpID string `json:"opid"`
+	}
+	if err := json.Unmarshal(out, &resp); err == nil && resp.OpID != "" {
+		return resp.OpID
+	}
+	opid := strings.TrimSpace(string(out))
+	if opid == "" {
+		t.Fatalf("missing opid")
+	}
+	return opid
+}
+
+func mustSendManyWithMemo(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string, amount string, memoHex string) string {
+	t.Helper()
+
+	recipients := `[{"address":"` + toAddr + `","amount":` + amount + `,"memo":"` + memoHex + `"}]`
 	out := mustRun(t, jd.CLICommand(ctx, "z_sendmany", fromAddr, recipients, "1"))
 
 	var resp struct {

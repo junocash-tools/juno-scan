@@ -56,6 +56,7 @@ curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes?min_value_zat=
 
 Note: when a note’s nullifier is observed in the node mempool, the note will include `pending_spent_txid` / `pending_spent_at` and (when known) `pending_spent_expiry_height`.
 Pending spends are *sticky*: if a spend disappears from the mempool before it is mined, the note remains pending until the spend is mined or the chain height passes `pending_spent_expiry_height`.
+Each note object includes `memo_hex`; when no memo is stored it is returned as `null`.
 When additional pages exist, the notes response includes `next_cursor`; pass it back as `cursor` to continue.
 
 If you configured `-api-bearer-token`, include `-H 'Authorization: Bearer <token>'` in all requests.

@@ -473,6 +473,7 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 		Position            *int64     `json:"position,omitempty"`
 		Recipient           string     `json:"recipient_address"`
 		ValueZat            int64      `json:"value_zat"`
+		MemoHex             *string    `json:"memo_hex"`
 		NoteNullifier       string     `json:"note_nullifier"`
 		PendingTxID         *string    `json:"pending_spent_txid,omitempty"`
 		PendingAt           *time.Time `json:"pending_spent_at,omitempty"`
@@ -502,6 +503,7 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 			Position:            n.Position,
 			Recipient:           n.RecipientAddress,
 			ValueZat:            n.ValueZat,
+			MemoHex:             n.MemoHex,
 			NoteNullifier:       n.NoteNullifier,
 			PendingTxID:         n.PendingSpentTxID,
 			PendingAt:           n.PendingSpentAt,
