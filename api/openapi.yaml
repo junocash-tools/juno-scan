@@ -204,6 +204,7 @@ paths:
   /v1/wallets/{wallet_id}/notes:
     get:
       summary: List wallet notes
+      description: Returns incoming notes plus mined outgoing notes recovered via OVK. The `spent` filter applies to incoming notes only.
       parameters:
         - name: wallet_id
           in: path
@@ -215,7 +216,15 @@ paths:
           required: false
           schema:
             type: string
-            description: When set to true, include spent notes
+            description: When set to true, include spent incoming notes
+        - name: direction
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [incoming, outgoing, all]
+            default: all
+            description: Filter note direction; outgoing notes are mined-only
         - name: min_value_zat
           in: query
           required: false
@@ -448,8 +457,11 @@ components:
       additionalProperties: true
     WalletNote:
       type: object
-      required: [txid, action_index, height, recipient_address, value_zat, memo_hex, note_nullifier, created_at]
+      required: [direction, txid, action_index, height, recipient_address, value_zat, memo_hex, created_at]
       properties:
+        direction:
+          type: string
+          enum: [incoming, outgoing]
         txid:
           type: string
         action_index:
@@ -472,6 +484,16 @@ components:
           description: Hex-encoded 512-byte Orchard memo, or null when no memo is stored
         note_nullifier:
           type: string
+          nullable: true
+          description: Present for incoming notes; null for OVK-recovered outgoing notes
+        ovk_scope:
+          type: string
+          nullable: true
+          description: Present for outgoing notes recovered via OVK
+        recipient_scope:
+          type: string
+          nullable: true
+          description: Present when the outgoing recipient scope is known
         pending_spent_txid:
           type: string
         pending_spent_at:

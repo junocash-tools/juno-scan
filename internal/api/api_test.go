@@ -26,16 +26,31 @@ func TestIsSafeWalletID(t *testing.T) {
 }
 
 func TestParseNotesCursor(t *testing.T) {
-	valid := "123:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7"
-	cursor, err := parseNotesCursor(valid)
+	validLegacy := "123:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7"
+	cursor, err := parseNotesCursor(validLegacy)
 	if err != nil {
-		t.Fatalf("parseNotesCursor(valid): %v", err)
+		t.Fatalf("parseNotesCursor(validLegacy): %v", err)
 	}
 	if cursor == nil {
 		t.Fatalf("cursor=nil")
 	}
-	if got := encodeNotesCursor(*cursor); got != valid {
-		t.Fatalf("roundtrip=%q want %q", got, valid)
+	if cursor.Direction != noteDirectionIncoming {
+		t.Fatalf("direction=%q want incoming", cursor.Direction)
+	}
+	if got := encodeNotesCursor(*cursor); got != validLegacy+":incoming" {
+		t.Fatalf("roundtrip=%q want %q", got, validLegacy+":incoming")
+	}
+
+	validNew := validLegacy + ":outgoing"
+	cursor, err = parseNotesCursor(validNew)
+	if err != nil {
+		t.Fatalf("parseNotesCursor(validNew): %v", err)
+	}
+	if cursor == nil {
+		t.Fatalf("cursor=nil for validNew")
+	}
+	if got := encodeNotesCursor(*cursor); got != validNew {
+		t.Fatalf("roundtrip=%q want %q", got, validNew)
 	}
 
 	bad := []string{
@@ -43,6 +58,7 @@ func TestParseNotesCursor(t *testing.T) {
 		"1:zzz:0",
 		"-1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
 		"1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:-1",
+		"1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0:bad",
 	}
 	for _, in := range bad {
 		if _, err := parseNotesCursor(in); err == nil {

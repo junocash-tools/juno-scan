@@ -99,6 +99,7 @@ func TestScanner_DepositDetected_MySQL(t *testing.T) {
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	waitForEventKind(t, ctx, st, "hot", "SpendConfirmed")
 	waitForEventKind(t, ctx, st, "hot", "OutgoingOutputConfirmed")
+	waitForOutgoingOutputPageEntry(t, ctx, st, "hot", spendTxID, toAddr)
 
 	notesAll, err := st.ListWalletNotes(ctx, "hot", false, 1000)
 	if err != nil {

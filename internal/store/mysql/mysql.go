@@ -263,6 +263,7 @@ FROM notes
 				for rows.Next() {
 					var o store.OutgoingOutput
 					var minedHeight sql.NullInt64
+					var position sql.NullInt64
 					var confirmedHeight sql.NullInt64
 					var mempoolSeenAt sql.NullTime
 					var memo sql.NullString
@@ -272,6 +273,7 @@ FROM notes
 						&o.TxID,
 						&o.ActionIndex,
 						&minedHeight,
+						&position,
 						&confirmedHeight,
 						&mempoolSeenAt,
 						&o.RecipientAddress,
@@ -285,6 +287,9 @@ FROM notes
 					}
 					if minedHeight.Valid {
 						o.MinedHeight = &minedHeight.Int64
+					}
+					if position.Valid {
+						o.Position = &position.Int64
 					}
 					if confirmedHeight.Valid {
 						o.ConfirmedHeight = &confirmedHeight.Int64
@@ -308,7 +313,7 @@ FROM notes
 			}
 
 			outgoingBaseSelect := `
-SELECT wallet_id, txid, action_index, mined_height, confirmed_height, mempool_seen_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
+SELECT wallet_id, txid, action_index, mined_height, position, confirmed_height, mempool_seen_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
 FROM outgoing_outputs
 `
 
@@ -724,6 +729,24 @@ func sanitizeNotesQuery(query store.NotesQuery) store.NotesQuery {
 	return query
 }
 
+func sanitizeOutgoingOutputsQuery(query store.OutgoingOutputsQuery) store.OutgoingOutputsQuery {
+	if query.Limit <= 0 || query.Limit > 1000 {
+		query.Limit = 1000
+	}
+	if query.MinValueZat < 0 {
+		query.MinValueZat = 0
+	}
+	if query.Cursor != nil {
+		cursor := *query.Cursor
+		cursor.TxID = strings.ToLower(strings.TrimSpace(cursor.TxID))
+		query.Cursor = &cursor
+		if query.Cursor.TxID == "" {
+			query.Cursor = nil
+		}
+	}
+	return query
+}
+
 func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query store.NotesQuery) ([]store.Note, *store.NotesCursor, error) {
 	query = sanitizeNotesQuery(query)
 
@@ -844,6 +867,116 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 		Limit:       limit,
 	})
 	return notes, err
+}
+
+func (s *Store) ListWalletOutgoingOutputsPage(ctx context.Context, walletID string, query store.OutgoingOutputsQuery) ([]store.OutgoingOutput, *store.NotesCursor, error) {
+	query = sanitizeOutgoingOutputsQuery(query)
+
+	sb := strings.Builder{}
+	sb.WriteString(`
+	SELECT txid, action_index, mined_height, position, confirmed_height, mempool_seen_at, tx_expiry_height, expired_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
+	FROM outgoing_outputs
+	WHERE wallet_id = ? AND mined_height IS NOT NULL
+	`)
+	args := []any{walletID}
+	if query.MinValueZat > 0 {
+		sb.WriteString(" AND value_zat >= ?")
+		args = append(args, query.MinValueZat)
+	}
+	if query.Cursor != nil {
+		comp := ">"
+		if query.IncludeCursor {
+			comp = ">="
+		}
+		sb.WriteString(" AND (mined_height > ? OR (mined_height = ? AND (txid > ? OR (txid = ? AND action_index ")
+		sb.WriteString(comp)
+		sb.WriteString(" ?))))")
+		args = append(args, query.Cursor.Height, query.Cursor.Height, query.Cursor.TxID, query.Cursor.TxID, query.Cursor.ActionIndex)
+	}
+	sb.WriteString(" ORDER BY mined_height, txid, action_index LIMIT ?")
+	args = append(args, query.Limit+1)
+
+	rows, err := s.db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mysql: list outgoing outputs page: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]store.OutgoingOutput, 0, query.Limit+1)
+	for rows.Next() {
+		var o store.OutgoingOutput
+		var minedHeight sql.NullInt64
+		var position sql.NullInt64
+		var confirmedHeight sql.NullInt64
+		var mempoolSeenAt sql.NullTime
+		var txExpiryHeight sql.NullInt64
+		var expiredAt sql.NullTime
+		var memo sql.NullString
+		var recipientScope sql.NullString
+		o.WalletID = walletID
+		if err := rows.Scan(
+			&o.TxID,
+			&o.ActionIndex,
+			&minedHeight,
+			&position,
+			&confirmedHeight,
+			&mempoolSeenAt,
+			&txExpiryHeight,
+			&expiredAt,
+			&o.RecipientAddress,
+			&o.ValueZat,
+			&memo,
+			&o.OvkScope,
+			&recipientScope,
+			&o.CreatedAt,
+		); err != nil {
+			return nil, nil, fmt.Errorf("mysql: list outgoing outputs page: %w", err)
+		}
+		if minedHeight.Valid {
+			o.MinedHeight = &minedHeight.Int64
+		}
+		if position.Valid {
+			o.Position = &position.Int64
+		}
+		if confirmedHeight.Valid {
+			o.ConfirmedHeight = &confirmedHeight.Int64
+		}
+		if mempoolSeenAt.Valid {
+			t := mempoolSeenAt.Time.UTC()
+			o.MempoolSeenAt = &t
+		}
+		if txExpiryHeight.Valid {
+			o.TxExpiryHeight = &txExpiryHeight.Int64
+		}
+		if expiredAt.Valid {
+			tm := expiredAt.Time.UTC()
+			o.ExpiredAt = &tm
+		}
+		if memo.Valid {
+			o.MemoHex = &memo.String
+		}
+		if recipientScope.Valid {
+			o.RecipientScope = &recipientScope.String
+		}
+		out = append(out, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("mysql: list outgoing outputs page: %w", err)
+	}
+
+	if len(out) <= query.Limit {
+		return out, nil, nil
+	}
+	last := out[query.Limit-1]
+	if last.MinedHeight == nil {
+		return nil, nil, errors.New("mysql: outgoing output missing mined_height")
+	}
+	next := &store.NotesCursor{
+		Height:      *last.MinedHeight,
+		TxID:        last.TxID,
+		ActionIndex: last.ActionIndex,
+	}
+	return out[:query.Limit], next, nil
 }
 
 func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]store.PendingSpend, chainHeight int64, seenAt time.Time) error {
@@ -1046,7 +1179,7 @@ func (s *Store) ListOutgoingOutputsByTxID(ctx context.Context, walletID, txid st
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-	SELECT txid, action_index, mined_height, confirmed_height, mempool_seen_at, tx_expiry_height, expired_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
+	SELECT txid, action_index, mined_height, position, confirmed_height, mempool_seen_at, tx_expiry_height, expired_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
 	FROM outgoing_outputs
 	WHERE wallet_id = ? AND txid = ?
 	ORDER BY action_index
@@ -1060,6 +1193,7 @@ func (s *Store) ListOutgoingOutputsByTxID(ctx context.Context, walletID, txid st
 	for rows.Next() {
 		var o store.OutgoingOutput
 		var minedHeight sql.NullInt64
+		var position sql.NullInt64
 		var confirmedHeight sql.NullInt64
 		var mempoolSeenAt sql.NullTime
 		var txExpiryHeight sql.NullInt64
@@ -1071,6 +1205,7 @@ func (s *Store) ListOutgoingOutputsByTxID(ctx context.Context, walletID, txid st
 			&o.TxID,
 			&o.ActionIndex,
 			&minedHeight,
+			&position,
 			&confirmedHeight,
 			&mempoolSeenAt,
 			&txExpiryHeight,
@@ -1086,6 +1221,9 @@ func (s *Store) ListOutgoingOutputsByTxID(ctx context.Context, walletID, txid st
 		}
 		if minedHeight.Valid {
 			o.MinedHeight = &minedHeight.Int64
+		}
+		if position.Valid {
+			o.Position = &position.Int64
 		}
 		if confirmedHeight.Valid {
 			o.ConfirmedHeight = &confirmedHeight.Int64
@@ -1522,6 +1660,11 @@ func (t *myTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutput)
 		minedHeight = *o.MinedHeight
 	}
 
+	position := any(nil)
+	if o.Position != nil {
+		position = *o.Position
+	}
+
 	mempoolSeenAt := any(nil)
 	if o.MempoolSeenAt != nil && !o.MempoolSeenAt.IsZero() {
 		mempoolSeenAt = o.MempoolSeenAt.UTC()
@@ -1539,11 +1682,11 @@ func (t *myTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutput)
 
 	res, err := t.tx.ExecContext(ctx, `
 	INSERT IGNORE INTO outgoing_outputs (
-	  wallet_id, txid, action_index, mined_height, mempool_seen_at, tx_expiry_height,
+	  wallet_id, txid, action_index, mined_height, position, mempool_seen_at, tx_expiry_height,
 	  recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope
 	)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, o.WalletID, o.TxID, o.ActionIndex, minedHeight, mempoolSeenAt, txExpiryHeight, o.RecipientAddress, o.ValueZat, memoHex, o.OvkScope, recipientScope)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, o.WalletID, o.TxID, o.ActionIndex, minedHeight, position, mempoolSeenAt, txExpiryHeight, o.RecipientAddress, o.ValueZat, memoHex, o.OvkScope, recipientScope)
 	if err != nil {
 		return false, fmt.Errorf("mysql: insert outgoing output: %w", err)
 	}
@@ -1555,15 +1698,17 @@ func (t *myTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutput)
 	res, err = t.tx.ExecContext(ctx, `
 	UPDATE outgoing_outputs
 	SET mined_height = COALESCE(mined_height, ?),
+	    position = COALESCE(position, ?),
 	    mempool_seen_at = COALESCE(mempool_seen_at, ?),
 	    tx_expiry_height = COALESCE(tx_expiry_height, ?)
 	WHERE wallet_id = ? AND txid = ? AND action_index = ?
 	  AND (
 	    (mined_height IS NULL AND ? IS NOT NULL) OR
+	    (position IS NULL AND ? IS NOT NULL) OR
 	    (mempool_seen_at IS NULL AND ? IS NOT NULL) OR
 	    (tx_expiry_height IS NULL AND ? IS NOT NULL)
 	  )
-	`, minedHeight, mempoolSeenAt, txExpiryHeight, o.WalletID, o.TxID, o.ActionIndex, minedHeight, mempoolSeenAt, txExpiryHeight)
+	`, minedHeight, position, mempoolSeenAt, txExpiryHeight, o.WalletID, o.TxID, o.ActionIndex, minedHeight, position, mempoolSeenAt, txExpiryHeight)
 	if err != nil {
 		return false, fmt.Errorf("mysql: update outgoing output: %w", err)
 	}
@@ -1660,7 +1805,7 @@ WHERE confirmed_height IS NULL AND height <= ?
 
 func (t *myTx) ConfirmOutgoingOutputs(ctx context.Context, confirmationHeight int64, maxMinedHeight int64) ([]store.OutgoingOutput, error) {
 	rows, err := t.tx.QueryContext(ctx, `
-SELECT wallet_id, txid, action_index, mined_height, confirmed_height, mempool_seen_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
+SELECT wallet_id, txid, action_index, mined_height, position, confirmed_height, mempool_seen_at, recipient_address, value_zat, memo_hex, ovk_scope, recipient_scope, created_at
 FROM outgoing_outputs
 WHERE mined_height IS NOT NULL AND confirmed_height IS NULL AND mined_height <= ?
 ORDER BY mined_height, wallet_id, txid, action_index
@@ -1674,6 +1819,7 @@ ORDER BY mined_height, wallet_id, txid, action_index
 	for rows.Next() {
 		var o store.OutgoingOutput
 		var minedHeight sql.NullInt64
+		var position sql.NullInt64
 		var confirmedHeight sql.NullInt64
 		var mempoolSeenAt sql.NullTime
 		var memo sql.NullString
@@ -1683,6 +1829,7 @@ ORDER BY mined_height, wallet_id, txid, action_index
 			&o.TxID,
 			&o.ActionIndex,
 			&minedHeight,
+			&position,
 			&confirmedHeight,
 			&mempoolSeenAt,
 			&o.RecipientAddress,
@@ -1696,6 +1843,9 @@ ORDER BY mined_height, wallet_id, txid, action_index
 		}
 		if minedHeight.Valid {
 			o.MinedHeight = &minedHeight.Int64
+		}
+		if position.Valid {
+			o.Position = &position.Int64
 		}
 		if confirmedHeight.Valid {
 			o.ConfirmedHeight = &confirmedHeight.Int64

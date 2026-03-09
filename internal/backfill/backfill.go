@@ -188,6 +188,8 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 
 					for _, o := range outs {
 						heightCopy := height
+						pos := posByTxAction[t.TxID][o.ActionIndex]
+						posCopy := pos
 
 						var memoHexPtr *string
 						memoHex := strings.TrimSpace(o.MemoHex)
@@ -208,6 +210,7 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 							ActionIndex: int32(o.ActionIndex),
 
 							MinedHeight: &heightCopy,
+							Position:    &posCopy,
 
 							RecipientAddress: o.RecipientAddress,
 							ValueZat:         int64(o.ValueZat),
@@ -227,7 +230,7 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 							Version:  types.V1,
 							WalletID: o.WalletID,
 
-							TxID:  t.TxID,
+							TxID:   t.TxID,
 							Height: &heightCopy,
 
 							ActionIndex:    o.ActionIndex,
@@ -539,7 +542,7 @@ func confirmOutgoingOutputConfirmations(ctx context.Context, tx store.Tx, confir
 				Version:  types.V1,
 				WalletID: o.WalletID,
 
-				TxID:  o.TxID,
+				TxID:   o.TxID,
 				Height: &heightCopy,
 
 				ActionIndex:    uint32(o.ActionIndex),

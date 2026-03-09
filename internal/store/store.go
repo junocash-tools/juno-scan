@@ -26,6 +26,7 @@ type Store interface {
 	ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, filter EventFilter) (events []Event, nextCursor int64, err error)
 	ListWalletNotesPage(ctx context.Context, walletID string, query NotesQuery) (notes []Note, nextCursor *NotesCursor, err error)
 	ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]Note, error)
+	ListWalletOutgoingOutputsPage(ctx context.Context, walletID string, query OutgoingOutputsQuery) (outputs []OutgoingOutput, nextCursor *NotesCursor, err error)
 	UpdatePendingSpends(ctx context.Context, pending map[string]PendingSpend, chainHeight int64, seenAt time.Time) error
 	ListNotesByPendingSpentTxIDs(ctx context.Context, txids []string) ([]Note, error)
 	ListOrchardCommitmentsUpToHeight(ctx context.Context, height int64) ([]OrchardCommitment, error)
@@ -152,6 +153,13 @@ type NotesQuery struct {
 	Cursor      *NotesCursor
 }
 
+type OutgoingOutputsQuery struct {
+	MinValueZat   int64
+	Limit         int
+	Cursor        *NotesCursor
+	IncludeCursor bool
+}
+
 type OutgoingOutput struct {
 	WalletID string
 
@@ -159,6 +167,7 @@ type OutgoingOutput struct {
 	ActionIndex int32
 
 	MinedHeight     *int64
+	Position        *int64
 	ConfirmedHeight *int64
 	MempoolSeenAt   *time.Time
 	TxExpiryHeight  *int64

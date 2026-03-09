@@ -56,7 +56,7 @@ curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes?min_value_zat=
 
 Note: when a note’s nullifier is observed in the node mempool, the note will include `pending_spent_txid` / `pending_spent_at` and (when known) `pending_spent_expiry_height`.
 Pending spends are *sticky*: if a spend disappears from the mempool before it is mined, the note remains pending until the spend is mined or the chain height passes `pending_spent_expiry_height`.
-Each note object includes `memo_hex`; when no memo is stored it is returned as `null`.
+The notes endpoint returns incoming notes plus mined outgoing notes recovered via OVK. Each note object includes `direction` (`incoming` or `outgoing`) and `memo_hex`; when no memo is stored it is returned as `null`. Outgoing notes include `ovk_scope` / `recipient_scope` when available, and `spent` filtering applies only to incoming notes.
 When additional pages exist, the notes response includes `next_cursor`; pass it back as `cursor` to continue.
 
 If you configured `-api-bearer-token`, include `-H 'Authorization: Bearer <token>'` in all requests.
@@ -178,7 +178,7 @@ The broker message key is derived from `payload.txid` when present (falls back t
 - `POST /v1/wallets` → upsert wallet `{wallet_id, ufvk}`
 - `GET /v1/wallets/{wallet_id}/events?cursor=<id>&limit=<n>[&block_height=<h>][&kind=<k>][&txid=<txid>]` → wallet event stream (default limit: 100, max: 1000)
 - `POST /v1/wallets/{wallet_id}/backfill` → backfill wallet history (incremental)
-- `GET /v1/wallets/{wallet_id}/notes[?spent=true][&min_value_zat=<zat>][&limit=<n>][&cursor=<c>]` → paged note list (default: unspent-only, limit: 1000, max: 1000)
+- `GET /v1/wallets/{wallet_id}/notes[?spent=true][&direction=incoming|outgoing|all][&min_value_zat=<zat>][&limit=<n>][&cursor=<c>]` → paged incoming/outgoing note list (default direction: `all`; mined outgoing only; incoming notes are unspent-only by default; limit: 1000, max: 1000)
 - `POST /v1/orchard/witness` → compute Orchard witnesses for commitment positions
 
 HTTP API authentication (optional):

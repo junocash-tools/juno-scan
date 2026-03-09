@@ -172,6 +172,8 @@ func TestScanner_DepositDetected(t *testing.T) {
 		t.Fatalf("invalid confirmed_height=%d", outgoingConfirmedPayload.ConfirmedHeight)
 	}
 
+	waitForOutgoingOutputPageEntry(t, ctx, st, "hot", spendTxID, toAddr)
+
 	notesAll, err := st.ListWalletNotes(ctx, "hot", false, 1000)
 	if err != nil {
 		t.Fatalf("ListWalletNotes(all): %v", err)
@@ -667,6 +669,51 @@ func waitForOutgoingOutputEventState(t *testing.T, ctx context.Context, st store
 
 	t.Fatalf("OutgoingOutputEvent txid=%s state=%s not found", txid, wantState)
 	return store.Event{}
+}
+
+func waitForOutgoingOutputPageEntry(t *testing.T, ctx context.Context, st store.Store, walletID, txid, recipient string) store.OutgoingOutput {
+	t.Helper()
+
+	txid = strings.ToLower(strings.TrimSpace(txid))
+	recipient = strings.TrimSpace(recipient)
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	for time.Now().Before(deadline) {
+		outs, next, err := st.ListWalletOutgoingOutputsPage(ctx, walletID, store.OutgoingOutputsQuery{
+			Limit: 1000,
+		})
+		if err == nil {
+			if next != nil {
+				t.Fatalf("unexpected outgoing outputs pagination in test: next=%+v", next)
+			}
+			for _, o := range outs {
+				if strings.TrimSpace(o.TxID) != txid {
+					continue
+				}
+				if recipient != "" && strings.TrimSpace(o.RecipientAddress) != recipient {
+					continue
+				}
+				if o.MinedHeight == nil || *o.MinedHeight <= 0 {
+					t.Fatalf("expected mined outgoing output, got %+v", o)
+				}
+				if o.Position == nil || *o.Position < 0 {
+					t.Fatalf("expected outgoing output position, got %+v", o)
+				}
+				if strings.TrimSpace(o.OvkScope) == "" {
+					t.Fatalf("expected ovk_scope, got %+v", o)
+				}
+				return o
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	t.Fatalf("outgoing output txid=%s recipient=%s not found in wallet page", txid, recipient)
+	return store.OutgoingOutput{}
 }
 
 func mustTxIDFromPayload(t *testing.T, payload json.RawMessage) string {

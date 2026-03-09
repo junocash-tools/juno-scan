@@ -17,6 +17,34 @@ import (
 	"github.com/Abdullah1738/juno-scan/internal/store"
 )
 
+type noteDirection string
+
+const (
+	noteDirectionIncoming noteDirection = "incoming"
+	noteDirectionOutgoing noteDirection = "outgoing"
+	noteDirectionAll      noteDirection = "all"
+)
+
+type apiWalletNote struct {
+	Direction           noteDirection `json:"direction"`
+	TxID                string        `json:"txid"`
+	ActionIndex         int32         `json:"action_index"`
+	Height              int64         `json:"height"`
+	Position            *int64        `json:"position,omitempty"`
+	Recipient           string        `json:"recipient_address"`
+	ValueZat            int64         `json:"value_zat"`
+	MemoHex             *string       `json:"memo_hex"`
+	NoteNullifier       *string       `json:"note_nullifier"`
+	OvkScope            *string       `json:"ovk_scope,omitempty"`
+	RecipientScope      *string       `json:"recipient_scope,omitempty"`
+	PendingTxID         *string       `json:"pending_spent_txid,omitempty"`
+	PendingAt           *time.Time    `json:"pending_spent_at,omitempty"`
+	PendingExpiryHeight *int64        `json:"pending_spent_expiry_height,omitempty"`
+	SpentHeight         *int64        `json:"spent_height,omitempty"`
+	SpentTxID           *string       `json:"spent_txid,omitempty"`
+	CreatedAt           time.Time     `json:"created_at"`
+}
+
 type Server struct {
 	st store.Store
 	bf *backfill.Service
@@ -457,6 +485,17 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 		minValueZat = n
 	}
 
+	direction := noteDirectionAll
+	if v := strings.TrimSpace(r.URL.Query().Get("direction")); v != "" {
+		switch noteDirection(strings.ToLower(v)) {
+		case noteDirectionIncoming, noteDirectionOutgoing, noteDirectionAll:
+			direction = noteDirection(strings.ToLower(v))
+		default:
+			http.Error(w, "invalid direction", http.StatusBadRequest)
+			return
+		}
+	}
+
 	cursor, err := parseNotesCursor(strings.TrimSpace(r.URL.Query().Get("cursor")))
 	if err != nil {
 		http.Error(w, "invalid cursor", http.StatusBadRequest)
@@ -466,57 +505,118 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	type note struct {
-		TxID                string     `json:"txid"`
-		ActionIndex         int32      `json:"action_index"`
-		Height              int64      `json:"height"`
-		Position            *int64     `json:"position,omitempty"`
-		Recipient           string     `json:"recipient_address"`
-		ValueZat            int64      `json:"value_zat"`
-		MemoHex             *string    `json:"memo_hex"`
-		NoteNullifier       string     `json:"note_nullifier"`
-		PendingTxID         *string    `json:"pending_spent_txid,omitempty"`
-		PendingAt           *time.Time `json:"pending_spent_at,omitempty"`
-		PendingExpiryHeight *int64     `json:"pending_spent_expiry_height,omitempty"`
-		SpentHeight         *int64     `json:"spent_height,omitempty"`
-		SpentTxID           *string    `json:"spent_txid,omitempty"`
-		CreatedAt           time.Time  `json:"created_at"`
-	}
+	var (
+		incomingRows []store.Note
+		outgoingRows []store.OutgoingOutput
+		incomingMore *store.NotesCursor
+		outgoingMore *store.NotesCursor
+	)
 
-	ns, nextCursor, err := s.st.ListWalletNotesPage(ctx, walletID, store.NotesQuery{
-		OnlyUnspent: onlyUnspent,
-		MinValueZat: minValueZat,
-		Limit:       int(limit),
-		Cursor:      cursor,
-	})
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-
-	notes := make([]note, 0, len(ns))
-	for _, n := range ns {
-		notes = append(notes, note{
-			TxID:                n.TxID,
-			ActionIndex:         n.ActionIndex,
-			Height:              n.Height,
-			Position:            n.Position,
-			Recipient:           n.RecipientAddress,
-			ValueZat:            n.ValueZat,
-			MemoHex:             n.MemoHex,
-			NoteNullifier:       n.NoteNullifier,
-			PendingTxID:         n.PendingSpentTxID,
-			PendingAt:           n.PendingSpentAt,
-			PendingExpiryHeight: n.PendingSpentExpiryHeight,
-			SpentHeight:         n.SpentHeight,
-			SpentTxID:           n.SpentTxID,
-			CreatedAt:           n.CreatedAt,
+	if direction != noteDirectionOutgoing {
+		incomingRows, incomingMore, err = s.st.ListWalletNotesPage(ctx, walletID, store.NotesQuery{
+			OnlyUnspent: onlyUnspent,
+			MinValueZat: minValueZat,
+			Limit:       int(limit),
+			Cursor:      notesCursorTriple(cursor),
 		})
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
 	}
+
+	if direction != noteDirectionIncoming {
+		outgoingRows, outgoingMore, err = s.st.ListWalletOutgoingOutputsPage(ctx, walletID, store.OutgoingOutputsQuery{
+			MinValueZat:   minValueZat,
+			Limit:         int(limit),
+			Cursor:        notesCursorTriple(cursor),
+			IncludeCursor: cursor != nil && cursor.Direction == noteDirectionIncoming,
+		})
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	notes := make([]apiWalletNote, 0, limit)
+	inIdx := 0
+	outIdx := 0
+	for len(notes) < int(limit) {
+		var next apiWalletNote
+		hasNext := false
+
+		if inIdx < len(incomingRows) {
+			n := incomingRows[inIdx]
+			noteNullifier := n.NoteNullifier
+			next = apiWalletNote{
+				Direction:           noteDirectionIncoming,
+				TxID:                n.TxID,
+				ActionIndex:         n.ActionIndex,
+				Height:              n.Height,
+				Position:            n.Position,
+				Recipient:           n.RecipientAddress,
+				ValueZat:            n.ValueZat,
+				MemoHex:             n.MemoHex,
+				NoteNullifier:       &noteNullifier,
+				PendingTxID:         n.PendingSpentTxID,
+				PendingAt:           n.PendingSpentAt,
+				PendingExpiryHeight: n.PendingSpentExpiryHeight,
+				SpentHeight:         n.SpentHeight,
+				SpentTxID:           n.SpentTxID,
+				CreatedAt:           n.CreatedAt,
+			}
+			hasNext = true
+		}
+
+		if outIdx < len(outgoingRows) {
+			o := outgoingRows[outIdx]
+			if o.MinedHeight == nil {
+				http.Error(w, "db error", http.StatusInternalServerError)
+				return
+			}
+			ovkScope := o.OvkScope
+			candidate := apiWalletNote{
+				Direction:      noteDirectionOutgoing,
+				TxID:           o.TxID,
+				ActionIndex:    o.ActionIndex,
+				Height:         *o.MinedHeight,
+				Position:       o.Position,
+				Recipient:      o.RecipientAddress,
+				ValueZat:       o.ValueZat,
+				MemoHex:        o.MemoHex,
+				OvkScope:       &ovkScope,
+				RecipientScope: o.RecipientScope,
+				CreatedAt:      o.CreatedAt,
+			}
+			if !hasNext || compareAPINotes(candidate, next) < 0 {
+				next = candidate
+				hasNext = true
+				outIdx++
+			} else {
+				inIdx++
+			}
+		} else if hasNext {
+			inIdx++
+		}
+
+		if !hasNext {
+			break
+		}
+
+		notes = append(notes, next)
+	}
+
+	hasMore := inIdx < len(incomingRows) || outIdx < len(outgoingRows) || incomingMore != nil || outgoingMore != nil
 
 	resp := map[string]any{"notes": notes}
-	if nextCursor != nil {
-		resp["next_cursor"] = encodeNotesCursor(*nextCursor)
+	if hasMore && len(notes) > 0 {
+		last := notes[len(notes)-1]
+		resp["next_cursor"] = encodeNotesCursor(notesCursor{
+			Height:      last.Height,
+			TxID:        last.TxID,
+			ActionIndex: last.ActionIndex,
+			Direction:   last.Direction,
+		})
 	}
 	writeJSON(w, resp)
 }
@@ -615,18 +715,25 @@ func parseInt64Query(r *http.Request, key string, def int64) int64 {
 	return n
 }
 
-func encodeNotesCursor(cursor store.NotesCursor) string {
-	txid := strings.ToLower(strings.TrimSpace(cursor.TxID))
-	return strconv.FormatInt(cursor.Height, 10) + ":" + txid + ":" + strconv.FormatInt(int64(cursor.ActionIndex), 10)
+type notesCursor struct {
+	Height      int64
+	TxID        string
+	ActionIndex int32
+	Direction   noteDirection
 }
 
-func parseNotesCursor(raw string) (*store.NotesCursor, error) {
+func encodeNotesCursor(cursor notesCursor) string {
+	txid := strings.ToLower(strings.TrimSpace(cursor.TxID))
+	return strconv.FormatInt(cursor.Height, 10) + ":" + txid + ":" + strconv.FormatInt(int64(cursor.ActionIndex), 10) + ":" + string(cursor.Direction)
+}
+
+func parseNotesCursor(raw string) (*notesCursor, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, nil
 	}
 	parts := strings.Split(raw, ":")
-	if len(parts) != 3 {
+	if len(parts) != 3 && len(parts) != 4 {
 		return nil, errors.New("invalid cursor")
 	}
 	height, err := strconv.ParseInt(parts[0], 10, 64)
@@ -641,11 +748,77 @@ func parseNotesCursor(raw string) (*store.NotesCursor, error) {
 	if err != nil || actionIndex < 0 {
 		return nil, errors.New("invalid cursor")
 	}
-	return &store.NotesCursor{
+	direction := noteDirectionIncoming
+	if len(parts) == 4 {
+		switch noteDirection(strings.ToLower(strings.TrimSpace(parts[3]))) {
+		case noteDirectionIncoming, noteDirectionOutgoing:
+			direction = noteDirection(strings.ToLower(strings.TrimSpace(parts[3])))
+		default:
+			return nil, errors.New("invalid cursor")
+		}
+	}
+	return &notesCursor{
 		Height:      height,
 		TxID:        txid,
 		ActionIndex: int32(actionIndex),
+		Direction:   direction,
 	}, nil
+}
+
+func notesCursorTriple(cursor *notesCursor) *store.NotesCursor {
+	if cursor == nil {
+		return nil
+	}
+	return &store.NotesCursor{
+		Height:      cursor.Height,
+		TxID:        cursor.TxID,
+		ActionIndex: cursor.ActionIndex,
+	}
+}
+
+func compareAPINotes(a, b apiWalletNote) int {
+	if a.Height != b.Height {
+		if a.Height < b.Height {
+			return -1
+		}
+		return 1
+	}
+	if a.TxID != b.TxID {
+		if a.TxID < b.TxID {
+			return -1
+		}
+		return 1
+	}
+	if a.ActionIndex != b.ActionIndex {
+		if a.ActionIndex < b.ActionIndex {
+			return -1
+		}
+		return 1
+	}
+	return compareNoteDirections(a.Direction, b.Direction)
+}
+
+func compareNoteDirections(a, b noteDirection) int {
+	rank := func(v noteDirection) int {
+		switch v {
+		case noteDirectionIncoming:
+			return 0
+		case noteDirectionOutgoing:
+			return 1
+		default:
+			return 2
+		}
+	}
+	ra := rank(a)
+	rb := rank(b)
+	switch {
+	case ra < rb:
+		return -1
+	case ra > rb:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func isSafeWalletID(s string) bool {

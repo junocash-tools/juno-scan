@@ -55,10 +55,18 @@ func (s *Store) Migrate(ctx context.Context) error {
 	defer s.mu.Unlock()
 
 	verKey := keyMeta("schema_version")
-	_, closer, err := s.db.Get(verKey)
+	v, closer, err := s.db.Get(verKey)
 	if err == nil {
+		version := string(v)
 		_ = closer.Close()
-		return nil
+		switch version {
+		case "2":
+			return nil
+		case "1":
+			return s.migrateV1ToV2(verKey)
+		default:
+			return fmt.Errorf("rocksdb: unsupported schema_version %q", version)
+		}
 	}
 	if !errors.Is(err, pebble.ErrNotFound) {
 		return fmt.Errorf("rocksdb: schema_version: %w", err)
@@ -66,11 +74,49 @@ func (s *Store) Migrate(ctx context.Context) error {
 
 	b := s.db.NewBatch()
 	defer b.Close()
-	if err := b.Set(verKey, []byte("1"), pebble.NoSync); err != nil {
+	if err := b.Set(verKey, []byte("2"), pebble.NoSync); err != nil {
 		return fmt.Errorf("rocksdb: set schema_version: %w", err)
 	}
 	if err := b.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("rocksdb: migrate commit: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrateV1ToV2(verKey []byte) error {
+	b := s.db.NewBatch()
+	defer b.Close()
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: outgoingOutputPrefix,
+		UpperBound: prefixUpperBound(outgoingOutputPrefix),
+	})
+	if err != nil {
+		return fmt.Errorf("rocksdb: migrate v2 iter: %w", err)
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var rec outgoingOutputRecord
+		if err := json.Unmarshal(iter.Value(), &rec); err != nil {
+			return fmt.Errorf("rocksdb: migrate v2 decode outgoing output: %w", err)
+		}
+		if rec.MinedHeight == nil {
+			continue
+		}
+		if err := b.Set(keyWalletOutgoingMinedIndex(rec.WalletID, uint64(*rec.MinedHeight), rec.TxID, rec.ActionIndex), nil, pebble.NoSync); err != nil {
+			return fmt.Errorf("rocksdb: migrate v2 wallet outgoing index: %w", err)
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("rocksdb: migrate v2 iter: %w", err)
+	}
+
+	if err := b.Set(verKey, []byte("2"), pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: migrate v2 version: %w", err)
+	}
+	if err := b.Commit(pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: migrate v2 commit: %w", err)
 	}
 	return nil
 }
@@ -325,6 +371,11 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 			t := time.Unix(*rec.MempoolSeenUnix, 0).UTC()
 			mempoolSeenAt = &t
 		}
+		var posPtr *int64
+		if rec.Position != nil {
+			p := int64(*rec.Position)
+			posPtr = &p
+		}
 		var expiredAt *time.Time
 		if rec.ExpiredAtUnix != nil {
 			t := time.Unix(*rec.ExpiredAtUnix, 0).UTC()
@@ -335,6 +386,7 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 			TxID:             rec.TxID,
 			ActionIndex:      rec.ActionIndex,
 			MinedHeight:      rec.MinedHeight,
+			Position:         posPtr,
 			ConfirmedHeight:  rec.ConfirmedHeight,
 			MempoolSeenAt:    mempoolSeenAt,
 			TxExpiryHeight:   rec.TxExpiryHeight,
@@ -1228,6 +1280,24 @@ func sanitizeNotesQuery(query store.NotesQuery) store.NotesQuery {
 	return query
 }
 
+func sanitizeOutgoingOutputsQuery(query store.OutgoingOutputsQuery) store.OutgoingOutputsQuery {
+	if query.Limit <= 0 || query.Limit > 1000 {
+		query.Limit = 1000
+	}
+	if query.MinValueZat < 0 {
+		query.MinValueZat = 0
+	}
+	if query.Cursor != nil {
+		cursor := *query.Cursor
+		cursor.TxID = strings.ToLower(strings.TrimSpace(cursor.TxID))
+		query.Cursor = &cursor
+		if query.Cursor.TxID == "" {
+			query.Cursor = nil
+		}
+	}
+	return query
+}
+
 func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query store.NotesQuery) ([]store.Note, *store.NotesCursor, error) {
 	_ = ctx
 	query = sanitizeNotesQuery(query)
@@ -1335,6 +1405,124 @@ func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspen
 		Limit:       limit,
 	})
 	return notes, err
+}
+
+func (s *Store) ListWalletOutgoingOutputsPage(ctx context.Context, walletID string, query store.OutgoingOutputsQuery) ([]store.OutgoingOutput, *store.NotesCursor, error) {
+	_ = ctx
+	query = sanitizeOutgoingOutputsQuery(query)
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: keyWalletOutgoingMinedIndexMin(walletID),
+		UpperBound: prefixUpperBound(keyWalletOutgoingMinedPrefix(walletID)),
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("rocksdb: iter outgoing outputs page: %w", err)
+	}
+	defer iter.Close()
+
+	if query.Cursor == nil {
+		iter.First()
+	} else {
+		cursorKey := keyWalletOutgoingMinedIndex(walletID, uint64(query.Cursor.Height), query.Cursor.TxID, query.Cursor.ActionIndex)
+		iter.SeekGE(cursorKey)
+		if iter.Valid() && bytes.Equal(iter.Key(), cursorKey) && !query.IncludeCursor {
+			iter.Next()
+		}
+	}
+
+	out := make([]store.OutgoingOutput, 0, query.Limit+1)
+	for ; iter.Valid(); iter.Next() {
+		height, txid, actionIndex, err := parseWalletOutgoingMinedIndexKey(iter.Key(), walletID)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		ooKey := keyOutgoingOutput(walletID, txid, actionIndex)
+		v, closer, err := s.db.Get(ooKey)
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue
+			}
+			return nil, nil, fmt.Errorf("rocksdb: get outgoing output: %w", err)
+		}
+		var rec outgoingOutputRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			_ = closer.Close()
+			return nil, nil, fmt.Errorf("rocksdb: decode outgoing output: %w", err)
+		}
+		_ = closer.Close()
+
+		if query.MinValueZat > 0 && rec.ValueZat < query.MinValueZat {
+			continue
+		}
+
+		var minedHeight *int64
+		h := height
+		minedHeight = &h
+		var posPtr *int64
+		if rec.Position != nil {
+			p := int64(*rec.Position)
+			posPtr = &p
+		}
+		var confirmedHeight *int64
+		if rec.ConfirmedHeight != nil {
+			c := *rec.ConfirmedHeight
+			confirmedHeight = &c
+		}
+		var mempoolSeenAt *time.Time
+		if rec.MempoolSeenUnix != nil {
+			t := time.Unix(*rec.MempoolSeenUnix, 0).UTC()
+			mempoolSeenAt = &t
+		}
+		var txExpiryHeight *int64
+		if rec.TxExpiryHeight != nil {
+			eh := *rec.TxExpiryHeight
+			txExpiryHeight = &eh
+		}
+		var expiredAt *time.Time
+		if rec.ExpiredAtUnix != nil {
+			tm := time.Unix(*rec.ExpiredAtUnix, 0).UTC()
+			expiredAt = &tm
+		}
+
+		out = append(out, store.OutgoingOutput{
+			WalletID:         walletID,
+			TxID:             rec.TxID,
+			ActionIndex:      rec.ActionIndex,
+			MinedHeight:      minedHeight,
+			Position:         posPtr,
+			ConfirmedHeight:  confirmedHeight,
+			MempoolSeenAt:    mempoolSeenAt,
+			TxExpiryHeight:   txExpiryHeight,
+			ExpiredAt:        expiredAt,
+			RecipientAddress: rec.RecipientAddress,
+			ValueZat:         rec.ValueZat,
+			MemoHex:          rec.MemoHex,
+			OvkScope:         rec.OvkScope,
+			RecipientScope:   rec.RecipientScope,
+			CreatedAt:        time.Unix(rec.CreatedAtUnix, 0).UTC(),
+		})
+		if len(out) >= query.Limit+1 {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, nil, fmt.Errorf("rocksdb: list outgoing outputs page: %w", err)
+	}
+
+	if len(out) <= query.Limit {
+		return out, nil, nil
+	}
+	last := out[query.Limit-1]
+	if last.MinedHeight == nil {
+		return nil, nil, errors.New("rocksdb: outgoing output missing mined_height")
+	}
+	next := &store.NotesCursor{
+		Height:      *last.MinedHeight,
+		TxID:        last.TxID,
+		ActionIndex: last.ActionIndex,
+	}
+	return out[:query.Limit], next, nil
 }
 
 func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]store.PendingSpend, chainHeight int64, seenAt time.Time) error {
@@ -1652,6 +1840,11 @@ func (s *Store) ListOutgoingOutputsByTxID(ctx context.Context, walletID, txid st
 			h := *rec.MinedHeight
 			minedHeight = &h
 		}
+		var posPtr *int64
+		if rec.Position != nil {
+			p := int64(*rec.Position)
+			posPtr = &p
+		}
 		var confirmedHeight *int64
 		if rec.ConfirmedHeight != nil {
 			h := *rec.ConfirmedHeight
@@ -1677,6 +1870,7 @@ func (s *Store) ListOutgoingOutputsByTxID(ctx context.Context, walletID, txid st
 			TxID:             rec.TxID,
 			ActionIndex:      rec.ActionIndex,
 			MinedHeight:      minedHeight,
+			Position:         posPtr,
 			ConfirmedHeight:  confirmedHeight,
 			MempoolSeenAt:    mempoolSeenAt,
 			TxExpiryHeight:   txExpiryHeight,
@@ -2749,6 +2943,14 @@ func (t *rocksTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutp
 			if err := t.batch.Set(keyOutgoingMinedHeightIndex(uint64(h), o.WalletID, o.TxID, o.ActionIndex), nil, pebble.NoSync); err != nil {
 				return false, fmt.Errorf("rocksdb: insert outgoing mined height index: %w", err)
 			}
+			if err := t.batch.Set(keyWalletOutgoingMinedIndex(o.WalletID, uint64(h), o.TxID, o.ActionIndex), nil, pebble.NoSync); err != nil {
+				return false, fmt.Errorf("rocksdb: insert wallet outgoing mined index: %w", err)
+			}
+			changed = true
+		}
+		if rec.Position == nil && o.Position != nil {
+			p := uint64(*o.Position)
+			rec.Position = &p
 			changed = true
 		}
 		if rec.MempoolSeenUnix == nil && o.MempoolSeenAt != nil && !o.MempoolSeenAt.IsZero() {
@@ -2796,6 +2998,10 @@ func (t *rocksTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutp
 		u := o.MempoolSeenAt.UTC().Unix()
 		rec.MempoolSeenUnix = &u
 	}
+	if o.Position != nil {
+		p := uint64(*o.Position)
+		rec.Position = &p
+	}
 	if o.TxExpiryHeight != nil {
 		h := *o.TxExpiryHeight
 		rec.TxExpiryHeight = &h
@@ -2815,6 +3021,9 @@ func (t *rocksTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutp
 	if o.MinedHeight != nil {
 		if err := t.batch.Set(keyOutgoingMinedHeightIndex(uint64(*o.MinedHeight), o.WalletID, o.TxID, o.ActionIndex), nil, pebble.NoSync); err != nil {
 			return false, fmt.Errorf("rocksdb: insert outgoing mined height index: %w", err)
+		}
+		if err := t.batch.Set(keyWalletOutgoingMinedIndex(o.WalletID, uint64(*o.MinedHeight), o.TxID, o.ActionIndex), nil, pebble.NoSync); err != nil {
+			return false, fmt.Errorf("rocksdb: insert wallet outgoing mined index: %w", err)
 		}
 	}
 	return true, nil
@@ -2932,11 +3141,12 @@ type outgoingOutputRecord struct {
 
 	ActionIndex int32 `json:"action_index"`
 
-	MinedHeight     *int64 `json:"mined_height,omitempty"`
-	ConfirmedHeight *int64 `json:"confirmed_height,omitempty"`
-	MempoolSeenUnix *int64 `json:"mempool_seen_at_unix,omitempty"`
-	TxExpiryHeight  *int64 `json:"tx_expiry_height,omitempty"`
-	ExpiredAtUnix   *int64 `json:"expired_at_unix,omitempty"`
+	MinedHeight     *int64  `json:"mined_height,omitempty"`
+	Position        *uint64 `json:"position,omitempty"`
+	ConfirmedHeight *int64  `json:"confirmed_height,omitempty"`
+	MempoolSeenUnix *int64  `json:"mempool_seen_at_unix,omitempty"`
+	TxExpiryHeight  *int64  `json:"tx_expiry_height,omitempty"`
+	ExpiredAtUnix   *int64  `json:"expired_at_unix,omitempty"`
 
 	RecipientAddress string  `json:"recipient_address"`
 	ValueZat         int64   `json:"value_zat"`
@@ -2973,6 +3183,7 @@ var (
 	noteSpentConfirmedHeightPrefix = []byte("nsch/")
 	outgoingOutputPrefix           = []byte("oo/")
 	outgoingMinedHeightPrefix      = []byte("oomh/")
+	outgoingWalletMinedPrefix      = []byte("oowh/")
 	outgoingConfirmedHeightPrefix  = []byte("ooch/")
 	eventPrefix                    = []byte("e/")
 	eventHeightPrefix              = []byte("eh/")
@@ -3168,6 +3379,31 @@ func keyOutgoingMinedHeightIndex(height uint64, walletID, txid string, actionInd
 	b = appendUint64Fixed20(b, height)
 	b = append(b, '/')
 	b = append(b, walletID...)
+	b = append(b, '/')
+	b = append(b, txid...)
+	b = append(b, '/')
+	b = strconv.AppendInt(b, int64(actionIndex), 10)
+	return b
+}
+
+func keyWalletOutgoingMinedPrefix(walletID string) []byte {
+	b := make([]byte, 0, len(outgoingWalletMinedPrefix)+len(walletID)+1)
+	b = append(b, outgoingWalletMinedPrefix...)
+	b = append(b, walletID...)
+	b = append(b, '/')
+	return b
+}
+
+func keyWalletOutgoingMinedIndexMin(walletID string) []byte {
+	return keyWalletOutgoingMinedPrefix(walletID)
+}
+
+func keyWalletOutgoingMinedIndex(walletID string, height uint64, txid string, actionIndex int32) []byte {
+	b := make([]byte, 0, len(outgoingWalletMinedPrefix)+len(walletID)+1+20+1+len(txid)+1+11)
+	b = append(b, outgoingWalletMinedPrefix...)
+	b = append(b, walletID...)
+	b = append(b, '/')
+	b = appendUint64Fixed20(b, height)
 	b = append(b, '/')
 	b = append(b, txid...)
 	b = append(b, '/')
@@ -3568,6 +3804,9 @@ func deleteOutgoingOutputsAboveHeight(batch *pebble.Batch, db *pebble.DB, startH
 		if err := batch.Delete(k, pebble.NoSync); err != nil {
 			return fmt.Errorf("rocksdb: delete outgoing mined index: %w", err)
 		}
+		if err := batch.Delete(keyWalletOutgoingMinedIndex(walletID, uint64(*rec.MinedHeight), txid, actionIndex), pebble.NoSync); err != nil {
+			return fmt.Errorf("rocksdb: delete wallet outgoing mined index: %w", err)
+		}
 		if err := batch.Delete(ooKey, pebble.NoSync); err != nil {
 			return fmt.Errorf("rocksdb: delete outgoing output: %w", err)
 		}
@@ -3818,6 +4057,26 @@ func parseOutgoingMinedHeightIndexKey(key []byte) (walletID string, height int64
 		return "", 0, "", 0, errors.New("rocksdb: outgoing action_index invalid")
 	}
 	return string(parts[2]), h, string(parts[3]), int32(action), nil
+}
+
+func parseWalletOutgoingMinedIndexKey(key []byte, wantWalletID string) (height int64, txid string, actionIndex int32, err error) {
+	// k = oowh/<wallet>/<height>/<txid>/<action_index>
+	parts := bytes.Split(key, []byte("/"))
+	if len(parts) != 5 {
+		return 0, "", 0, errors.New("rocksdb: wallet outgoing mined index malformed")
+	}
+	if string(parts[1]) != wantWalletID {
+		return 0, "", 0, errors.New("rocksdb: wallet outgoing mined index wallet mismatch")
+	}
+	h, err := parseFixed20Int64(parts[2])
+	if err != nil {
+		return 0, "", 0, errors.New("rocksdb: wallet outgoing mined index height invalid")
+	}
+	action, err := strconv.ParseInt(string(parts[4]), 10, 32)
+	if err != nil {
+		return 0, "", 0, errors.New("rocksdb: wallet outgoing mined index action_index invalid")
+	}
+	return h, string(parts[3]), int32(action), nil
 }
 
 func parseOutgoingConfirmedHeightIndexKey(key []byte) (walletID string, height int64, txid string, actionIndex int32, err error) {

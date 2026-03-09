@@ -639,6 +639,8 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 
 					for _, o := range outs {
 						heightCopy := blk.Height
+						pos := posByTxAction[t.TxID][o.ActionIndex]
+						posCopy := pos
 
 						var memoHexPtr *string
 						memoHex := strings.TrimSpace(o.MemoHex)
@@ -659,6 +661,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 							ActionIndex: int32(o.ActionIndex),
 
 							MinedHeight: &heightCopy,
+							Position:    &posCopy,
 
 							RecipientAddress: o.RecipientAddress,
 							ValueZat:         int64(o.ValueZat),

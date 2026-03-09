@@ -106,7 +106,7 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	mustWaitForEventKind(t, ctx, baseURL, "hot", "DepositConfirmed")
 
-	notes := mustGetNotes(t, ctx, baseURL, "hot", false)
+	notes := mustGetNotes(t, ctx, baseURL, "hot", false, "")
 	if len(notes) == 0 || notes[0].Position == nil {
 		t.Fatalf("expected at least 1 note with position")
 	}
@@ -142,16 +142,41 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 	mustWaitForEventKind(t, ctx, baseURL, "hot", "SpendConfirmed")
 	mustWaitForEventKindTxID(t, ctx, baseURL, "hot", "OutgoingOutputConfirmed", spendTxID)
 
-	allNotes := mustGetNotes(t, ctx, baseURL, "hot", true)
+	allNotes := mustGetNotes(t, ctx, baseURL, "hot", true, "")
 	foundSpent := false
+	foundOutgoing := false
 	for _, n := range allNotes {
 		if n.SpentHeight != nil {
 			foundSpent = true
-			break
+		}
+		if n.Direction == "outgoing" && n.TxID == spendTxID {
+			foundOutgoing = true
+			if n.NoteNullifier != nil {
+				t.Fatalf("expected outgoing note_nullifier to be null")
+			}
+			if n.OvkScope == nil || strings.TrimSpace(*n.OvkScope) == "" {
+				t.Fatalf("expected outgoing ovk_scope")
+			}
+			if n.Position == nil || *n.Position < 0 {
+				t.Fatalf("expected outgoing position")
+			}
 		}
 	}
 	if !foundSpent {
 		t.Fatalf("expected at least 1 spent note")
+	}
+	if !foundOutgoing {
+		t.Fatalf("expected outgoing note in /notes response")
+	}
+
+	outgoingOnly := mustGetNotes(t, ctx, baseURL, "hot", true, "outgoing")
+	if len(outgoingOnly) == 0 {
+		t.Fatalf("expected outgoing-only notes")
+	}
+	for _, n := range outgoingOnly {
+		if n.Direction != "outgoing" {
+			t.Fatalf("expected outgoing direction, got %+v", n)
+		}
 	}
 
 	memoAddr, memoUFVK := mustCreateWalletAndUFVK(t, ctx, jd)
@@ -379,17 +404,24 @@ func mustGetEvents(t *testing.T, ctx context.Context, baseURL, walletID string, 
 }
 
 type apiNote struct {
-	TxID        string  `json:"txid"`
-	ActionIndex int32   `json:"action_index"`
-	Position    *int64  `json:"position,omitempty"`
-	MemoHex     *string `json:"memo_hex"`
-	SpentHeight *int64  `json:"spent_height,omitempty"`
+	Direction      string  `json:"direction"`
+	TxID           string  `json:"txid"`
+	ActionIndex    int32   `json:"action_index"`
+	Position       *int64  `json:"position,omitempty"`
+	MemoHex        *string `json:"memo_hex"`
+	NoteNullifier  *string `json:"note_nullifier"`
+	OvkScope       *string `json:"ovk_scope,omitempty"`
+	RecipientScope *string `json:"recipient_scope,omitempty"`
+	SpentHeight    *int64  `json:"spent_height,omitempty"`
 }
 
-func mustGetNotes(t *testing.T, ctx context.Context, baseURL, walletID string, spent bool) []apiNote {
+func mustGetNotes(t *testing.T, ctx context.Context, baseURL, walletID string, spent bool, direction string) []apiNote {
 	t.Helper()
 
 	url := fmt.Sprintf("%s/v1/wallets/%s/notes?spent=%t", baseURL, walletID, spent)
+	if strings.TrimSpace(direction) != "" {
+		url += "&direction=" + direction
+	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
