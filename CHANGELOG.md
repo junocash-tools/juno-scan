@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.4.5 (2026-03-28)
+
+- Fix scanner shutdown ordering so Pebble closes only after scanner and publisher goroutines exit.
+- Add RocksDB-backed integration coverage for graceful shutdown during active scanning.
+
 ## v1.4.1 (2026-02-10)
 
 - Add multi-daemon docker integration coverage for mempool spend expiry across disconnect/reconnect + sync.
