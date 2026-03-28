@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/Abdullah1738/juno-scan/internal/storage"
 	"github.com/Abdullah1738/juno-scan/internal/store"
 	sdkjunocashd "github.com/Abdullah1738/juno-sdk-go/junocashd"
+	"golang.org/x/sync/errgroup"
 )
 
 func main() {
@@ -26,20 +28,29 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	st := mustOpenStore(ctx, cfg)
+	if err := run(ctx, cfg); err != nil {
+		log.Fatalf("run: %v", err)
+	}
+}
+
+func run(ctx context.Context, cfg config.Config) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	st := mustOpenStore(runCtx, cfg)
 	defer func() { _ = st.Close() }()
 
-	if err := st.Migrate(ctx); err != nil {
-		log.Fatalf("migrate: %v", err)
+	if err := st.Migrate(runCtx); err != nil {
+		return err
 	}
 
-	br, err := broker.Open(ctx, broker.Config{
+	br, err := broker.Open(runCtx, broker.Config{
 		Driver: cfg.BrokerDriver,
 		URL:    cfg.BrokerURL,
 		Topic:  cfg.BrokerTopic,
 	})
 	if err != nil {
-		log.Fatalf("broker init: %v", err)
+		return err
 	}
 	defer func() {
 		if br != nil {
@@ -47,39 +58,41 @@ func main() {
 		}
 	}()
 
+	g, groupCtx := errgroup.WithContext(runCtx)
+
 	if br != nil {
 		pub, err := publisher.New(st, br, publisher.Config{
 			PollInterval: cfg.BrokerPollInterval,
 			BatchSize:    cfg.BrokerBatchSize,
 		})
 		if err != nil {
-			log.Fatalf("publisher init: %v", err)
+			return err
 		}
 
-		go func() {
-			if err := pub.Run(ctx); err != nil && ctx.Err() == nil {
-				log.Printf("publisher stopped: %v", err)
-				cancel()
+		g.Go(func() error {
+			if err := pub.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) && groupCtx.Err() == nil {
+				return err
 			}
-		}()
+			return nil
+		})
 	}
 
 	rpc := sdkjunocashd.New(cfg.RPCURL, cfg.RPCUser, cfg.RPCPassword)
 	sc, err := scanner.New(st, rpc, cfg.UAHRP, cfg.PollInterval, cfg.Confirmations, cfg.ZMQHashBlock)
 	if err != nil {
-		log.Fatalf("scanner init: %v", err)
+		return err
 	}
 
-	go func() {
-		if err := sc.Run(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("scanner stopped: %v", err)
-			cancel()
+	g.Go(func() error {
+		if err := sc.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) && groupCtx.Err() == nil {
+			return err
 		}
-	}()
+		return nil
+	})
 
 	bf, err := backfill.New(st, rpc, cfg.UAHRP, cfg.Confirmations)
 	if err != nil {
-		log.Fatalf("backfill init: %v", err)
+		return err
 	}
 
 	apiServer, err := api.New(st,
@@ -87,7 +100,7 @@ func main() {
 		api.WithBearerToken(cfg.APIBearerToken),
 	)
 	if err != nil {
-		log.Fatalf("api init: %v", err)
+		return err
 	}
 
 	srv := &http.Server{
@@ -97,16 +110,24 @@ func main() {
 	}
 
 	go func() {
-		<-ctx.Done()
+		<-groupCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
 	log.Printf("listening on %s", cfg.ListenAddr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("http: %v", err)
+	g.Go(func() error {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return err
 	}
+	return nil
 }
 
 func mustOpenStore(ctx context.Context, cfg config.Config) store.Store {
