@@ -511,7 +511,7 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
 
     let mut tx_bytes = hex::decode(req.tx_hex.trim()).map_err(|_| ScanError::TxHexInvalid)?;
     let tx =
-        Transaction::read(&tx_bytes[..], BranchId::Nu6_1).map_err(|_| ScanError::TxParseFailed)?;
+        Transaction::read(&tx_bytes[..], BranchId::Nu6_2).map_err(|_| ScanError::TxParseFailed)?;
     tx_bytes.zeroize();
 
     let orchard_bundle = match tx.orchard_bundle() {
@@ -651,7 +651,7 @@ fn recover_outgoing_tx_json_inner(
 
     let mut tx_bytes = hex::decode(req.tx_hex.trim()).map_err(|_| ScanError::TxHexInvalid)?;
     let tx =
-        Transaction::read(&tx_bytes[..], BranchId::Nu6_1).map_err(|_| ScanError::TxParseFailed)?;
+        Transaction::read(&tx_bytes[..], BranchId::Nu6_2).map_err(|_| ScanError::TxParseFailed)?;
     tx_bytes.zeroize();
 
     let orchard_bundle = match tx.orchard_bundle() {
@@ -938,4 +938,51 @@ fn parse_hex_32(s: &str) -> Result<[u8; 32], ()> {
 
 fn is_empty_memo(memo: &[u8; 512]) -> bool {
     memo[0] == 0xF6 && memo[1..].iter().all(|b| *b == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+    use zcash_protocol::constants::{V5_TX_VERSION, V5_VERSION_GROUP_ID};
+
+    fn empty_nu6_2_v5_tx() -> Vec<u8> {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&((1 << 31) | V5_TX_VERSION).to_le_bytes());
+        tx.extend_from_slice(&V5_VERSION_GROUP_ID.to_le_bytes());
+        tx.extend_from_slice(&u32::from(BranchId::Nu6_2).to_le_bytes());
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx.push(0);
+        tx.push(0);
+        tx.push(0);
+        tx.push(0);
+        tx.push(0);
+        tx
+    }
+
+    #[test]
+    fn parses_nu6_2_v5_transaction() {
+        let tx = Transaction::read(&empty_nu6_2_v5_tx()[..], BranchId::Nu6_2)
+            .expect("NU6.2 v5 transaction parses");
+
+        assert_eq!(tx.into_data().consensus_branch_id(), BranchId::Nu6_2);
+    }
+
+    #[test]
+    fn scan_tx_accepts_nu6_2_v5_transaction() {
+        let req = CString::new(format!(
+            r#"{{"ua_hrp":"j","wallets":[],"tx_hex":"{}"}}"#,
+            hex::encode(empty_nu6_2_v5_tx())
+        ))
+        .unwrap();
+
+        match scan_tx_json_inner(req.as_ptr()).expect("scan response") {
+            ScanTxResponse::Ok { actions, notes } => {
+                assert!(actions.is_empty());
+                assert!(notes.is_empty());
+            }
+            ScanTxResponse::Err { error } => panic!("unexpected scan error: {error}"),
+        }
+    }
 }

@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	defaultJunocashVersion  = "0.9.9"
+	defaultJunocashVersion  = "0.9.12"
 	defaultPostgresImage    = "postgres:16-alpine"
 	defaultMySQLImage       = "mysql:8.4"
 	defaultNATSImage        = "nats:2.10-alpine"
