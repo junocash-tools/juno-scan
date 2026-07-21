@@ -6,37 +6,51 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   BIN_NAME: juno-scan
+  CARGO_ZIGBUILD_VERSION: 0.20.1
   GO_MAIN: ./cmd/juno-scan
+  GOTOOLCHAIN: local
+  RUST_TOOLCHAIN: 1.86.0
+  ZIG_VERSION: 0.12.0
 
 jobs:
-  create-release:
+  validate:
+    name: validate release tag
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Create GitHub release (if needed)
+      - name: Require a SemVer tag
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
         run: |
           set -euo pipefail
-          tag="${{ github.ref_name }}"
-
-          if gh -R "${{ github.repository }}" release view "$tag" >/dev/null 2>&1; then
-            exit 0
+          core='(0|[1-9][0-9]*)'
+          prerelease='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          semver="^v${core}\\.${core}\\.${core}(-${prerelease}(\\.${prerelease})*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"
+          if [[ ! "$TAG" =~ $semver ]]; then
+            printf 'release tag must be SemVer with a v prefix: %s\n' "$TAG" >&2
+            exit 1
           fi
 
-          notes="Release $tag"
-          if [ "$tag" = "v1.0" ]; then
-            notes="Initial Version"
-          fi
-
-          gh -R "${{ github.repository }}" release create "$tag" --notes "$notes"
+  verify:
+    name: verify release commit
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
 
   build:
-    needs: create-release
+    name: build ${{ matrix.name }}
+    needs: [validate, verify]
     runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -58,66 +72,68 @@ jobs:
             goos: darwin
             goarch: amd64
             rust_target: x86_64-apple-darwin
-            zig_target: ""
+            clang_target: x86_64-apple-darwin
           - name: darwin-arm64
             runs-on: macos-14
             goos: darwin
             goarch: arm64
-            rust_target: ""
-            zig_target: ""
-    steps:
-      - uses: actions/checkout@v4
+            rust_target: aarch64-apple-darwin
+            clang_target: arm64-apple-darwin
 
-      - uses: actions/setup-go@v5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version-file: go.mod
+          cache: true
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Add Rust target
-        if: matrix.rust_target != ''
-        run: rustup target add ${{ matrix.rust_target }}
-
-      - uses: goto-bus-stop/setup-zig@v2
-        if: matrix.zig_target != ''
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          version: 0.12.0
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.rust_target }}
 
-      - uses: taiki-e/install-action@v2
-        if: matrix.zig_target != ''
+      - name: Set up Zig
+        if: matrix.goos == 'linux'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          tool: cargo-zigbuild
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install cargo-zigbuild
+        if: matrix.goos == 'linux'
+        shell: bash
+        run: cargo install cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION" --locked
 
       - name: Build Rust static library
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           crate_dir="rust/scan"
           lib="juno_scan"
           manifest="$crate_dir/Cargo.toml"
+          target="${{ matrix.rust_target }}"
 
           if [ "${{ matrix.goos }}" = "linux" ]; then
-            cargo zigbuild --release --target "${{ matrix.rust_target }}" --manifest-path "$manifest"
-            mkdir -p "$crate_dir/target/release"
-            cp "$crate_dir/target/${{ matrix.rust_target }}/release/lib${lib}.a" "$crate_dir/target/release/lib${lib}.a"
-          elif [ -n "${{ matrix.rust_target }}" ]; then
-            export MACOSX_DEPLOYMENT_TARGET=11.0
-            cargo build --release --target "${{ matrix.rust_target }}" --manifest-path "$manifest"
-            mkdir -p "$crate_dir/target/release"
-            cp "$crate_dir/target/${{ matrix.rust_target }}/release/lib${lib}.a" "$crate_dir/target/release/lib${lib}.a"
+            cargo zigbuild --locked --release --target "$target" --manifest-path "$manifest"
           else
             export MACOSX_DEPLOYMENT_TARGET=11.0
-            cargo build --release --manifest-path "$manifest"
+            cargo build --locked --release --target "$target" --manifest-path "$manifest"
           fi
 
+          mkdir -p "$crate_dir/target/release"
+          cp "$crate_dir/target/$target/release/lib${lib}.a" "$crate_dir/target/release/lib${lib}.a"
           rm -f "$crate_dir/target/release/lib${lib}.so" "$crate_dir/target/release/lib${lib}.dylib"
 
       - name: Build binary
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           mkdir -p dist
-
           export GOOS="${{ matrix.goos }}"
           export GOARCH="${{ matrix.goarch }}"
           export CGO_ENABLED=1
@@ -126,40 +142,160 @@ jobs:
             export CC="zig cc -target ${{ matrix.zig_target }}"
             export CXX="zig c++ -target ${{ matrix.zig_target }}"
             export CGO_LDFLAGS="${CGO_LDFLAGS:-} -lunwind"
-            go build -trimpath -ldflags "-s -w -linkmode external -extldflags '-static'" -o "dist/${BIN_NAME}" "${GO_MAIN}"
+            go build -mod=readonly -trimpath -ldflags "-s -w -linkmode external -extldflags '-static'" -o "dist/${BIN_NAME}" "${GO_MAIN}"
             file "dist/${BIN_NAME}" | grep -q "statically linked"
-          elif [ "$GOOS" = "darwin" ]; then
-            export MACOSX_DEPLOYMENT_TARGET=11.0
-            if [ "$GOARCH" = "amd64" ]; then
-              export CC="clang -target x86_64-apple-darwin"
-              export CXX="clang++ -target x86_64-apple-darwin"
-            fi
-            go build -trimpath -ldflags "-s -w" -o "dist/${BIN_NAME}" "${GO_MAIN}"
           else
-            go build -trimpath -ldflags "-s -w" -o "dist/${BIN_NAME}" "${GO_MAIN}"
+            export MACOSX_DEPLOYMENT_TARGET=11.0
+            export CC="clang -target ${{ matrix.clang_target }}"
+            export CXX="clang++ -target ${{ matrix.clang_target }}"
+            go build -mod=readonly -trimpath -ldflags "-s -w" -o "dist/${BIN_NAME}" "${GO_MAIN}"
           fi
 
-      - name: Package
+      - name: Verify binary architecture
         shell: bash
         run: |
-          set -euxo pipefail
-          tag="${{ github.ref_name }}"
-          archive="${BIN_NAME}_${tag}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz"
+          set -euo pipefail
+          description="$(file "dist/${BIN_NAME}")"
+          printf '%s\n' "$description"
 
+          case "${{ matrix.name }}" in
+            linux-amd64)
+              grep -Eq 'ELF 64-bit.*x86-64.*statically linked' <<<"$description"
+              ;;
+            linux-arm64)
+              grep -Eq 'ELF 64-bit.*ARM aarch64.*statically linked' <<<"$description"
+              ;;
+            darwin-amd64)
+              grep -Eq 'Mach-O 64-bit executable x86_64' <<<"$description"
+              ;;
+            darwin-arm64)
+              grep -Eq 'Mach-O 64-bit executable arm64' <<<"$description"
+              ;;
+            *)
+              printf 'unsupported release target: %s\n' "${{ matrix.name }}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${BIN_NAME}_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz"
           tar -C dist -czf "dist/${archive}" "${BIN_NAME}"
 
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "dist/${archive}" > "dist/${archive}.sha256"
-          else
-            shasum -a 256 "dist/${archive}" > "dist/${archive}.sha256"
+      - name: Stage platform archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    name: checksum and publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download platform archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify archives and create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          expected=(
+            "${BIN_NAME}_${tag}_linux_amd64.tar.gz"
+            "${BIN_NAME}_${tag}_linux_arm64.tar.gz"
+            "${BIN_NAME}_${tag}_darwin_amd64.tar.gz"
+            "${BIN_NAME}_${tag}_darwin_arm64.tar.gz"
+          )
+
+          shopt -s nullglob
+          found=(dist/*.tar.gz)
+          if [ "${#found[@]}" -ne "${#expected[@]}" ]; then
+            printf 'expected 4 archives, found %d\n' "${#found[@]}"
+            printf '%s\n' "${found[@]}"
+            exit 1
           fi
 
-      - name: Upload to GitHub release
+          for archive in "${expected[@]}"; do
+            test -f "dist/$archive"
+            contents="$(tar -tzf "dist/$archive")"
+            if [ "$contents" != "$BIN_NAME" ]; then
+              printf 'unexpected archive contents for %s: %s\n' "$archive" "$contents"
+              exit 1
+            fi
+          done
+
+          (
+            cd dist
+            : > SHA256SUMS
+            for archive in "${expected[@]}"; do
+              sha256sum "$archive" > "$archive.sha256"
+              cat "$archive.sha256" >> SHA256SUMS
+            done
+            sha256sum -c SHA256SUMS
+          )
+
+      - name: Attest release archives
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Create or inspect draft release
+        id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           tag="${{ github.ref_name }}"
-          archive="${BIN_NAME}_${tag}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz"
-          gh -R "${{ github.repository }}" release upload "$tag" "dist/${archive}" "dist/${archive}.sha256" --clobber
+          publish=false
+
+          if gh -R "${{ github.repository }}" release view "$tag" >/dev/null 2>&1; then
+            if [ "$(gh -R "${{ github.repository }}" release view "$tag" --json isDraft --jq .isDraft)" = "true" ]; then
+              publish=true
+            else
+              printf 'refusing to replace assets on published release %s\n' "$tag" >&2
+              exit 1
+            fi
+          else
+            notes="Release $tag"
+            release_flags=(--verify-tag --draft --title "$tag" --notes "$notes")
+            version_without_build="${tag%%+*}"
+            if [[ "$version_without_build" == *-* ]]; then
+              release_flags+=(--prerelease --latest=false)
+            fi
+            gh -R "${{ github.repository }}" release create "$tag" "${release_flags[@]}"
+            publish=true
+          fi
+
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh -R "${{ github.repository }}" release upload "${{ github.ref_name }}" \
+            dist/*.tar.gz dist/*.tar.gz.sha256 dist/SHA256SUMS \
+            --clobber
+
+      - name: Publish draft release
+        if: steps.release.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh -R "${{ github.repository }}" release edit "${{ github.ref_name }}" --draft=false
