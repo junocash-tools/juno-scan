@@ -84,7 +84,17 @@ func StartJunocashdNode(ctx context.Context, cfg JunocashdNodeConfig) (*Junocash
 	version := defaultJunocashVersion
 	req := testcontainers.ContainerRequest{
 		ImagePlatform: "linux/amd64",
-		FromDockerfile: testcontainers.FromDockerfile{
+		ExposedPorts: []string{
+			"8232/tcp",
+			fmt.Sprintf("%d/tcp", p2pPort),
+		},
+		Cmd:        args,
+		WaitingFor: wait.ForListeningPort(nat.Port("8232/tcp")).WithStartupTimeout(60 * time.Second),
+	}
+	if image := strings.TrimSpace(os.Getenv("JUNO_TEST_JUNOCASHD_IMAGE")); image != "" {
+		req.Image = image
+	} else {
+		req.FromDockerfile = testcontainers.FromDockerfile{
 			Context:    repoRoot(),
 			Dockerfile: "docker/junocashd/Dockerfile",
 			BuildArgs: map[string]*string{
@@ -94,13 +104,7 @@ func StartJunocashdNode(ctx context.Context, cfg JunocashdNodeConfig) (*Junocash
 				opts.Platform = "linux/amd64"
 				opts.Version = build.BuilderBuildKit
 			},
-		},
-		ExposedPorts: []string{
-			"8232/tcp",
-			fmt.Sprintf("%d/tcp", p2pPort),
-		},
-		Cmd:        args,
-		WaitingFor: wait.ForListeningPort(nat.Port("8232/tcp")).WithStartupTimeout(60 * time.Second),
+		}
 	}
 
 	if strings.TrimSpace(cfg.Network) != "" {

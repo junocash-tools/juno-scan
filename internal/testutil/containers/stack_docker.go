@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	build "github.com/docker/docker/api/types/build"
@@ -165,17 +166,6 @@ func startJunocashd(ctx context.Context, rpcUser, rpcPass string) (testcontainer
 
 	req := testcontainers.ContainerRequest{
 		ImagePlatform: "linux/amd64",
-		FromDockerfile: testcontainers.FromDockerfile{
-			Context:    repoRoot(),
-			Dockerfile: "docker/junocashd/Dockerfile",
-			BuildArgs: map[string]*string{
-				"JUNOCASH_VERSION": &version,
-			},
-			BuildOptionsModifier: func(opts *build.ImageBuildOptions) {
-				opts.Platform = "linux/amd64"
-				opts.Version = build.BuilderBuildKit
-			},
-		},
 		ExposedPorts: []string{
 			"8232/tcp",
 			"28332/tcp",
@@ -199,6 +189,21 @@ func startJunocashd(ctx context.Context, rpcUser, rpcPass string) (testcontainer
 			"-zmqpubhashblock=tcp://0.0.0.0:28332",
 		},
 		WaitingFor: wait.ForListeningPort(nat.Port("8232/tcp")).WithStartupTimeout(60 * time.Second),
+	}
+	if image := strings.TrimSpace(os.Getenv("JUNO_TEST_JUNOCASHD_IMAGE")); image != "" {
+		req.Image = image
+	} else {
+		req.FromDockerfile = testcontainers.FromDockerfile{
+			Context:    repoRoot(),
+			Dockerfile: "docker/junocashd/Dockerfile",
+			BuildArgs: map[string]*string{
+				"JUNOCASH_VERSION": &version,
+			},
+			BuildOptionsModifier: func(opts *build.ImageBuildOptions) {
+				opts.Platform = "linux/amd64"
+				opts.Version = build.BuilderBuildKit
+			},
+		}
 	}
 	if os.Getenv("JUNO_TEST_LOG") != "" {
 		req.FromDockerfile.BuildLogWriter = os.Stdout
