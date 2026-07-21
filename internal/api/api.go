@@ -227,12 +227,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		if s.nodeHeight != nil {
 			if nodeHeight, known := s.nodeHeight(); known {
 				lag := nodeHeight - tip.Height
+				scannerAhead := lag < 0
 				if lag < 0 {
 					lag = 0
 				}
 				resp["node_height"] = nodeHeight
 				resp["scanner_lag"] = lag
-				if lag > s.maxReadyLag {
+				if scannerAhead || lag > s.maxReadyLag {
 					resp["ready"] = false
 					resp["status"] = "degraded"
 				}

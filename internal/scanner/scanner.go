@@ -157,6 +157,15 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 			return fmt.Errorf("scanner: getblockcount: %w", err)
 		}
 		s.recordNodeHeight(chainHeight)
+		if ok {
+			rolledBack, err := s.reconcileCanonicalTip(ctx, tip, chainHeight)
+			if err != nil {
+				return err
+			}
+			if rolledBack {
+				continue
+			}
+		}
 		if nextHeight > chainHeight {
 			if err := s.backfillMissingSubtreeRoots(ctx, chainHeight, orchardSubtreeBackfillPerScan); err != nil {
 				return err
@@ -172,28 +181,16 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 			return fmt.Errorf("scanner: getblockhash(%d): %w", nextHeight, err)
 		}
 
-		// Reorg detection: compare stored tip with daemon chain at the same height.
-		if ok && tip.Height >= 0 {
-			daemonTipHash, err := s.rpc.GetBlockHash(ctx, tip.Height)
-			if err == nil && daemonTipHash != tip.Hash {
-				common, err := s.findCommonAncestor(ctx, tip.Height)
-				if err != nil {
-					return err
-				}
-				log.Printf("reorg detected: rolling back to height %d", common)
-				if err := s.st.RollbackToHeight(ctx, common); err != nil {
-					return err
-				}
-				continue
-			}
-		}
-
 		var blk blockVerbose2
 		if err := s.rpc.Call(ctx, "getblock", []any{nextHash, 2}, &blk); err != nil {
 			return fmt.Errorf("scanner: getblock(%d): %w", nextHeight, err)
 		}
 		if blk.Height != nextHeight {
 			return fmt.Errorf("scanner: daemon returned unexpected height: got %d want %d", blk.Height, nextHeight)
+		}
+		if ok && blk.PreviousBlockHash != tip.Hash {
+			log.Printf("canonical tip changed before block %d commit; retrying", nextHeight)
+			continue
 		}
 
 		if err := s.processBlock(ctx, blk); err != nil {
@@ -202,6 +199,36 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 	}
 
 	return ctx.Err()
+}
+
+func (s *Scanner) reconcileCanonicalTip(ctx context.Context, tip store.BlockTip, chainHeight int64) (bool, error) {
+	if tip.Height < 0 {
+		return false, nil
+	}
+
+	ancestorSearchHeight := tip.Height
+	if tip.Height > chainHeight {
+		ancestorSearchHeight = chainHeight
+	} else {
+		daemonTipHash, err := s.rpc.GetBlockHash(ctx, tip.Height)
+		if err != nil {
+			return false, fmt.Errorf("scanner: getblockhash(%d) for canonical tip: %w", tip.Height, err)
+		}
+		if daemonTipHash == tip.Hash {
+			return false, nil
+		}
+		ancestorSearchHeight = tip.Height - 1
+	}
+
+	common, err := s.findCommonAncestor(ctx, ancestorSearchHeight)
+	if err != nil {
+		return false, err
+	}
+	log.Printf("reorg detected: rolling back from height %d to height %d", tip.Height, common)
+	if err := s.st.RollbackToHeight(ctx, common); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Scanner) updatePendingSpends(ctx context.Context, chainHeight int64) error {
@@ -521,7 +548,10 @@ func (s *Scanner) findCommonAncestor(ctx context.Context, fromHeight int64) (int
 			continue
 		}
 		chainHash, err := s.rpc.GetBlockHash(ctx, h)
-		if err == nil && chainHash == dbHash {
+		if err != nil {
+			return 0, fmt.Errorf("scanner: getblockhash(%d) while finding common ancestor: %w", h, err)
+		}
+		if chainHash == dbHash {
 			return h, nil
 		}
 		h--

@@ -319,8 +319,13 @@ func waitForScannerTip(t *testing.T, ctx context.Context, st store.Store, rpc *s
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
+		chainHash, err := rpc.GetBlockHash(ctx, chainHeight)
+		if err != nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
 		tip, ok, err := st.Tip(ctx)
-		if err == nil && ok && tip.Height >= chainHeight {
+		if err == nil && ok && tip.Height == chainHeight && tip.Hash == chainHash {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)

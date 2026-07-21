@@ -130,3 +130,43 @@ func TestHealthRequiresTipAndBackfillBeyondTip(t *testing.T) {
 	}
 	checkReady(true)
 }
+
+func TestHealthDegradesWhenScannerTipIsAheadOfNode(t *testing.T) {
+	ctx := context.Background()
+	st, err := rocksdb.Open(t.TempDir() + "/scanner-ahead.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.WithTx(ctx, func(tx store.Tx) error {
+		return tx.InsertBlock(ctx, store.Block{Height: 10, Hash: "stored-tip"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := New(st, WithRuntimeStatus("regtest", "jregtest", 100, 2, func() (int64, bool) {
+		return 9, true
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+	rr := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr, req)
+	var response struct {
+		Status        string `json:"status"`
+		Ready         bool   `json:"ready"`
+		NodeHeight    int64  `json:"node_height"`
+		ScannedHeight int64  `json:"scanned_height"`
+		ScannerLag    int64  `json:"scanner_lag"`
+	}
+	if rr.Code != http.StatusOK || json.Unmarshal(rr.Body.Bytes(), &response) != nil {
+		t.Fatalf("health status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if response.Ready || response.Status != "degraded" || response.NodeHeight != 9 || response.ScannedHeight != 10 || response.ScannerLag != 0 {
+		t.Fatalf("scanner-ahead health=%+v body=%s", response, rr.Body.String())
+	}
+}
