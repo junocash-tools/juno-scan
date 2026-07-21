@@ -154,6 +154,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"status":        "ok",
 		"ready":         true,
+		"confirmations": s.defaultConfirmations,
 		"max_ready_lag": s.maxReadyLag,
 	}
 	eventEpoch, err := s.st.EventEpoch(ctx)
@@ -212,7 +213,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}
-			if !found || progress.State != "complete" {
+			if !found || progress.State != "complete" || progress.Generation < 1 || progress.BirthdayHeight != wallet.BirthdayHeight || progress.UFVKFingerprint != wallet.UFVKFingerprint || progress.NextHeight <= tip.Height || progress.NextHeight < progress.BirthdayHeight {
 				historyComplete = false
 				historyPending++
 			}
@@ -486,7 +487,15 @@ func (s *Server) handleListWalletEvents(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	cursor := parseInt64Query(r, "cursor", 0)
+	cursor := int64(0)
+	if rawCursor := strings.TrimSpace(r.URL.Query().Get("cursor")); rawCursor != "" {
+		parsed, err := strconv.ParseInt(rawCursor, 10, 64)
+		if err != nil || parsed < 0 {
+			http.Error(w, "invalid cursor", http.StatusBadRequest)
+			return
+		}
+		cursor = parsed
+	}
 	limit := parseInt64Query(r, "limit", 100)
 	if limit <= 0 || limit > 1000 {
 		limit = 100
@@ -555,6 +564,15 @@ func (s *Server) handleListWalletEvents(w http.ResponseWriter, r *http.Request, 
 		before, err := s.st.EventEpoch(ctx)
 		if err != nil {
 			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		maxEventID, err := s.st.MaxWalletEventID(ctx, walletID)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		if cursor > maxEventID {
+			http.Error(w, "event cursor exceeds durable journal; verify event_epoch and reset cursor", http.StatusConflict)
 			return
 		}
 		evs, nextCursor, err = s.st.ListWalletEvents(ctx, walletID, cursor, int(limit), filter)
@@ -685,10 +703,30 @@ func (s *Server) handleBackfillWallet(w http.ResponseWriter, r *http.Request, wa
 			return
 		}
 	}
-	if req.FromHeight != nil {
-		fromHeight = *req.FromHeight
-	} else if progressFound {
-		fromHeight = progress.NextHeight
+	if !hasProgressStore || !progressFound {
+		http.Error(w, "wallet backfill progress unavailable", http.StatusConflict)
+		return
+	}
+	fromHeight = progress.NextHeight
+	if req.FromHeight != nil && *req.FromHeight != progress.NextHeight {
+		http.Error(w, "from_height must equal persisted next_height", http.StatusConflict)
+		return
+	}
+	wallets, err := s.st.ListWallets(ctx)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	identityValid := false
+	for _, wallet := range wallets {
+		if wallet.WalletID == walletID && wallet.DisabledAt == nil && wallet.BirthdayHeight == progress.BirthdayHeight && wallet.UFVKFingerprint == progress.UFVKFingerprint {
+			identityValid = true
+			break
+		}
+	}
+	if !identityValid || progress.Generation < 1 || progress.NextHeight < progress.BirthdayHeight {
+		http.Error(w, "wallet backfill identity changed", http.StatusConflict)
+		return
 	}
 
 	tip, ok, err := s.st.Tip(ctx)
@@ -709,6 +747,27 @@ func (s *Server) handleBackfillWallet(w http.ResponseWriter, r *http.Request, wa
 		http.Error(w, "to_height exceeds scanned tip", http.StatusBadRequest)
 		return
 	}
+	if toHeight < fromHeight {
+		if req.ToHeight == nil && progress.State == "complete" && fromHeight > tip.Height {
+			writeJSON(w, map[string]any{
+				"status":                 "ok",
+				"wallet_id":              walletID,
+				"from_height":            fromHeight,
+				"to_height":              tip.Height,
+				"scanned_from":           fromHeight,
+				"scanned_to":             tip.Height,
+				"next_height":            fromHeight,
+				"inserted_notes":         0,
+				"inserted_events":        0,
+				"visited_action_heights": 0,
+				"skipped_heights":        0,
+				"rpc_calls":              0,
+			})
+			return
+		}
+		http.Error(w, "to_height must be >= persisted next_height", http.StatusBadRequest)
+		return
+	}
 
 	res, err := s.bf.BackfillWallet(ctx, backfill.Request{
 		WalletID:   walletID,
@@ -718,7 +777,9 @@ func (s *Server) handleBackfillWallet(w http.ResponseWriter, r *http.Request, wa
 	})
 	if err != nil {
 		if hasProgressStore && progressFound {
-			progress.State, progress.LastError, progress.TargetHeight = "error", err.Error(), toHeight
+			expected := fromHeight
+			progress.ExpectedNextHeight = &expected
+			progress.State, progress.LastError, progress.TargetHeight = "error", err.Error(), tip.Height
 			_ = progressStore.SetWalletBackfillProgress(ctx, progress)
 		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -726,18 +787,46 @@ func (s *Server) handleBackfillWallet(w http.ResponseWriter, r *http.Request, wa
 	}
 
 	next := res.NextHeight
+	if res.ScannedFrom != fromHeight || next <= fromHeight || next > tip.Height+1 {
+		http.Error(w, "invalid backfill progress result", http.StatusConflict)
+		return
+	}
 	if hasProgressStore {
-		if !progressFound {
-			progress = store.WalletBackfillProgress{WalletID: walletID, BirthdayHeight: fromHeight}
-		}
-		progress.NextHeight, progress.TargetHeight, progress.LastError = next, toHeight, ""
+		expected := fromHeight
+		progress.ExpectedNextHeight = &expected
+		progress.NextHeight, progress.TargetHeight, progress.LastError = next, tip.Height, ""
 		progress.State = "running"
-		if next > toHeight {
+		if next > tip.Height {
 			progress.State = "complete"
 		}
 		if err := progressStore.SetWalletBackfillProgress(ctx, progress); err != nil {
+			if errors.Is(err, store.ErrBackfillProgressConflict) {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
+		}
+		if progress.State == "complete" {
+			latestTip, found, err := s.st.Tip(ctx)
+			if err != nil {
+				http.Error(w, "db error", http.StatusInternalServerError)
+				return
+			}
+			if found && latestTip.Height >= next {
+				if err := s.st.WithTx(ctx, func(tx store.Tx) error {
+					return tx.AdvanceCompleteWalletBackfillProgress(ctx, latestTip.Height)
+				}); err != nil {
+					http.Error(w, "db error", http.StatusInternalServerError)
+					return
+				}
+				if refreshed, found, err := progressStore.WalletBackfillStatus(ctx, walletID); err != nil {
+					http.Error(w, "db error", http.StatusInternalServerError)
+					return
+				} else if found && refreshed.Generation == progress.Generation {
+					next = refreshed.NextHeight
+				}
+			}
 		}
 	}
 	writeJSON(w, map[string]any{
@@ -1001,6 +1090,10 @@ func (s *Server) handleOrchardWitness(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.computeOrchardWitness(ctx, anchorHeight, req.Positions)
 	if err != nil {
+		if errors.Is(err, errWitnessAnchorChanged) {
+			http.Error(w, "witness anchor changed; retry", http.StatusConflict)
+			return
+		}
 		if errors.Is(err, errDBAccess) {
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return

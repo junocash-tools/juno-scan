@@ -69,7 +69,7 @@ func TestIntegration_API_BackfillWallet(t *testing.T) {
 	}()
 
 	// Produce a deposit before registering the wallet with the scanner.
-	mustRun(t, jd.CLICommand(ctx, "generate", "101"))
+	ensureMatureCoinbaseUTXO(t, ctx, jd)
 	fromAddr := mustCoinbaseAddress(t, ctx, jd)
 	opid := mustShieldCoinbase(t, ctx, jd, fromAddr, addr)
 	mustWaitOpSuccess(t, ctx, jd, opid)
@@ -174,7 +174,7 @@ func TestIntegration_API_BackfillWallet(t *testing.T) {
 	}
 
 	// Backfill again should be idempotent (no duplicated DepositEvent).
-	bfResp2, err := http.Post(srv.URL+"/v1/wallets/hot/backfill", "application/json", bytes.NewReader(reqBody))
+	bfResp2, err := http.Post(srv.URL+"/v1/wallets/hot/backfill", "application/json", bytes.NewReader([]byte(`{}`)))
 	if err != nil {
 		t.Fatalf("POST /v1/wallets/hot/backfill(2): %v", err)
 	}
@@ -226,7 +226,7 @@ func TestIntegration_BackfillCrossWalletTransferOrderIndependent(t *testing.T) {
 	addrB, ufvkB := mustCreateWalletAndUFVK(t, ctx, jd)
 	uaHRP := strings.SplitN(addrA, "1", 2)[0]
 	rpc := sdkjunocashd.New(jd.RPCURL, jd.RPCUser, jd.RPCPassword)
-	mustRun(t, jd.CLICommand(ctx, "generate", "101"))
+	ensureMatureCoinbaseUTXO(t, ctx, jd)
 	shieldOpID := mustShieldCoinbase(t, ctx, jd, mustCoinbaseAddress(t, ctx, jd), addrA)
 	mustWaitOpSuccess(t, ctx, jd, shieldOpID)
 	mustRun(t, jd.CLICommand(ctx, "generate", "2"))
@@ -288,6 +288,19 @@ func TestIntegration_BackfillCrossWalletTransferOrderIndependent(t *testing.T) {
 				if strings.HasPrefix(event.Kind, "Deposit") {
 					t.Fatalf("order %v exposed cross-wallet deposit: %+v", order, event)
 				}
+			}
+			eventsA, _, err := st.ListWalletEvents(ctx, "wallet-a", 0, 1000, store.EventFilter{TxID: transferTxID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			outgoingEvents := 0
+			for _, event := range eventsA {
+				if event.Kind == "OutgoingOutputEvent" {
+					outgoingEvents++
+				}
+			}
+			if outgoingEvents != 1 {
+				t.Fatalf("order %v outgoing recovery events=%d want 1: %+v", order, outgoingEvents, eventsA)
 			}
 		})
 	}

@@ -97,6 +97,7 @@ paths:
         - name: cursor
           in: query
           required: false
+          description: Must be a non-negative int64. Persist with event_epoch; reset when the epoch changes.
           schema:
             type: integer
             format: int64
@@ -155,6 +156,12 @@ paths:
             text/plain:
               schema:
                 type: string
+        "409":
+          description: Event journal changed during the read or cursor exceeds its durable maximum
+          content:
+            text/plain:
+              schema:
+                type: string
         "500":
           description: DB error
           content:
@@ -207,6 +214,12 @@ paths:
                 type: string
         "400":
           description: Invalid request
+          content:
+            text/plain:
+              schema:
+                type: string
+        "409":
+          description: Non-contiguous or stale backfill progress
           content:
             text/plain:
               schema:
@@ -355,6 +368,12 @@ paths:
             text/plain:
               schema:
                 type: string
+        "409":
+          description: Canonical anchor changed while the witness was computed; retry
+          content:
+            text/plain:
+              schema:
+                type: string
         "500":
           description: DB / witness error
           content:
@@ -369,21 +388,28 @@ components:
   schemas:
     HealthResponse:
       type: object
-      required: [status, event_epoch]
+      required: [status, event_epoch, confirmations]
       properties:
         status:
           type: string
           enum: [ok, degraded]
         ready:
           type: boolean
+          description: True only with a scanned tip, acceptable node lag, and every enabled wallet complete beyond that tip with matching identity and birthday.
         event_epoch:
           type: string
           pattern: "^[0-9a-f]{64}$"
+          description: Rotates once per scanner process start and after destructive event-journal reset or repair.
         network:
           type: string
           enum: [mainnet, testnet, regtest]
         ua_hrp:
           type: string
+        confirmations:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Configured confirmation threshold used for lifecycle events and default balance availability.
         scanned_height:
           type: integer
           format: int64
@@ -500,7 +526,7 @@ components:
           type: integer
           format: int64
           minimum: 0
-          default: 0
+          description: Must equal the wallet's persisted next_height. Omit to use it automatically.
         to_height:
           type: integer
           format: int64
@@ -564,7 +590,7 @@ components:
       additionalProperties: true
     BackfillStatus:
       type: object
-      required: [wallet_id, ufvk_fingerprint, birthday_height, next_height, target_height, state, updated_at]
+      required: [wallet_id, ufvk_fingerprint, birthday_height, next_height, target_height, state, generation, updated_at]
       properties:
         wallet_id: {type: string}
         birthday_height: {type: integer, format: int64}
@@ -573,6 +599,7 @@ components:
         target_height: {type: integer, format: int64}
         state: {type: string, enum: [pending, running, complete, error]}
         last_error: {type: string}
+        generation: {type: integer, format: int64, minimum: 1}
         updated_at: {type: string, format: date-time}
       additionalProperties: false
     AddressBalanceResponse:

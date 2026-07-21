@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.5.0 (2026-07-21)
+
+- Add durable wallet identity, birthday, backfill progress, address-balance, outgoing-output, subtree-root, and recovery contracts for exchange operation.
+- Fence backfill against canonical-chain races, preserve contiguous generation-guarded progress, and recover multi-wallet outgoing transactions correctly.
+- Harden event cursors, restart/reset epochs, live-tip readiness, RocksDB recovery, and PostgreSQL/MySQL upgrade paths.
+- Pin release container bases and consume `juno-sdk-go` v1.4.0 deposit-origin contracts.
+
 ## v1.4.5 (2026-03-28)
 
 - Fix scanner shutdown ordering so Pebble closes only after scanner and publisher goroutines exit.

@@ -16,7 +16,9 @@ Each item has:
 - `kind`: identifies the payload type
 - `payload`: the event payload JSON object
 
-The page also has `event_epoch` (64 lowercase hex characters). Persist it with the cursor. A different epoch means the scanner database or event projection changed; reset the cursor.
+The page also has `event_epoch` (64 lowercase hex characters). Persist it with the cursor. It rotates once on every scanner process start and after a destructive event-journal reset or repair. A different epoch means the cursor may be stale; reset it.
+
+Malformed, negative, or overflowing cursors are rejected with HTTP 400. A cursor above the wallet's current durable maximum is rejected with HTTP 409; verify `event_epoch` and reset the cursor.
 
 This document describes the `payload` shapes for each `kind`.
 

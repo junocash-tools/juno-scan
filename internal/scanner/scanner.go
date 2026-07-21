@@ -104,6 +104,14 @@ func New(st store.Store, rpc *sdkjunocashd.Client, uaHRP string, pollInterval ti
 }
 
 func (s *Scanner) Run(ctx context.Context) error {
+	if tip, ok, err := s.st.Tip(ctx); err != nil {
+		return err
+	} else if ok {
+		if err := reconcileCompleteWalletBackfillProgress(ctx, s.st, tip.Height); err != nil {
+			return err
+		}
+	}
+
 	var zmqNotify <-chan struct{}
 	if s.zmqHashBlockEndpoint != "" {
 		ch := make(chan struct{}, 1)
@@ -532,7 +540,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 		walletByID[w.WalletID] = w
 	}
 
-	return s.st.WithTx(ctx, func(tx store.Tx) error {
+	if err := s.st.WithTx(ctx, func(tx store.Tx) error {
 		if err := tx.InsertBlock(ctx, store.Block{
 			Height:   blk.Height,
 			Hash:     blk.Hash,
@@ -783,7 +791,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 
 				if inserted && !isInternalTx {
 					payload := events.DepositEventPayload{
-						Origin: "external",
+						Origin: string(types.DepositOriginExternal),
 						DepositEvent: types.DepositEvent{
 							Version:          types.V1,
 							WalletID:         n.WalletID,
@@ -827,8 +835,19 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 		if err := s.confirmOutgoingOutputConfirmations(ctx, tx, blk.Height); err != nil {
 			return err
 		}
-
 		return nil
+	}); err != nil {
+		return err
+	}
+	// Reconcile once more after the block transaction is visible. Together with
+	// the API's post-CAS tip check, this closes both orderings of a backfill
+	// completion crossing the live block commit.
+	return reconcileCompleteWalletBackfillProgress(ctx, s.st, blk.Height)
+}
+
+func reconcileCompleteWalletBackfillProgress(ctx context.Context, st store.Store, scannedHeight int64) error {
+	return st.WithTx(ctx, func(tx store.Tx) error {
+		return tx.AdvanceCompleteWalletBackfillProgress(ctx, scannedHeight)
 	})
 }
 
@@ -987,7 +1006,7 @@ func (s *Scanner) confirmDepositConfirmations(ctx context.Context, tx store.Tx, 
 
 		payload := events.DepositConfirmedPayload{
 			DepositEventPayload: events.DepositEventPayload{
-				Origin: "external",
+				Origin: string(types.DepositOriginExternal),
 				DepositEvent: types.DepositEvent{
 					Version:          types.V1,
 					WalletID:         n.WalletID,

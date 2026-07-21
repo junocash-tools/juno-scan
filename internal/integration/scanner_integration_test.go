@@ -425,6 +425,18 @@ func mustCoinbaseAddress(t *testing.T, ctx context.Context, jd *testutil.Running
 	return utxos[0].Address
 }
 
+func ensureMatureCoinbaseUTXO(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd) {
+	t.Helper()
+	out := mustRun(t, jd.CLICommand(ctx, "getblockcount"))
+	height, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		t.Fatalf("getblockcount: %v: %s", err, string(out))
+	}
+	if blocks := int64(101) - height; blocks > 0 {
+		mustRun(t, jd.CLICommand(ctx, "generate", strconv.FormatInt(blocks, 10)))
+	}
+}
+
 func mustShieldCoinbase(t *testing.T, ctx context.Context, jd *testutil.RunningJunocashd, fromAddr, toAddr string) string {
 	t.Helper()
 

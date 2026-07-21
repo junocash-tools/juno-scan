@@ -8,15 +8,18 @@ import (
 )
 
 var (
-	ErrWalletUFVKMismatch    = errors.New("wallet_ufvk_immutable")
-	ErrUFVKAlreadyRegistered = errors.New("ufvk_already_registered")
-	ErrBirthdayIncrease      = errors.New("birthday_height_increase_forbidden")
+	ErrWalletUFVKMismatch       = errors.New("wallet_ufvk_immutable")
+	ErrUFVKAlreadyRegistered    = errors.New("ufvk_already_registered")
+	ErrBirthdayIncrease         = errors.New("birthday_height_increase_forbidden")
+	ErrBackfillProgressConflict = errors.New("backfill_progress_conflict")
+	ErrCanonicalBlockChanged    = errors.New("canonical_block_changed")
 )
 
 type Store interface {
 	Close() error
 	Migrate(ctx context.Context) error
 	EventEpoch(ctx context.Context) (string, error)
+	RotateEventEpoch(ctx context.Context) (string, error)
 
 	WithTx(ctx context.Context, fn func(Tx) error) error
 
@@ -30,6 +33,7 @@ type Store interface {
 
 	WalletEventPublishCursor(ctx context.Context, walletID string) (int64, error)
 	SetWalletEventPublishCursor(ctx context.Context, walletID string, cursor int64) error
+	MaxWalletEventID(ctx context.Context, walletID string) (int64, error)
 
 	ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, filter EventFilter) (events []Event, nextCursor int64, err error)
 	ListWalletNotesPage(ctx context.Context, walletID string, query NotesQuery) (notes []Note, nextCursor *NotesCursor, err error)
@@ -45,6 +49,8 @@ type Store interface {
 }
 
 type Tx interface {
+	AssertCanonicalBlock(ctx context.Context, height int64, hash string) error
+	AdvanceCompleteWalletBackfillProgress(ctx context.Context, scannedHeight int64) error
 	InsertBlock(ctx context.Context, b Block) error
 	NextOrchardCommitmentPosition(ctx context.Context) (int64, error)
 	InsertOrchardAction(ctx context.Context, a OrchardAction) error
@@ -74,14 +80,16 @@ type Wallet struct {
 }
 
 type WalletBackfillProgress struct {
-	WalletID        string    `json:"wallet_id"`
-	UFVKFingerprint string    `json:"ufvk_fingerprint"`
-	BirthdayHeight  int64     `json:"birthday_height"`
-	NextHeight      int64     `json:"next_height"`
-	TargetHeight    int64     `json:"target_height"`
-	State           string    `json:"state"`
-	LastError       string    `json:"last_error,omitempty"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	WalletID           string    `json:"wallet_id"`
+	UFVKFingerprint    string    `json:"ufvk_fingerprint"`
+	BirthdayHeight     int64     `json:"birthday_height"`
+	NextHeight         int64     `json:"next_height"`
+	TargetHeight       int64     `json:"target_height"`
+	State              string    `json:"state"`
+	LastError          string    `json:"last_error,omitempty"`
+	Generation         int64     `json:"generation"`
+	UpdatedAt          time.Time `json:"updated_at"`
+	ExpectedNextHeight *int64    `json:"-"`
 }
 
 type WalletUFVK struct {

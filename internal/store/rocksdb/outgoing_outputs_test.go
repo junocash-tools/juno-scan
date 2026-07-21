@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Abdullah1738/juno-scan/internal/store"
+	"github.com/cockroachdb/pebble"
 )
 
 func TestStore_RollbackOutgoingOutputs(t *testing.T) {
@@ -139,6 +140,150 @@ func TestStore_RollbackOutgoingOutputs(t *testing.T) {
 	}
 	if !sawUnconfirmed || !sawOrphaned {
 		t.Fatalf("expected OutgoingOutputUnconfirmed(tx1) and OutgoingOutputOrphaned(tx2), got %+v", evs)
+	}
+}
+
+func TestStore_RollbackReversesAndReemitsOutgoingExpiry(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "expiry-rollback.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertWallet(ctx, "hot", "ufvk"); err != nil {
+		t.Fatal(err)
+	}
+	seen := time.Unix(100, 0).UTC()
+	expiryHeight := int64(5)
+	if err := st.WithTx(ctx, func(tx store.Tx) error {
+		if err := tx.InsertBlock(ctx, store.Block{Height: 5, Hash: "h5"}); err != nil {
+			return err
+		}
+		if err := tx.InsertBlock(ctx, store.Block{Height: 6, Hash: "h6"}); err != nil {
+			return err
+		}
+		_, err := tx.InsertOutgoingOutput(ctx, store.OutgoingOutput{WalletID: "hot", TxID: "tx", ActionIndex: 0, MempoolSeenAt: &seen, TxExpiryHeight: &expiryHeight, RecipientAddress: "u", ValueZat: 1, OvkScope: "external"})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	expire := func() error {
+		return st.WithTx(ctx, func(tx store.Tx) error {
+			expired, err := tx.ExpireOutgoingOutputs(ctx, 6, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			if len(expired) != 1 {
+				t.Fatalf("expired outputs=%d want 1", len(expired))
+			}
+			return tx.InsertEvent(ctx, store.Event{Kind: "OutgoingOutputExpired", WalletID: "hot", Height: 6, Payload: json.RawMessage(`{"txid":"tx"}`)})
+		})
+	}
+	if err := expire(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RollbackToHeight(ctx, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.WithTx(ctx, func(tx store.Tx) error {
+		return tx.InsertBlock(ctx, store.Block{Height: 6, Hash: "h6b"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := expire(); err != nil {
+		t.Fatalf("expiry did not re-emit after rollback: %v", err)
+	}
+	events, _, err := st.ListWalletEvents(ctx, "hot", 0, 100, store.EventFilter{Kinds: []string{"OutgoingOutputExpired"}})
+	if err != nil || len(events) != 1 || events[0].Height != 6 {
+		t.Fatalf("re-emitted events=%+v err=%v", events, err)
+	}
+}
+
+func TestStore_MigrateRepairsLegacyOutgoingExpiryObservation(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "legacy-expiry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertWallet(ctx, "hot", "ufvk"); err != nil {
+		t.Fatal(err)
+	}
+	seenAt := time.Unix(100, 0).UTC()
+	expiryHeight := int64(5)
+	if err := st.WithTx(ctx, func(tx store.Tx) error {
+		for _, txid := range []string{"with-event", "without-event"} {
+			if _, err := tx.InsertOutgoingOutput(ctx, store.OutgoingOutput{WalletID: "hot", TxID: txid, ActionIndex: 0, MempoolSeenAt: &seenAt, TxExpiryHeight: &expiryHeight, RecipientAddress: "u", ValueZat: 1, OvkScope: "external"}); err != nil {
+				return err
+			}
+		}
+		expired, err := tx.ExpireOutgoingOutputs(ctx, 6, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		if len(expired) != 2 {
+			t.Fatalf("expired outputs=%d want 2", len(expired))
+		}
+		return tx.InsertEvent(ctx, store.Event{Kind: "OutgoingOutputExpired", WalletID: "hot", Height: 6, Payload: json.RawMessage(`{"txid":"with-event","action_index":0}`)})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, txid := range []string{"with-event", "without-event"} {
+		key := keyOutgoingOutput("hot", txid, 0)
+		value, closer, err := st.db.Get(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rec outgoingOutputRecord
+		if err := json.Unmarshal(value, &rec); err != nil {
+			_ = closer.Close()
+			t.Fatal(err)
+		}
+		_ = closer.Close()
+		rec.ExpiredHeight = nil
+		value, err = json.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.db.Set(key, value, pebble.NoSync); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.db.Delete(keyMeta("outgoing_expiry_observation_repaired"), pebble.NoSync); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for txid, want := range map[string]int64{"with-event": 6, "without-event": int64(1<<63 - 1)} {
+		value, closer, err := st.db.Get(keyOutgoingOutput("hot", txid, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rec outgoingOutputRecord
+		if err := json.Unmarshal(value, &rec); err != nil {
+			_ = closer.Close()
+			t.Fatal(err)
+		}
+		_ = closer.Close()
+		if rec.ExpiredHeight == nil || *rec.ExpiredHeight != want {
+			t.Fatalf("legacy expiry txid=%s height=%v want=%d", txid, rec.ExpiredHeight, want)
+		}
+	}
+	if err := st.RollbackToHeight(ctx, 5); err != nil {
+		t.Fatal(err)
+	}
+	for _, txid := range []string{"with-event", "without-event"} {
+		outputs, err := st.ListOutgoingOutputsByTxID(ctx, "hot", txid)
+		if err != nil || len(outputs) != 1 || outputs[0].ExpiredAt != nil {
+			t.Fatalf("legacy expiry did not unexpire txid=%s outputs=%+v err=%v", txid, outputs, err)
+		}
 	}
 }
 

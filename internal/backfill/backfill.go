@@ -108,14 +108,14 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 		return Result{}, err
 	}
 	wallets := make([]orchardscan.Wallet, 0, len(registered))
-	walletUFVK := ""
+	walletFound := false
 	for _, w := range registered {
 		wallets = append(wallets, orchardscan.Wallet{WalletID: w.WalletID, UFVK: w.UFVK})
 		if w.WalletID == req.WalletID {
-			walletUFVK = w.UFVK
+			walletFound = true
 		}
 	}
-	if walletUFVK == "" {
+	if !walletFound {
 		return Result{}, errors.New("backfill: wallet not found (or disabled)")
 	}
 
@@ -147,12 +147,10 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 	var rpcCalls int64
 
 	for _, height := range actionHeights {
-		hash, ok, err := s.st.HashAtHeight(ctx, height)
+		hash, calls, err := s.canonicalHashAtHeight(ctx, height)
+		rpcCalls += calls
 		if err != nil {
 			return Result{}, err
-		}
-		if !ok {
-			return Result{}, fmt.Errorf("backfill: missing block at height %d (scanner tip is behind)", height)
 		}
 
 		var blk blockVerbose2
@@ -160,13 +158,16 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 			return Result{}, fmt.Errorf("backfill: getblock(%d): %w", height, err)
 		}
 		rpcCalls++
-		if blk.Height != height {
-			return Result{}, fmt.Errorf("backfill: daemon returned unexpected height: got %d want %d", blk.Height, height)
+		if blk.Height != height || strings.ToLower(strings.TrimSpace(blk.Hash)) != hash {
+			return Result{}, fmt.Errorf("%w: daemon block mismatch at height %d", store.ErrCanonicalBlockChanged, height)
 		}
 
 		startPos := nextPos
 
 		err = s.st.WithTx(ctx, func(tx store.Tx) error {
+			if err := tx.AssertCanonicalBlock(ctx, height, hash); err != nil {
+				return fmt.Errorf("backfill: canonical fence height %d: %w", height, err)
+			}
 			posByTxAction := make(map[string]map[uint32]int64)
 			txHexes := make([]string, 0, len(blk.Tx))
 			for _, t := range blk.Tx {
@@ -247,7 +248,20 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 
 				// Record outgoing outputs for spends (recipient/value/memo via OVK output recovery).
 				if len(spentNotes) > 0 {
-					outs, err := orchardscan.RecoverOutgoingTx(ctx, s.uaHRP, []orchardscan.Wallet{{WalletID: req.WalletID, UFVK: walletUFVK}}, t.Hex)
+					spentWalletIDs := make(map[string]struct{}, len(spentNotes))
+					for _, n := range spentNotes {
+						spentWalletIDs[n.WalletID] = struct{}{}
+					}
+					recoveryWallets := make([]orchardscan.Wallet, 0, len(spentWalletIDs))
+					for _, wallet := range wallets {
+						if _, spent := spentWalletIDs[wallet.WalletID]; spent {
+							recoveryWallets = append(recoveryWallets, wallet)
+						}
+					}
+					if len(recoveryWallets) != len(spentWalletIDs) {
+						return errors.New("backfill: spent-note wallet identity changed")
+					}
+					outs, err := orchardscan.RecoverOutgoingTx(ctx, s.uaHRP, recoveryWallets, t.Hex)
 					if err != nil {
 						return fmt.Errorf("backfill: recover outgoing tx %s: %w", t.TxID, err)
 					}
@@ -366,7 +380,7 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 					}
 					if inserted && !isInternalTx {
 						payload := events.DepositEventPayload{
-							Origin: "external",
+							Origin: string(types.DepositOriginExternal),
 							DepositEvent: types.DepositEvent{
 								Version:          types.V1,
 								WalletID:         n.WalletID,
@@ -432,7 +446,15 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 	}
 
 	// Coalesce confirmation progress across barren ranges into one final write.
+	finalHash, calls, err := s.canonicalHashAtHeight(ctx, scanTo)
+	rpcCalls += calls
+	if err != nil {
+		return Result{}, err
+	}
 	if err := s.st.WithTx(ctx, func(tx store.Tx) error {
+		if err := tx.AssertCanonicalBlock(ctx, scanTo, finalHash); err != nil {
+			return fmt.Errorf("backfill: final canonical fence height %d: %w", scanTo, err)
+		}
 		_, eventsAdded, err := confirmDepositConfirmations(ctx, tx, s.confirmations, scanTo)
 		if err != nil {
 			return err
@@ -470,6 +492,26 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 		SkippedHeights:       (scanTo - req.FromHeight + 1) - int64(len(actionHeights)),
 		RPCCalls:             rpcCalls,
 	}, nil
+}
+
+func (s *Service) canonicalHashAtHeight(ctx context.Context, height int64) (string, int64, error) {
+	stored, ok, err := s.st.HashAtHeight(ctx, height)
+	if err != nil {
+		return "", 0, err
+	}
+	stored = strings.ToLower(strings.TrimSpace(stored))
+	if !ok || stored == "" {
+		return "", 0, fmt.Errorf("backfill: missing block at height %d (scanner tip is behind)", height)
+	}
+	var canonical string
+	if err := s.rpc.Call(ctx, "getblockhash", []any{height}, &canonical); err != nil {
+		return "", 1, fmt.Errorf("backfill: getblockhash(%d): %w", height, err)
+	}
+	canonical = strings.ToLower(strings.TrimSpace(canonical))
+	if canonical == "" || canonical != stored {
+		return "", 1, fmt.Errorf("%w: height %d stored=%s rpc=%s", store.ErrCanonicalBlockChanged, height, stored, canonical)
+	}
+	return stored, 1, nil
 }
 
 func (s *Service) walletUFVK(ctx context.Context, walletID string) (string, bool, error) {
@@ -512,7 +554,7 @@ func confirmDepositConfirmations(ctx context.Context, tx store.Tx, confirmations
 
 		payload := events.DepositConfirmedPayload{
 			DepositEventPayload: events.DepositEventPayload{
-				Origin: "external",
+				Origin: string(types.DepositOriginExternal),
 				DepositEvent: types.DepositEvent{
 					Version:          types.V1,
 					WalletID:         n.WalletID,

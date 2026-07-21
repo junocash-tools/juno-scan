@@ -3,6 +3,7 @@ package rocksdb
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -11,7 +12,7 @@ import (
 	"github.com/cockroachdb/pebble"
 )
 
-func TestEventEpochStablePerDatabaseAndDifferentForFreshDatabase(t *testing.T) {
+func TestEventEpochRotatesOncePerStartupAndIsStableWithinProcess(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir() + "/one.db"
 	st, err := Open(path)
@@ -21,7 +22,7 @@ func TestEventEpochStablePerDatabaseAndDifferentForFreshDatabase(t *testing.T) {
 	if err := st.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	first, err := st.EventEpoch(ctx)
+	first, err := st.RotateEventEpoch(ctx)
 	if err != nil || len(first) != store.EventEpochHexLength {
 		t.Fatalf("epoch=%q err=%v", first, err)
 	}
@@ -36,9 +37,16 @@ func TestEventEpochStablePerDatabaseAndDifferentForFreshDatabase(t *testing.T) {
 	if err := st.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	second, _ := st.EventEpoch(ctx)
-	if second != first {
-		t.Fatalf("epoch changed across restart: %q != %q", second, first)
+	persisted, _ := st.EventEpoch(ctx)
+	if persisted != first {
+		t.Fatalf("persisted epoch changed before startup rotation: %q != %q", persisted, first)
+	}
+	second, err := st.RotateEventEpoch(ctx)
+	if err != nil || second == first {
+		t.Fatalf("startup did not rotate epoch: first=%q second=%q err=%v", first, second, err)
+	}
+	if stable, _ := st.EventEpoch(ctx); stable != second {
+		t.Fatalf("startup epoch unstable within process: %q != %q", stable, second)
 	}
 	fresh, err := Open(t.TempDir() + "/fresh.db")
 	if err != nil {
@@ -48,9 +56,41 @@ func TestEventEpochStablePerDatabaseAndDifferentForFreshDatabase(t *testing.T) {
 	if err := fresh.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	third, _ := fresh.EventEpoch(ctx)
-	if third == first {
+	third, _ := fresh.RotateEventEpoch(ctx)
+	if third == first || third == second {
 		t.Fatalf("fresh databases share epoch %q", first)
+	}
+}
+
+func TestV3UpgradeRejectsDuplicateUFVKsWithoutAdvancingSchema(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(t.TempDir() + "/duplicates.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.db.Set(keyMeta("schema_version"), []byte("3"), pebble.NoSync); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.Set(keyMeta("event_epoch"), []byte(strings.Repeat("a", store.EventEpochHexLength)), pebble.NoSync); err != nil {
+		t.Fatal(err)
+	}
+	for _, walletID := range []string{"wallet-a", "wallet-b"} {
+		encoded, _ := json.Marshal(walletRecord{UFVK: "duplicate-ufvk", CreatedAtUnix: 1})
+		if err := st.db.Set(keyWallet(walletID), encoded, pebble.NoSync); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Migrate(ctx); !errors.Is(err, store.ErrUFVKAlreadyRegistered) {
+		t.Fatalf("Migrate duplicate UFVK err=%v", err)
+	}
+	v, closer, err := st.db.Get(keyMeta("schema_version"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closer.Close()
+	if string(v) != "3" {
+		t.Fatalf("failed migration advanced schema to %q", string(v))
 	}
 }
 
@@ -154,9 +194,9 @@ func TestInternalTransactionQuarantinePersistsAcrossRestartAndRollback(t *testin
 	if err := st.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	restartedEpoch, _ := st.EventEpoch(ctx)
-	if restartedEpoch != epoch {
-		t.Fatalf("epoch changed on restart: %q != %q", restartedEpoch, epoch)
+	restartedEpoch, err := st.RotateEventEpoch(ctx)
+	if err != nil || restartedEpoch == epoch {
+		t.Fatalf("epoch did not change on startup restart: %q == %q err=%v", restartedEpoch, epoch, err)
 	}
 	if err := st.RollbackToHeight(ctx, 0); err != nil {
 		t.Fatal(err)

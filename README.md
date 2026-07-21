@@ -60,7 +60,9 @@ Pending spends are *sticky*: if a spend disappears from the mempool before it is
 The notes endpoint returns incoming notes plus mined outgoing notes recovered via OVK. Each note object includes `direction` (`incoming` or `outgoing`) and `memo_hex`; when no memo is stored it is returned as `null`. Outgoing notes include `ovk_scope` / `recipient_scope` when available, and `spent` filtering applies only to incoming notes.
 When additional pages exist, the notes response includes `next_cursor`; pass it back as `cursor` to continue.
 
-Every health and event-page response includes `event_epoch`, exactly 64 lowercase hexadecimal characters. Bind persisted event cursors to this value. A fresh/recreated scanner database or a repaired event journal has a new epoch; discard old cursors and restart consumption.
+Every health and event-page response includes `event_epoch`, exactly 64 lowercase hexadecimal characters. Bind persisted event cursors to this value. It rotates once on every scanner process start and after a destructive event-journal reset or repair. Discard old cursors and restart consumption whenever it changes.
+The events API rejects a cursor above the wallet's durable event maximum with HTTP `409`; verify `event_epoch` and reset the cursor.
+Health also reports `confirmations`; gateways should fail readiness when it differs from their configured default.
 
 If you configured `-api-bearer-token`, include `-H 'Authorization: Bearer <token>'` in all requests.
 
@@ -212,6 +214,7 @@ HTTP API stability:
 ```
 
 If `anchor_height` is omitted, the current scanned tip height is used.
+Witness reads verify the canonical anchor before and after computation; retry HTTP `409` responses after a reorg.
 
 ## Events
 

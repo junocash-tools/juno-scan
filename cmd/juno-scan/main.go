@@ -52,7 +52,7 @@ func run(ctx context.Context, cfg config.Config) error {
 	st := mustOpenStore(runCtx, cfg)
 	defer func() { _ = st.Close() }()
 
-	if err := st.Migrate(runCtx); err != nil {
+	if err := prepareStoreForStartup(runCtx, st); err != nil {
 		return err
 	}
 
@@ -171,6 +171,19 @@ func run(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	return nil
+}
+
+type startupStore interface {
+	Migrate(context.Context) error
+	RotateEventEpoch(context.Context) (string, error)
+}
+
+func prepareStoreForStartup(ctx context.Context, st startupStore) error {
+	if err := st.Migrate(ctx); err != nil {
+		return err
+	}
+	_, err := st.RotateEventEpoch(ctx)
+	return err
 }
 
 func mustOpenStore(ctx context.Context, cfg config.Config) store.Store {

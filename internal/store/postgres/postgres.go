@@ -97,6 +97,17 @@ func (s *Store) EventEpoch(ctx context.Context) (string, error) {
 	return epoch, nil
 }
 
+func (s *Store) RotateEventEpoch(ctx context.Context) (string, error) {
+	epoch, err := store.NewEventEpoch()
+	if err != nil {
+		return "", err
+	}
+	if err := s.pool.QueryRow(ctx, `INSERT INTO scanner_metadata (key,value) VALUES ('event_epoch',$1) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value RETURNING value`, epoch).Scan(&epoch); err != nil {
+		return "", fmt.Errorf("postgres: rotate event epoch: %w", err)
+	}
+	return epoch, nil
+}
+
 func (s *Store) WithTx(ctx context.Context, fn func(store.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -163,7 +174,7 @@ func (s *Store) upsertWalletIdentity(ctx context.Context, walletID, ufvk string,
 		}
 		return fmt.Errorf("postgres: insert wallet: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO wallet_backfill_progress (wallet_id,birthday_height,next_height,target_height,state,last_error) VALUES ($1,$2,$2,0,'pending','') ON CONFLICT (wallet_id) DO UPDATE SET next_height=CASE WHEN wallet_backfill_progress.birthday_height<>EXCLUDED.birthday_height THEN EXCLUDED.birthday_height ELSE wallet_backfill_progress.next_height END,state=CASE WHEN wallet_backfill_progress.birthday_height<>EXCLUDED.birthday_height THEN 'pending' ELSE wallet_backfill_progress.state END,birthday_height=EXCLUDED.birthday_height,updated_at=NOW()`, walletID, requestedBirthday); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO wallet_backfill_progress (wallet_id,birthday_height,next_height,target_height,state,last_error,generation) VALUES ($1,$2,$2,0,'pending','',1) ON CONFLICT (wallet_id) DO UPDATE SET next_height=CASE WHEN wallet_backfill_progress.birthday_height<>EXCLUDED.birthday_height THEN EXCLUDED.birthday_height ELSE wallet_backfill_progress.next_height END,state=CASE WHEN wallet_backfill_progress.birthday_height<>EXCLUDED.birthday_height THEN 'pending' ELSE wallet_backfill_progress.state END,last_error=CASE WHEN wallet_backfill_progress.birthday_height<>EXCLUDED.birthday_height THEN '' ELSE wallet_backfill_progress.last_error END,generation=CASE WHEN wallet_backfill_progress.birthday_height<>EXCLUDED.birthday_height THEN wallet_backfill_progress.generation+1 ELSE wallet_backfill_progress.generation END,birthday_height=EXCLUDED.birthday_height,updated_at=NOW()`, walletID, requestedBirthday); err != nil {
 		return fmt.Errorf("postgres: upsert wallet backfill progress: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -175,7 +186,7 @@ func (s *Store) upsertWalletIdentity(ctx context.Context, walletID, ufvk string,
 func (s *Store) WalletBackfillStatus(ctx context.Context, walletID string) (store.WalletBackfillProgress, bool, error) {
 	p := store.WalletBackfillProgress{WalletID: walletID}
 	var ufvk string
-	err := s.pool.QueryRow(ctx, `SELECT p.birthday_height,p.next_height,p.target_height,p.state,p.last_error,p.updated_at,w.ufvk FROM wallet_backfill_progress p JOIN wallets w USING (wallet_id) WHERE p.wallet_id=$1`, walletID).Scan(&p.BirthdayHeight, &p.NextHeight, &p.TargetHeight, &p.State, &p.LastError, &p.UpdatedAt, &ufvk)
+	err := s.pool.QueryRow(ctx, `SELECT p.birthday_height,p.next_height,p.target_height,p.state,p.last_error,p.generation,p.updated_at,w.ufvk FROM wallet_backfill_progress p JOIN wallets w USING (wallet_id) WHERE p.wallet_id=$1`, walletID).Scan(&p.BirthdayHeight, &p.NextHeight, &p.TargetHeight, &p.State, &p.LastError, &p.Generation, &p.UpdatedAt, &ufvk)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return p, false, nil
 	}
@@ -187,9 +198,21 @@ func (s *Store) WalletBackfillStatus(ctx context.Context, walletID string) (stor
 }
 
 func (s *Store) SetWalletBackfillProgress(ctx context.Context, p store.WalletBackfillProgress) error {
-	_, err := s.pool.Exec(ctx, `UPDATE wallet_backfill_progress SET next_height=$2,target_height=$3,state=$4,last_error=$5,updated_at=NOW() WHERE wallet_id=$1`, p.WalletID, p.NextHeight, p.TargetHeight, p.State, p.LastError)
+	if p.Generation < 1 {
+		return store.ErrBackfillProgressConflict
+	}
+	query := `UPDATE wallet_backfill_progress SET next_height=$2,target_height=$3,state=$4,last_error=$5,updated_at=NOW() WHERE wallet_id=$1 AND generation=$6`
+	args := []any{p.WalletID, p.NextHeight, p.TargetHeight, p.State, p.LastError, p.Generation}
+	if p.ExpectedNextHeight != nil {
+		query += ` AND next_height=$7`
+		args = append(args, *p.ExpectedNextHeight)
+	}
+	tag, err := s.pool.Exec(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("postgres: set wallet backfill progress: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return store.ErrBackfillProgressConflict
 	}
 	return nil
 }
@@ -270,6 +293,23 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 		var unconfirmedSpends []store.Note
 		var orphanOutgoingOutputs []store.OutgoingOutput
 		var unconfirmedOutgoingOutputs []store.OutgoingOutput
+
+		blockRows, err := pgtx.tx.Query(ctx, `SELECT height FROM blocks WHERE height > $1 ORDER BY height FOR UPDATE`, height)
+		if err != nil {
+			return fmt.Errorf("postgres: rollback lock blocks: %w", err)
+		}
+		for blockRows.Next() {
+			var lockedHeight int64
+			if err := blockRows.Scan(&lockedHeight); err != nil {
+				blockRows.Close()
+				return fmt.Errorf("postgres: rollback lock blocks: %w", err)
+			}
+		}
+		if err := blockRows.Err(); err != nil {
+			blockRows.Close()
+			return fmt.Errorf("postgres: rollback lock blocks: %w", err)
+		}
+		blockRows.Close()
 
 		if height >= 0 {
 			fetchNotes := func(query string, args ...any) ([]store.Note, error) {
@@ -439,10 +479,16 @@ FROM outgoing_outputs
 		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM orchard_subtree_roots WHERE end_height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback subtree roots: %w", err)
 		}
+		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM orchard_shard_roots WHERE end_height > $1`, height); err != nil {
+			return fmt.Errorf("postgres: rollback shard roots: %w", err)
+		}
+		if _, err := pgtx.tx.Exec(ctx, `UPDATE orchard_shard_cache_state SET next_index = COALESCE((SELECT MAX(shard_index) + 1 FROM orchard_shard_roots), 0), updated_at = NOW() WHERE singleton = TRUE`); err != nil {
+			return fmt.Errorf("postgres: rewind shard cache cursor: %w", err)
+		}
 		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM notes WHERE height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback notes: %w", err)
 		}
-		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM outgoing_outputs WHERE mined_height > $1`, height); err != nil {
+		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM outgoing_outputs WHERE $1 < 0 OR mined_height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback outgoing outputs: %w", err)
 		}
 		if _, err := pgtx.tx.Exec(ctx, `UPDATE notes SET spent_height = NULL, spent_txid = NULL, spent_confirmed_height = NULL WHERE spent_height > $1`, height); err != nil {
@@ -454,11 +500,37 @@ FROM outgoing_outputs
 		if _, err := pgtx.tx.Exec(ctx, `UPDATE outgoing_outputs SET confirmed_height = NULL WHERE confirmed_height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback unconfirm outgoing outputs: %w", err)
 		}
+		if _, err := pgtx.tx.Exec(ctx, `UPDATE outgoing_outputs SET expired_at = NULL, expired_height = NULL WHERE expired_height > $1 OR (expired_at IS NOT NULL AND expired_height IS NULL)`, height); err != nil {
+			return fmt.Errorf("postgres: rollback unexpire outgoing outputs: %w", err)
+		}
 		if _, err := pgtx.tx.Exec(ctx, `UPDATE notes SET spent_confirmed_height = NULL WHERE spent_confirmed_height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback unconfirm spend: %w", err)
 		}
 		if _, err := pgtx.tx.Exec(ctx, `DELETE FROM blocks WHERE height > $1`, height); err != nil {
 			return fmt.Errorf("postgres: rollback blocks: %w", err)
+		}
+		if height < 0 {
+			if _, err := pgtx.tx.Exec(ctx, `DELETE FROM wallet_event_publish_cursors`); err != nil {
+				return fmt.Errorf("postgres: reset event publish cursors: %w", err)
+			}
+			if _, err := pgtx.tx.Exec(ctx, `
+UPDATE wallet_backfill_progress
+SET next_height = birthday_height,
+    target_height = 0,
+    state = 'pending',
+    last_error = '',
+    generation = generation + 1,
+    updated_at = NOW()
+`); err != nil {
+				return fmt.Errorf("postgres: reset backfill progress: %w", err)
+			}
+			epoch, err := store.NewEventEpoch()
+			if err != nil {
+				return err
+			}
+			if _, err := pgtx.tx.Exec(ctx, `INSERT INTO scanner_metadata (key,value) VALUES ('event_epoch',$1) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`, epoch); err != nil {
+				return fmt.Errorf("postgres: rotate event epoch after destructive reset: %w", err)
+			}
 		}
 
 		if height >= 0 {
@@ -472,7 +544,7 @@ FROM outgoing_outputs
 				}
 				payload := events.DepositOrphanedPayload{
 					DepositEventPayload: events.DepositEventPayload{
-						Origin: "external",
+						Origin: string(types.DepositOriginExternal),
 						DepositEvent: types.DepositEvent{
 							Version:          types.V1,
 							WalletID:         n.WalletID,
@@ -520,7 +592,7 @@ FROM outgoing_outputs
 				}
 				payload := events.DepositUnconfirmedPayload{
 					DepositEventPayload: events.DepositEventPayload{
-						Origin: "external",
+						Origin: string(types.DepositOriginExternal),
 						DepositEvent: types.DepositEvent{
 							Version:          types.V1,
 							WalletID:         n.WalletID,
@@ -759,6 +831,14 @@ DO UPDATE SET cursor = EXCLUDED.cursor, updated_at = now()
 		return fmt.Errorf("postgres: set publish cursor: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) MaxWalletEventID(ctx context.Context, walletID string) (int64, error) {
+	var maxID int64
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(id), 0) FROM events WHERE wallet_id=$1`, walletID).Scan(&maxID); err != nil {
+		return 0, fmt.Errorf("postgres: max wallet event id: %w", err)
+	}
+	return maxID, nil
 }
 
 func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, filter store.EventFilter) ([]store.Event, int64, error) {
@@ -1576,6 +1656,39 @@ type pgTx struct {
 	tx pgx.Tx
 }
 
+func (t *pgTx) AssertCanonicalBlock(ctx context.Context, height int64, hash string) error {
+	var stored string
+	if err := t.tx.QueryRow(ctx, `SELECT hash FROM blocks WHERE height=$1 FOR UPDATE`, height).Scan(&stored); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.ErrCanonicalBlockChanged
+		}
+		return fmt.Errorf("postgres: lock canonical block: %w", err)
+	}
+	if stored != hash {
+		return store.ErrCanonicalBlockChanged
+	}
+	return nil
+}
+
+func (t *pgTx) AdvanceCompleteWalletBackfillProgress(ctx context.Context, scannedHeight int64) error {
+	if scannedHeight < 0 {
+		return nil
+	}
+	if _, err := t.tx.Exec(ctx, `
+UPDATE wallet_backfill_progress
+SET next_height=$1,
+    target_height=GREATEST(target_height,$2),
+    updated_at=NOW()
+WHERE state='complete'
+  AND generation >= 1
+  AND next_height >= birthday_height
+  AND next_height <= $2
+`, scannedHeight+1, scannedHeight); err != nil {
+		return fmt.Errorf("postgres: advance complete wallet backfill progress: %w", err)
+	}
+	return nil
+}
+
 func (t *pgTx) InsertBlock(ctx context.Context, b store.Block) error {
 	_, err := t.tx.Exec(ctx, `
 INSERT INTO blocks (height, hash, prev_hash, time)
@@ -1983,7 +2096,7 @@ func (t *pgTx) ExpireOutgoingOutputs(ctx context.Context, chainHeight int64, exp
 
 	rows, err := t.tx.Query(ctx, `
 UPDATE outgoing_outputs
-SET expired_at = $1
+SET expired_at = $1, expired_height = $2
 WHERE mined_height IS NULL
   AND expired_at IS NULL
   AND mempool_seen_at IS NOT NULL

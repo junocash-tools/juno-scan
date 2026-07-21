@@ -115,4 +115,56 @@ func TestListWalletEvents_BlockHeightFilter(t *testing.T) {
 			t.Fatalf("expected 400, got %d", httpResp.StatusCode)
 		}
 	})
+
+	for _, cursor := range []string{"-1", "nope", "9223372036854775808"} {
+		cursor := cursor
+		t.Run("invalid cursor "+cursor, func(t *testing.T) {
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/v1/wallets/hot/events?cursor="+cursor, nil)
+			httpResp, err := (&http.Client{}).Do(req)
+			if err != nil {
+				t.Fatalf("GET events: %v", err)
+			}
+			defer httpResp.Body.Close()
+			if httpResp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("cursor %q replayed from zero: status=%d", cursor, httpResp.StatusCode)
+			}
+		})
+	}
+
+	t.Run("cursor ahead of durable journal", func(t *testing.T) {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/v1/wallets/hot/events?cursor=4", nil)
+		httpResp, err := (&http.Client{}).Do(req)
+		if err != nil {
+			t.Fatalf("GET events: %v", err)
+		}
+		defer httpResp.Body.Close()
+		if httpResp.StatusCode != http.StatusConflict {
+			t.Fatalf("cursor ahead status=%d want 409", httpResp.StatusCode)
+		}
+	})
+}
+
+func TestListWalletEventsRejectsCursorAheadOfEmptyJournal(t *testing.T) {
+	ctx := context.Background()
+	st, err := rocksdb.Open(filepath.Join(t.TempDir(), "empty.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if maxID, err := st.MaxWalletEventID(ctx, "hot"); err != nil || maxID != 0 {
+		t.Fatalf("empty max=%d err=%v", maxID, err)
+	}
+	apiServer, err := New(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/wallets/hot/events?cursor=1", nil)
+	rr := httptest.NewRecorder()
+	apiServer.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("empty journal cursor-ahead status=%d body=%s", rr.Code, rr.Body.String())
+	}
 }

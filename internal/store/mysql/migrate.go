@@ -6,10 +6,13 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
+
+	driver "github.com/go-sql-driver/mysql"
 )
 
 //go:embed migrations/*.sql
@@ -51,6 +54,9 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		stmts := splitSQLStatements(m.sql)
 		for _, stmt := range stmts {
 			if _, err := db.ExecContext(ctx, stmt); err != nil {
+				if isCrashResumeDDLError(err) {
+					continue
+				}
 				return fmt.Errorf("mysql: apply %s: %w", m.name, err)
 			}
 		}
@@ -60,6 +66,21 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 	}
 
 	return nil
+}
+
+func isCrashResumeDDLError(err error) bool {
+	var myErr *driver.MySQLError
+	if !errors.As(err, &myErr) {
+		return false
+	}
+	switch myErr.Number {
+	case 1050, // table already exists
+		1060, // duplicate column
+		1061: // duplicate key/index name
+		return true
+	default:
+		return false
+	}
 }
 
 func splitSQLStatements(sql string) []string {

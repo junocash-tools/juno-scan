@@ -23,6 +23,7 @@ var (
 	errInvalidCommitmentPositions = errors.New("api: invalid commitment positions")
 	errDBAccess                   = errors.New("api: db access")
 	errPreferLegacyWitnessPath    = errors.New("api: prefer legacy witness path")
+	errWitnessAnchorChanged       = errors.New("api: witness anchor changed")
 
 	orchardWitnessWithOpsFn = orchardscan.OrchardWitnessWithOps
 )
@@ -84,6 +85,10 @@ func witnessFallbackReason(err error) string {
 }
 
 func computeOrchardWitnessLegacy(ctx context.Context, st store.Store, anchorHeight int64, positions []uint32) (orchardscan.WitnessResult, error) {
+	anchorHash, err := witnessAnchorHash(ctx, st, anchorHeight)
+	if err != nil {
+		return orchardscan.WitnessResult{}, err
+	}
 	commitments, err := st.ListOrchardCommitmentsUpToHeight(ctx, anchorHeight)
 	if err != nil {
 		return orchardscan.WitnessResult{}, fmt.Errorf("%w: list commitments: %v", errDBAccess, err)
@@ -105,7 +110,13 @@ func computeOrchardWitnessLegacy(ctx context.Context, st store.Store, anchorHeig
 	res, err := orchardscan.OrchardWitness(ctx, cmxHex, positions)
 	res.ComputeMode = "legacy"
 	res.StreamedLeafCount = int64(len(cmxHex))
-	return res, err
+	if err != nil {
+		return res, err
+	}
+	if err := verifyWitnessAnchor(ctx, st, anchorHeight, anchorHash); err != nil {
+		return orchardscan.WitnessResult{}, err
+	}
+	return res, nil
 }
 
 func computeOrchardWitnessFast(ctx context.Context, st orchardWitnessFastStore, anchorHeight int64, positions []uint32) (orchardscan.WitnessResult, error) {
@@ -115,6 +126,10 @@ func computeOrchardWitnessFast(ctx context.Context, st orchardWitnessFastStore, 
 func computeOrchardWitnessCached(ctx context.Context, st orchardWitnessFastStore, anchorHeight int64, positions []uint32, useShards bool) (orchardscan.WitnessResult, error) {
 	if anchorHeight < 0 || anchorHeight > int64(^uint32(0)) {
 		return orchardscan.WitnessResult{}, &orchardscan.Error{Code: orchardscan.ErrInvalidRequest}
+	}
+	anchorHash, err := witnessAnchorHash(ctx, st, anchorHeight)
+	if err != nil {
+		return orchardscan.WitnessResult{}, err
 	}
 
 	leafCount, err := st.OrchardTreeSizeAtHeight(ctx, anchorHeight)
@@ -317,5 +332,37 @@ func computeOrchardWitnessCached(ctx context.Context, st orchardWitnessFastStore
 	}
 	res.StreamedLeafCount = streamedLeafCount
 	res.InsertedRootCount = insertedRootCount
-	return res, err
+	if err != nil {
+		return res, err
+	}
+	if err := verifyWitnessAnchor(ctx, st, anchorHeight, anchorHash); err != nil {
+		return orchardscan.WitnessResult{}, err
+	}
+	return res, nil
+}
+
+type witnessAnchorStore interface {
+	HashAtHeight(context.Context, int64) (string, bool, error)
+}
+
+func witnessAnchorHash(ctx context.Context, st witnessAnchorStore, anchorHeight int64) (string, error) {
+	hash, ok, err := st.HashAtHeight(ctx, anchorHeight)
+	if err != nil {
+		return "", fmt.Errorf("%w: read witness anchor: %v", errDBAccess, err)
+	}
+	if !ok || hash == "" {
+		return "", errWitnessAnchorChanged
+	}
+	return hash, nil
+}
+
+func verifyWitnessAnchor(ctx context.Context, st witnessAnchorStore, anchorHeight int64, expectedHash string) error {
+	hash, ok, err := st.HashAtHeight(ctx, anchorHeight)
+	if err != nil {
+		return fmt.Errorf("%w: verify witness anchor: %v", errDBAccess, err)
+	}
+	if !ok || hash != expectedHash {
+		return errWitnessAnchorChanged
+	}
+	return nil
 }

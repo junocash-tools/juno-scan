@@ -33,6 +33,9 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	}
 	cfg.ParseTime = true
 	cfg.Loc = time.UTC
+	// Insert/update idempotency depends on MySQL's default affected-row semantics.
+	// Do not allow a caller-supplied DSN to report matched-but-unchanged rows as changed.
+	cfg.ClientFoundRows = false
 
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
@@ -78,6 +81,17 @@ func (s *Store) EventEpoch(ctx context.Context) (string, error) {
 	}
 	if err := s.db.QueryRowContext(ctx, "SELECT `value` FROM scanner_metadata WHERE `key`='event_epoch'").Scan(&epoch); err != nil {
 		return "", fmt.Errorf("mysql: read event epoch: %w", err)
+	}
+	return epoch, nil
+}
+
+func (s *Store) RotateEventEpoch(ctx context.Context) (string, error) {
+	epoch, err := store.NewEventEpoch()
+	if err != nil {
+		return "", err
+	}
+	if _, err := s.db.ExecContext(ctx, "INSERT INTO scanner_metadata (`key`,`value`) VALUES ('event_epoch',?) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)", epoch); err != nil {
+		return "", fmt.Errorf("mysql: rotate event epoch: %w", err)
 	}
 	return epoch, nil
 }
@@ -148,7 +162,7 @@ func (s *Store) upsertWalletIdentity(ctx context.Context, walletID, ufvk string,
 		}
 		return fmt.Errorf("mysql: insert wallet: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO wallet_backfill_progress (wallet_id,birthday_height,next_height,target_height,state,last_error) VALUES (?,?,?,0,'pending','') ON DUPLICATE KEY UPDATE next_height=IF(birthday_height<>VALUES(birthday_height),VALUES(birthday_height),next_height),state=IF(birthday_height<>VALUES(birthday_height),'pending',state),birthday_height=VALUES(birthday_height)`, walletID, requestedBirthday, requestedBirthday); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO wallet_backfill_progress (wallet_id,birthday_height,next_height,target_height,state,last_error,generation) VALUES (?,?,?,0,'pending','',1) ON DUPLICATE KEY UPDATE next_height=IF(birthday_height<>VALUES(birthday_height),VALUES(birthday_height),next_height),state=IF(birthday_height<>VALUES(birthday_height),'pending',state),last_error=IF(birthday_height<>VALUES(birthday_height),'',last_error),generation=IF(birthday_height<>VALUES(birthday_height),generation+1,generation),birthday_height=VALUES(birthday_height)`, walletID, requestedBirthday, requestedBirthday); err != nil {
 		return fmt.Errorf("mysql: upsert wallet backfill progress: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -160,7 +174,7 @@ func (s *Store) upsertWalletIdentity(ctx context.Context, walletID, ufvk string,
 func (s *Store) WalletBackfillStatus(ctx context.Context, walletID string) (store.WalletBackfillProgress, bool, error) {
 	p := store.WalletBackfillProgress{WalletID: walletID}
 	var ufvk string
-	err := s.db.QueryRowContext(ctx, `SELECT p.birthday_height,p.next_height,p.target_height,p.state,p.last_error,p.updated_at,w.ufvk FROM wallet_backfill_progress p JOIN wallets w USING (wallet_id) WHERE p.wallet_id=?`, walletID).Scan(&p.BirthdayHeight, &p.NextHeight, &p.TargetHeight, &p.State, &p.LastError, &p.UpdatedAt, &ufvk)
+	err := s.db.QueryRowContext(ctx, `SELECT p.birthday_height,p.next_height,p.target_height,p.state,p.last_error,p.generation,p.updated_at,w.ufvk FROM wallet_backfill_progress p JOIN wallets w USING (wallet_id) WHERE p.wallet_id=?`, walletID).Scan(&p.BirthdayHeight, &p.NextHeight, &p.TargetHeight, &p.State, &p.LastError, &p.Generation, &p.UpdatedAt, &ufvk)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, false, nil
 	}
@@ -172,9 +186,29 @@ func (s *Store) WalletBackfillStatus(ctx context.Context, walletID string) (stor
 }
 
 func (s *Store) SetWalletBackfillProgress(ctx context.Context, p store.WalletBackfillProgress) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE wallet_backfill_progress SET next_height=?,target_height=?,state=?,last_error=? WHERE wallet_id=?`, p.NextHeight, p.TargetHeight, p.State, p.LastError, p.WalletID)
+	if p.Generation < 1 {
+		return store.ErrBackfillProgressConflict
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("mysql: begin wallet backfill progress update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var generation, nextHeight int64
+	if err := tx.QueryRowContext(ctx, `SELECT generation,next_height FROM wallet_backfill_progress WHERE wallet_id=? FOR UPDATE`, p.WalletID).Scan(&generation, &nextHeight); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return store.ErrBackfillProgressConflict
+		}
+		return fmt.Errorf("mysql: lock wallet backfill progress: %w", err)
+	}
+	if generation != p.Generation || (p.ExpectedNextHeight != nil && nextHeight != *p.ExpectedNextHeight) {
+		return store.ErrBackfillProgressConflict
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE wallet_backfill_progress SET next_height=?,target_height=?,state=?,last_error=? WHERE wallet_id=?`, p.NextHeight, p.TargetHeight, p.State, p.LastError, p.WalletID); err != nil {
 		return fmt.Errorf("mysql: set wallet backfill progress: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("mysql: commit wallet backfill progress: %w", err)
 	}
 	return nil
 }
@@ -259,6 +293,23 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 		var unconfirmedSpends []store.Note
 		var orphanOutgoingOutputs []store.OutgoingOutput
 		var unconfirmedOutgoingOutputs []store.OutgoingOutput
+
+		blockRows, err := mytx.tx.QueryContext(ctx, `SELECT height FROM blocks WHERE height > ? ORDER BY height FOR UPDATE`, height)
+		if err != nil {
+			return fmt.Errorf("mysql: rollback lock blocks: %w", err)
+		}
+		for blockRows.Next() {
+			var lockedHeight int64
+			if err := blockRows.Scan(&lockedHeight); err != nil {
+				blockRows.Close()
+				return fmt.Errorf("mysql: rollback lock blocks: %w", err)
+			}
+		}
+		if err := blockRows.Err(); err != nil {
+			blockRows.Close()
+			return fmt.Errorf("mysql: rollback lock blocks: %w", err)
+		}
+		blockRows.Close()
 
 		if height >= 0 {
 			fetchNotes := func(query string, args ...any) ([]store.Note, error) {
@@ -437,10 +488,16 @@ FROM outgoing_outputs
 		if _, err := mytx.tx.ExecContext(ctx, `DELETE FROM orchard_subtree_roots WHERE end_height > ?`, height); err != nil {
 			return fmt.Errorf("mysql: rollback subtree roots: %w", err)
 		}
+		if _, err := mytx.tx.ExecContext(ctx, `DELETE FROM orchard_shard_roots WHERE end_height > ?`, height); err != nil {
+			return fmt.Errorf("mysql: rollback shard roots: %w", err)
+		}
+		if _, err := mytx.tx.ExecContext(ctx, `UPDATE orchard_shard_cache_state SET next_index = COALESCE((SELECT MAX(shard_index) + 1 FROM orchard_shard_roots), 0) WHERE singleton = 1`); err != nil {
+			return fmt.Errorf("mysql: rewind shard cache cursor: %w", err)
+		}
 		if _, err := mytx.tx.ExecContext(ctx, `DELETE FROM notes WHERE height > ?`, height); err != nil {
 			return fmt.Errorf("mysql: rollback notes: %w", err)
 		}
-		if _, err := mytx.tx.ExecContext(ctx, `DELETE FROM outgoing_outputs WHERE mined_height > ?`, height); err != nil {
+		if _, err := mytx.tx.ExecContext(ctx, `DELETE FROM outgoing_outputs WHERE ? < 0 OR mined_height > ?`, height, height); err != nil {
 			return fmt.Errorf("mysql: rollback outgoing outputs: %w", err)
 		}
 		if _, err := mytx.tx.ExecContext(ctx, `UPDATE notes SET spent_height = NULL, spent_txid = NULL, spent_confirmed_height = NULL WHERE spent_height > ?`, height); err != nil {
@@ -452,11 +509,36 @@ FROM outgoing_outputs
 		if _, err := mytx.tx.ExecContext(ctx, `UPDATE outgoing_outputs SET confirmed_height = NULL WHERE confirmed_height > ?`, height); err != nil {
 			return fmt.Errorf("mysql: rollback unconfirm outgoing outputs: %w", err)
 		}
+		if _, err := mytx.tx.ExecContext(ctx, `UPDATE outgoing_outputs SET expired_at = NULL, expired_height = NULL WHERE expired_height > ? OR (expired_at IS NOT NULL AND expired_height IS NULL)`, height); err != nil {
+			return fmt.Errorf("mysql: rollback unexpire outgoing outputs: %w", err)
+		}
 		if _, err := mytx.tx.ExecContext(ctx, `UPDATE notes SET spent_confirmed_height = NULL WHERE spent_confirmed_height > ?`, height); err != nil {
 			return fmt.Errorf("mysql: rollback unconfirm spend: %w", err)
 		}
 		if _, err := mytx.tx.ExecContext(ctx, `DELETE FROM blocks WHERE height > ?`, height); err != nil {
 			return fmt.Errorf("mysql: rollback blocks: %w", err)
+		}
+		if height < 0 {
+			if _, err := mytx.tx.ExecContext(ctx, `DELETE FROM wallet_event_publish_cursors`); err != nil {
+				return fmt.Errorf("mysql: reset event publish cursors: %w", err)
+			}
+			if _, err := mytx.tx.ExecContext(ctx, `
+UPDATE wallet_backfill_progress
+SET next_height = birthday_height,
+    target_height = 0,
+    state = 'pending',
+    last_error = '',
+    generation = generation + 1
+`); err != nil {
+				return fmt.Errorf("mysql: reset backfill progress: %w", err)
+			}
+			epoch, err := store.NewEventEpoch()
+			if err != nil {
+				return err
+			}
+			if _, err := mytx.tx.ExecContext(ctx, "INSERT INTO scanner_metadata (`key`,`value`) VALUES ('event_epoch',?) ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)", epoch); err != nil {
+				return fmt.Errorf("mysql: rotate event epoch after destructive reset: %w", err)
+			}
 		}
 
 		if height >= 0 {
@@ -470,7 +552,7 @@ FROM outgoing_outputs
 				}
 				payload := events.DepositOrphanedPayload{
 					DepositEventPayload: events.DepositEventPayload{
-						Origin: "external",
+						Origin: string(types.DepositOriginExternal),
 						DepositEvent: types.DepositEvent{
 							Version:          types.V1,
 							WalletID:         n.WalletID,
@@ -518,7 +600,7 @@ FROM outgoing_outputs
 				}
 				payload := events.DepositUnconfirmedPayload{
 					DepositEventPayload: events.DepositEventPayload{
-						Origin: "external",
+						Origin: string(types.DepositOriginExternal),
 						DepositEvent: types.DepositEvent{
 							Version:          types.V1,
 							WalletID:         n.WalletID,
@@ -756,6 +838,14 @@ func (s *Store) SetWalletEventPublishCursor(ctx context.Context, walletID string
 		return fmt.Errorf("mysql: set publish cursor: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) MaxWalletEventID(ctx context.Context, walletID string) (int64, error) {
+	var maxID int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM events WHERE wallet_id=?`, walletID).Scan(&maxID); err != nil {
+		return 0, fmt.Errorf("mysql: max wallet event id: %w", err)
+	}
+	return maxID, nil
 }
 
 func (s *Store) ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, filter store.EventFilter) ([]store.Event, int64, error) {
@@ -1643,6 +1733,39 @@ type myTx struct {
 	tx *sql.Tx
 }
 
+func (t *myTx) AssertCanonicalBlock(ctx context.Context, height int64, hash string) error {
+	var stored string
+	if err := t.tx.QueryRowContext(ctx, `SELECT hash FROM blocks WHERE height=? FOR UPDATE`, height).Scan(&stored); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return store.ErrCanonicalBlockChanged
+		}
+		return fmt.Errorf("mysql: lock canonical block: %w", err)
+	}
+	if stored != hash {
+		return store.ErrCanonicalBlockChanged
+	}
+	return nil
+}
+
+func (t *myTx) AdvanceCompleteWalletBackfillProgress(ctx context.Context, scannedHeight int64) error {
+	if scannedHeight < 0 {
+		return nil
+	}
+	if _, err := t.tx.ExecContext(ctx, `
+UPDATE wallet_backfill_progress
+SET next_height=?,
+    target_height=GREATEST(target_height,?),
+    updated_at=CURRENT_TIMESTAMP
+WHERE state='complete'
+  AND generation >= 1
+  AND next_height >= birthday_height
+  AND next_height <= ?
+`, scannedHeight+1, scannedHeight, scannedHeight); err != nil {
+		return fmt.Errorf("mysql: advance complete wallet backfill progress: %w", err)
+	}
+	return nil
+}
+
 func (t *myTx) InsertBlock(ctx context.Context, b store.Block) error {
 	_, err := t.tx.ExecContext(ctx, `
 INSERT IGNORE INTO blocks (height, hash, prev_hash, time)
@@ -1750,7 +1873,7 @@ WHERE spent_height IS NULL AND note_nullifier IN (`)
 		b.WriteString("?")
 		args = append(args, nf)
 	}
-	b.WriteString(") ORDER BY wallet_id, txid, action_index")
+	b.WriteString(") ORDER BY wallet_id, txid, action_index FOR UPDATE")
 
 	rows, err := t.tx.QueryContext(ctx, b.String(), args[2:]...)
 	if err != nil {
@@ -1839,8 +1962,12 @@ WHERE spent_height IS NULL AND note_nullifier IN (`)
 	}
 	b.WriteString(")")
 
-	if _, err := t.tx.ExecContext(ctx, b.String(), args...); err != nil {
+	res, err := t.tx.ExecContext(ctx, b.String(), args...)
+	if err != nil {
 		return nil, fmt.Errorf("mysql: mark spent update: %w", err)
+	}
+	if err := requireAffectedRows(res, len(out), "mark spent"); err != nil {
+		return nil, err
 	}
 
 	for i := range out {
@@ -1984,6 +2111,7 @@ SELECT wallet_id, txid, action_index, height, position, NOT deposit_eligible, di
 FROM notes
 WHERE confirmed_height IS NULL AND height <= ?
 ORDER BY height, wallet_id, txid, action_index
+FOR UPDATE
 `, maxNoteHeight)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: confirm notes list: %w", err)
@@ -2052,12 +2180,16 @@ ORDER BY height, wallet_id, txid, action_index
 		return nil, nil
 	}
 
-	if _, err := t.tx.ExecContext(ctx, `
+	res, err := t.tx.ExecContext(ctx, `
 UPDATE notes
 SET confirmed_height = ?
 WHERE confirmed_height IS NULL AND height <= ?
-`, confirmationHeight, maxNoteHeight); err != nil {
+`, confirmationHeight, maxNoteHeight)
+	if err != nil {
 		return nil, fmt.Errorf("mysql: confirm notes update: %w", err)
+	}
+	if err := requireAffectedRows(res, len(out), "confirm notes"); err != nil {
+		return nil, err
 	}
 
 	return out, nil
@@ -2069,6 +2201,7 @@ SELECT wallet_id, txid, action_index, mined_height, position, confirmed_height, 
 FROM outgoing_outputs
 WHERE mined_height IS NOT NULL AND confirmed_height IS NULL AND mined_height <= ?
 ORDER BY mined_height, wallet_id, txid, action_index
+FOR UPDATE
 `, maxMinedHeight)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: confirm outgoing outputs list: %w", err)
@@ -2131,12 +2264,16 @@ ORDER BY mined_height, wallet_id, txid, action_index
 		return nil, nil
 	}
 
-	if _, err := t.tx.ExecContext(ctx, `
+	res, err := t.tx.ExecContext(ctx, `
 UPDATE outgoing_outputs
 SET confirmed_height = ?
 WHERE mined_height IS NOT NULL AND confirmed_height IS NULL AND mined_height <= ?
-`, confirmationHeight, maxMinedHeight); err != nil {
+`, confirmationHeight, maxMinedHeight)
+	if err != nil {
 		return nil, fmt.Errorf("mysql: confirm outgoing outputs update: %w", err)
+	}
+	if err := requireAffectedRows(res, len(out), "confirm outgoing outputs"); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -2155,6 +2292,7 @@ WHERE mined_height IS NULL
   AND tx_expiry_height IS NOT NULL
   AND ? > tx_expiry_height
 ORDER BY wallet_id, txid, action_index
+FOR UPDATE
 `, chainHeight)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: expire outgoing outputs list: %w", err)
@@ -2212,16 +2350,20 @@ ORDER BY wallet_id, txid, action_index
 		return nil, nil
 	}
 
-	if _, err := t.tx.ExecContext(ctx, `
+	res, err := t.tx.ExecContext(ctx, `
 UPDATE outgoing_outputs
-SET expired_at = ?
+SET expired_at = ?, expired_height = ?
 WHERE mined_height IS NULL
   AND expired_at IS NULL
   AND mempool_seen_at IS NOT NULL
   AND tx_expiry_height IS NOT NULL
   AND ? > tx_expiry_height
-`, expiredAt, chainHeight); err != nil {
+`, expiredAt, chainHeight, chainHeight)
+	if err != nil {
 		return nil, fmt.Errorf("mysql: expire outgoing outputs update: %w", err)
+	}
+	if err := requireAffectedRows(res, len(out), "expire outgoing outputs"); err != nil {
+		return nil, err
 	}
 
 	for i := range out {
@@ -2236,6 +2378,7 @@ SELECT wallet_id, txid, action_index, height, position, diversifier_index, recip
 FROM notes
 WHERE spent_height IS NOT NULL AND spent_confirmed_height IS NULL AND spent_height <= ?
 ORDER BY spent_height, wallet_id, txid, action_index
+FOR UPDATE
 `, maxSpentHeight)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: confirm spends list: %w", err)
@@ -2303,15 +2446,30 @@ ORDER BY spent_height, wallet_id, txid, action_index
 		return nil, nil
 	}
 
-	if _, err := t.tx.ExecContext(ctx, `
+	res, err := t.tx.ExecContext(ctx, `
 UPDATE notes
 SET spent_confirmed_height = ?
 WHERE spent_height IS NOT NULL AND spent_confirmed_height IS NULL AND spent_height <= ?
-`, confirmationHeight, maxSpentHeight); err != nil {
+`, confirmationHeight, maxSpentHeight)
+	if err != nil {
 		return nil, fmt.Errorf("mysql: confirm spends update: %w", err)
+	}
+	if err := requireAffectedRows(res, len(out), "confirm spends"); err != nil {
+		return nil, err
 	}
 
 	return out, nil
+}
+
+func requireAffectedRows(result sql.Result, expected int, transition string) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mysql: %s affected rows: %w", transition, err)
+	}
+	if affected != int64(expected) {
+		return fmt.Errorf("mysql: %s concurrency conflict: affected %d want %d", transition, affected, expected)
+	}
+	return nil
 }
 
 func (t *myTx) InsertEvent(ctx context.Context, e store.Event) error {

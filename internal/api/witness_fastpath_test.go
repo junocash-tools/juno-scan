@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/Abdullah1738/juno-scan/internal/orchardscan"
@@ -11,6 +12,8 @@ import (
 
 type fakeWitnessFastStore struct {
 	treeSize int64
+	mu       sync.Mutex
+	anchor   string
 
 	targetByPos  map[int64]store.OrchardCommitment
 	rootByIndex  map[int64]store.OrchardSubtreeRoot
@@ -20,7 +23,12 @@ type fakeWitnessFastStore struct {
 }
 
 func (f *fakeWitnessFastStore) HashAtHeight(_ context.Context, _ int64) (string, bool, error) {
-	return "canonical", true, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.anchor == "" {
+		return "canonical", true, nil
+	}
+	return f.anchor, true, nil
 }
 
 func (f *fakeWitnessFastStore) OrchardTreeSizeAtHeight(context.Context, int64) (int64, error) {
@@ -246,5 +254,38 @@ func TestComputeOrchardWitnessCached_RejectsRootsOutsideExactCoverage(t *testing
 				}
 			}
 		})
+	}
+}
+
+func TestComputeOrchardWitnessCachedRejectsConcurrentAnchorChange(t *testing.T) {
+	oldFn := orchardWitnessWithOpsFn
+	defer func() { orchardWitnessWithOpsFn = oldFn }()
+
+	computeStarted := make(chan struct{})
+	anchorChanged := make(chan struct{})
+	orchardWitnessWithOpsFn = func(_ context.Context, _ uint32, _ []orchardscan.WitnessTarget, _ []orchardscan.WitnessOperation) (orchardscan.WitnessResult, error) {
+		close(computeStarted)
+		<-anchorChanged
+		return orchardscan.WitnessResult{Root: "mixed-root", Paths: []orchardscan.WitnessPath{{Position: 0}}}, nil
+	}
+	st := &fakeWitnessFastStore{
+		treeSize:    1,
+		anchor:      "old-anchor",
+		targetByPos: map[int64]store.OrchardCommitment{0: {Position: 0, Height: 10, CMX: "target"}},
+	}
+	go func() {
+		<-computeStarted
+		st.mu.Lock()
+		st.anchor = "new-anchor"
+		st.mu.Unlock()
+		close(anchorChanged)
+	}()
+
+	res, err := computeOrchardWitnessCached(context.Background(), st, 10, []uint32{0}, true)
+	if !errors.Is(err, errWitnessAnchorChanged) {
+		t.Fatalf("error=%v want anchor change", err)
+	}
+	if res.Root != "" || len(res.Paths) != 0 {
+		t.Fatalf("mixed witness escaped: %+v", res)
 	}
 }

@@ -3,7 +3,7 @@ module github.com/Abdullah1738/juno-scan
 go 1.24.0
 
 require (
-	github.com/Abdullah1738/juno-sdk-go v1.3.0
+	github.com/Abdullah1738/juno-sdk-go v1.4.0
 	github.com/cockroachdb/pebble v1.1.4
 	github.com/docker/docker v28.5.1+incompatible
 	github.com/docker/go-connections v0.6.0
@@ -13,6 +13,7 @@ require (
 	github.com/rabbitmq/amqp091-go v1.10.0
 	github.com/segmentio/kafka-go v0.4.49
 	github.com/testcontainers/testcontainers-go v0.40.0
+	golang.org/x/sync v0.17.0
 )
 
 require (
@@ -91,7 +92,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.39.0 // indirect
 	golang.org/x/crypto v0.43.0 // indirect
 	golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df // indirect
-	golang.org/x/sync v0.17.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.30.0 // indirect
 	google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1 // indirect
