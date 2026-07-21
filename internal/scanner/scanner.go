@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Abdullah1738/juno-scan/internal/events"
@@ -29,6 +30,28 @@ type Scanner struct {
 
 	mempoolOrchardNullifiersByTxID map[string][]string
 	mempoolTxExpiryHeightByTxID    map[string]*int64
+
+	statusMu        sync.RWMutex
+	nodeHeight      int64
+	nodeHeightKnown bool
+}
+
+type Status struct {
+	NodeHeight      int64
+	NodeHeightKnown bool
+}
+
+func (s *Scanner) Status() Status {
+	s.statusMu.RLock()
+	defer s.statusMu.RUnlock()
+	return Status{NodeHeight: s.nodeHeight, NodeHeightKnown: s.nodeHeightKnown}
+}
+
+func (s *Scanner) recordNodeHeight(height int64) {
+	s.statusMu.Lock()
+	s.nodeHeight = height
+	s.nodeHeightKnown = true
+	s.statusMu.Unlock()
 }
 
 const (
@@ -125,6 +148,7 @@ func (s *Scanner) scanOnce(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("scanner: getblockcount: %w", err)
 		}
+		s.recordNodeHeight(chainHeight)
 		if nextHeight > chainHeight {
 			if err := s.backfillMissingSubtreeRoots(ctx, chainHeight, orchardSubtreeBackfillPerScan); err != nil {
 				return err
@@ -525,12 +549,17 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 		subtreeTx, supportsSubtreeRoots := tx.(orchardSubtreeRootTx)
 
 		posByTxAction := make(map[string]map[uint32]int64)
-
+		txHexes := make([]string, 0, len(blk.Tx))
 		for _, t := range blk.Tx {
-			res, err := orchardscan.ScanTx(ctx, s.uaHRP, wallets, t.Hex)
-			if err != nil {
-				return fmt.Errorf("scanner: scan tx %s: %w", t.TxID, err)
-			}
+			txHexes = append(txHexes, t.Hex)
+		}
+		scanResults, err := orchardscan.ScanBlock(ctx, s.uaHRP, wallets, txHexes)
+		if err != nil {
+			return fmt.Errorf("scanner: scan block %d: %w", blk.Height, err)
+		}
+
+		for txIndex, t := range blk.Tx {
+			res := scanResults[txIndex]
 
 			if len(res.Actions) == 0 {
 				continue
@@ -611,6 +640,17 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 					Height:   blk.Height,
 					Payload:  payloadBytes,
 				}); err != nil {
+					return err
+				}
+			}
+
+			recoveredByRegisteredWallet, err := orchardscan.RecoverOutgoingTx(ctx, s.uaHRP, wallets, t.Hex)
+			if err != nil {
+				return fmt.Errorf("scanner: classify transaction origin %s: %w", t.TxID, err)
+			}
+			isInternalTx := len(spentNotes) > 0 || len(recoveredByRegisteredWallet) > 0
+			if isInternalTx {
+				if _, err := tx.MarkTransactionInternal(ctx, t.TxID); err != nil {
 					return err
 				}
 			}
@@ -730,6 +770,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 					ActionIndex:      int32(n.ActionIndex),
 					Height:           blk.Height,
 					Position:         &posCopy,
+					IsInternal:       isInternalTx,
 					DiversifierIndex: n.DiversifierIndex,
 					RecipientAddress: n.RecipientAddress,
 					ValueZat:         int64(n.ValueZat),
@@ -740,8 +781,9 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 					return err
 				}
 
-				if inserted {
+				if inserted && !isInternalTx {
 					payload := events.DepositEventPayload{
+						Origin: "external",
 						DepositEvent: types.DepositEvent{
 							Version:          types.V1,
 							WalletID:         n.WalletID,
@@ -931,6 +973,9 @@ func (s *Scanner) confirmDepositConfirmations(ctx context.Context, tx store.Tx, 
 	}
 
 	for _, n := range notes {
+		if n.IsInternal {
+			continue
+		}
 		memoHex := ""
 		if n.MemoHex != nil {
 			memoHex = *n.MemoHex
@@ -942,6 +987,7 @@ func (s *Scanner) confirmDepositConfirmations(ctx context.Context, tx store.Tx, 
 
 		payload := events.DepositConfirmedPayload{
 			DepositEventPayload: events.DepositEventPayload{
+				Origin: "external",
 				DepositEvent: types.DepositEvent{
 					Version:          types.V1,
 					WalletID:         n.WalletID,

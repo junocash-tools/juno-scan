@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Abdullah1738/juno-scan/internal/scanner"
+	"github.com/Abdullah1738/juno-scan/internal/store"
 	"github.com/Abdullah1738/juno-scan/internal/store/postgres"
 	"github.com/Abdullah1738/juno-scan/internal/testutil"
 	sdkjunocashd "github.com/Abdullah1738/juno-sdk-go/junocashd"
@@ -103,6 +104,22 @@ func TestScanner_DepositDetected_Postgres(t *testing.T) {
 	waitForEventKind(t, ctx, st, "hot", "SpendConfirmed")
 	waitForEventKind(t, ctx, st, "hot", "OutgoingOutputConfirmed")
 	waitForOutgoingOutputPageEntry(t, ctx, st, "hot", spendTxID, toAddr)
+	events, _, err := st.ListWalletEvents(ctx, "hot", 0, 1000, store.EventFilter{})
+	if err != nil {
+		t.Fatalf("ListWalletEvents: %v", err)
+	}
+	depositEvents, depositConfirmed := 0, 0
+	for _, event := range events {
+		switch event.Kind {
+		case "DepositEvent":
+			depositEvents++
+		case "DepositConfirmed":
+			depositConfirmed++
+		}
+	}
+	if depositEvents != 1 || depositConfirmed != 1 {
+		t.Fatalf("withdrawal change emitted deposit lifecycle: DepositEvent=%d DepositConfirmed=%d", depositEvents, depositConfirmed)
+	}
 
 	notesAll, err := st.ListWalletNotes(ctx, "hot", false, 1000)
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/Abdullah1738/juno-scan/internal/config"
 	"github.com/Abdullah1738/juno-scan/internal/publisher"
 	"github.com/Abdullah1738/juno-scan/internal/scanner"
+	"github.com/Abdullah1738/juno-scan/internal/shardcache"
 	"github.com/Abdullah1738/juno-scan/internal/storage"
 	"github.com/Abdullah1738/juno-scan/internal/store"
 	sdkjunocashd "github.com/Abdullah1738/juno-sdk-go/junocashd"
@@ -36,6 +38,16 @@ func main() {
 func run(ctx context.Context, cfg config.Config) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	network, err := config.ResolveNetwork(cfg.Network, cfg.UAHRP)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(cfg.UAHRP) == "" {
+		cfg.UAHRP, err = config.ResolveUAHRP(network)
+		if err != nil {
+			return err
+		}
+	}
 
 	st := mustOpenStore(runCtx, cfg)
 	defer func() { _ = st.Close() }()
@@ -90,6 +102,31 @@ func run(ctx context.Context, cfg config.Config) error {
 		return nil
 	})
 
+	var shardCache *shardcache.Service
+	if shardStore, ok := st.(shardcache.Store); ok {
+		shardCache, err = shardcache.New(shardStore, shardcache.Options{
+			Enabled: cfg.ShardCacheEnabled, BatchSize: cfg.ShardCacheBatch,
+			PollInterval: cfg.ShardCachePoll, Yield: cfg.ShardCacheYield,
+			NodeHeight: func() (int64, bool) {
+				status := sc.Status()
+				return status.NodeHeight, status.NodeHeightKnown
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if cfg.ShardCacheEnabled {
+			g.Go(func() error {
+				if err := shardCache.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) && groupCtx.Err() == nil {
+					return err
+				}
+				return nil
+			})
+		}
+	} else if cfg.ShardCacheEnabled {
+		return errors.New("configured store does not support Orchard shard cache")
+	}
+
 	bf, err := backfill.New(st, rpc, cfg.UAHRP, cfg.Confirmations)
 	if err != nil {
 		return err
@@ -98,6 +135,12 @@ func run(ctx context.Context, cfg config.Config) error {
 	apiServer, err := api.New(st,
 		api.WithBackfillService(bf),
 		api.WithBearerToken(cfg.APIBearerToken),
+		api.WithRuntimeStatus(network, cfg.UAHRP, cfg.Confirmations, cfg.MaxReadyLag, func() (int64, bool) {
+			status := sc.Status()
+			return status.NodeHeight, status.NodeHeightKnown
+		}),
+		api.WithShardCacheService(shardCache),
+		api.WithWitnessMode(cfg.WitnessMode),
 	)
 	if err != nil {
 		return err

@@ -14,6 +14,7 @@ import (
 	"github.com/Abdullah1738/juno-scan/internal/store"
 	"github.com/Abdullah1738/juno-sdk-go/types"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -70,7 +71,30 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	return migrate.Apply(ctx, s.pool)
+	if err := migrate.Apply(ctx, s.pool); err != nil {
+		return err
+	}
+	_, err := s.EventEpoch(ctx)
+	return err
+}
+
+func (s *Store) EventEpoch(ctx context.Context) (string, error) {
+	var epoch string
+	err := s.pool.QueryRow(ctx, `SELECT value FROM scanner_metadata WHERE key='event_epoch'`).Scan(&epoch)
+	if err == nil {
+		return epoch, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("postgres: event epoch: %w", err)
+	}
+	epoch, err = store.NewEventEpoch()
+	if err != nil {
+		return "", err
+	}
+	if err := s.pool.QueryRow(ctx, `INSERT INTO scanner_metadata (key,value) VALUES ('event_epoch',$1) ON CONFLICT (key) DO UPDATE SET value=scanner_metadata.value RETURNING value`, epoch).Scan(&epoch); err != nil {
+		return "", fmt.Errorf("postgres: initialize event epoch: %w", err)
+	}
+	return epoch, nil
 }
 
 func (s *Store) WithTx(ctx context.Context, fn func(store.Tx) error) error {
@@ -90,20 +114,88 @@ func (s *Store) WithTx(ctx context.Context, fn func(store.Tx) error) error {
 }
 
 func (s *Store) UpsertWallet(ctx context.Context, walletID, ufvk string) error {
-	_, err := s.pool.Exec(ctx, `
-INSERT INTO wallets (wallet_id, ufvk, disabled_at)
-VALUES ($1, $2, NULL)
-ON CONFLICT (wallet_id)
-DO UPDATE SET ufvk = EXCLUDED.ufvk, disabled_at = NULL
-`, walletID, ufvk)
+	return s.upsertWalletIdentity(ctx, walletID, ufvk, nil)
+}
+
+func (s *Store) UpsertWalletBirthday(ctx context.Context, walletID, ufvk string, birthdayHeight int64) error {
+	return s.upsertWalletIdentity(ctx, walletID, ufvk, &birthdayHeight)
+}
+
+func (s *Store) upsertWalletIdentity(ctx context.Context, walletID, ufvk string, birthdayHeight *int64) error {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("postgres: upsert wallet: %w", err)
+		return fmt.Errorf("postgres: wallet birthday begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var existingUFVK string
+	var existingBirthday int64
+	err = tx.QueryRow(ctx, `SELECT ufvk,birthday_height FROM wallets WHERE wallet_id=$1 FOR UPDATE`, walletID).Scan(&existingUFVK, &existingBirthday)
+	exists := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("postgres: read wallet identity: %w", err)
+	}
+	if exists && existingUFVK != ufvk {
+		return store.ErrWalletUFVKMismatch
+	}
+	var otherWallet string
+	err = tx.QueryRow(ctx, `SELECT wallet_id FROM wallets WHERE ufvk=$1 AND wallet_id<>$2 LIMIT 1`, ufvk, walletID).Scan(&otherWallet)
+	if err == nil {
+		return store.ErrUFVKAlreadyRegistered
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("postgres: check ufvk identity: %w", err)
+	}
+	requestedBirthday := existingBirthday
+	if birthdayHeight != nil {
+		requestedBirthday = *birthdayHeight
+		if exists && requestedBirthday > existingBirthday {
+			return store.ErrBirthdayIncrease
+		}
+	}
+	if exists {
+		if _, err := tx.Exec(ctx, `UPDATE wallets SET birthday_height=$2,disabled_at=NULL WHERE wallet_id=$1`, walletID, requestedBirthday); err != nil {
+			return fmt.Errorf("postgres: update wallet: %w", err)
+		}
+	} else if _, err := tx.Exec(ctx, `INSERT INTO wallets (wallet_id,ufvk,birthday_height,disabled_at) VALUES ($1,$2,$3,NULL)`, walletID, ufvk, requestedBirthday); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.ConstraintName == "wallets_ufvk_unique_idx" {
+			return store.ErrUFVKAlreadyRegistered
+		}
+		return fmt.Errorf("postgres: insert wallet: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO wallet_backfill_progress (wallet_id,birthday_height,next_height,target_height,state,last_error) VALUES ($1,$2,$2,0,'pending','') ON CONFLICT (wallet_id) DO UPDATE SET next_height=CASE WHEN wallet_backfill_progress.birthday_height<>EXCLUDED.birthday_height THEN EXCLUDED.birthday_height ELSE wallet_backfill_progress.next_height END,state=CASE WHEN wallet_backfill_progress.birthday_height<>EXCLUDED.birthday_height THEN 'pending' ELSE wallet_backfill_progress.state END,birthday_height=EXCLUDED.birthday_height,updated_at=NOW()`, walletID, requestedBirthday); err != nil {
+		return fmt.Errorf("postgres: upsert wallet backfill progress: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: wallet birthday commit: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) WalletBackfillStatus(ctx context.Context, walletID string) (store.WalletBackfillProgress, bool, error) {
+	p := store.WalletBackfillProgress{WalletID: walletID}
+	var ufvk string
+	err := s.pool.QueryRow(ctx, `SELECT p.birthday_height,p.next_height,p.target_height,p.state,p.last_error,p.updated_at,w.ufvk FROM wallet_backfill_progress p JOIN wallets w USING (wallet_id) WHERE p.wallet_id=$1`, walletID).Scan(&p.BirthdayHeight, &p.NextHeight, &p.TargetHeight, &p.State, &p.LastError, &p.UpdatedAt, &ufvk)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return p, false, nil
+	}
+	if err != nil {
+		return p, false, fmt.Errorf("postgres: wallet backfill status: %w", err)
+	}
+	p.UFVKFingerprint = store.UFVKFingerprint(ufvk)
+	return p, true, nil
+}
+
+func (s *Store) SetWalletBackfillProgress(ctx context.Context, p store.WalletBackfillProgress) error {
+	_, err := s.pool.Exec(ctx, `UPDATE wallet_backfill_progress SET next_height=$2,target_height=$3,state=$4,last_error=$5,updated_at=NOW() WHERE wallet_id=$1`, p.WalletID, p.NextHeight, p.TargetHeight, p.State, p.LastError)
+	if err != nil {
+		return fmt.Errorf("postgres: set wallet backfill progress: %w", err)
 	}
 	return nil
 }
 
 func (s *Store) ListWallets(ctx context.Context) ([]store.Wallet, error) {
-	rows, err := s.pool.Query(ctx, `SELECT wallet_id, created_at, disabled_at FROM wallets ORDER BY wallet_id`)
+	rows, err := s.pool.Query(ctx, `SELECT wallet_id, ufvk, birthday_height, created_at, disabled_at FROM wallets ORDER BY wallet_id`)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list wallets: %w", err)
 	}
@@ -112,9 +204,11 @@ func (s *Store) ListWallets(ctx context.Context) ([]store.Wallet, error) {
 	var out []store.Wallet
 	for rows.Next() {
 		var w store.Wallet
-		if err := rows.Scan(&w.WalletID, &w.CreatedAt, &w.DisabledAt); err != nil {
+		var ufvk string
+		if err := rows.Scan(&w.WalletID, &ufvk, &w.BirthdayHeight, &w.CreatedAt, &w.DisabledAt); err != nil {
 			return nil, fmt.Errorf("postgres: list wallets: %w", err)
 		}
+		w.UFVKFingerprint = store.UFVKFingerprint(ufvk)
 		out = append(out, w)
 	}
 	if err := rows.Err(); err != nil {
@@ -198,6 +292,7 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 						&n.ActionIndex,
 						&n.Height,
 						&n.Position,
+						&n.IsInternal,
 						&divIdx,
 						&n.RecipientAddress,
 						&n.ValueZat,
@@ -230,7 +325,7 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 			}
 
 			baseSelect := `
-SELECT wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
+SELECT wallet_id, txid, action_index, height, position, NOT deposit_eligible, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
 FROM notes
 `
 
@@ -368,12 +463,16 @@ FROM outgoing_outputs
 
 		if height >= 0 {
 			for _, n := range orphanDeposits {
+				if n.IsInternal {
+					continue
+				}
 				memoHex := ""
 				if n.MemoHex != nil {
 					memoHex = *n.MemoHex
 				}
 				payload := events.DepositOrphanedPayload{
 					DepositEventPayload: events.DepositEventPayload{
+						Origin: "external",
 						DepositEvent: types.DepositEvent{
 							Version:          types.V1,
 							WalletID:         n.WalletID,
@@ -408,7 +507,7 @@ FROM outgoing_outputs
 			}
 
 			for _, n := range unconfirmedDeposits {
-				if n.ConfirmedHeight == nil {
+				if n.IsInternal || n.ConfirmedHeight == nil {
 					continue
 				}
 				memoHex := ""
@@ -421,6 +520,7 @@ FROM outgoing_outputs
 				}
 				payload := events.DepositUnconfirmedPayload{
 					DepositEventPayload: events.DepositEventPayload{
+						Origin: "external",
 						DepositEvent: types.DepositEvent{
 							Version:          types.V1,
 							WalletID:         n.WalletID,
@@ -773,6 +873,11 @@ func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query 
 		args = append(args, query.MinValueZat)
 		argN++
 	}
+	if query.RecipientAddress != "" {
+		sb.WriteString(fmt.Sprintf(" AND recipient_address = $%d", argN))
+		args = append(args, query.RecipientAddress)
+		argN++
+	}
 	if query.Cursor != nil {
 		sb.WriteString(fmt.Sprintf(" AND (height, txid, action_index) > ($%d, $%d, $%d)", argN, argN+1, argN+2))
 		args = append(args, query.Cursor.Height, query.Cursor.TxID, query.Cursor.ActionIndex)
@@ -846,6 +951,34 @@ func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query 
 		ActionIndex: last.ActionIndex,
 	}
 	return out[:query.Limit], next, nil
+}
+
+func (s *Store) AddressBalance(ctx context.Context, walletID, recipientAddress string, minConfirmations, scannerHeight int64) (store.AddressBalance, error) {
+	var out store.AddressBalance
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM wallets WHERE wallet_id = $1 AND disabled_at IS NULL)`, walletID).Scan(&out.WalletFound); err != nil {
+		return out, fmt.Errorf("postgres: address balance wallet: %w", err)
+	}
+	if !out.WalletFound {
+		return out, nil
+	}
+	confirmedThrough := scannerHeight - minConfirmations + 1
+	if err := s.pool.QueryRow(ctx, `
+SELECT
+  COALESCE(SUM(CASE WHEN spent_height IS NULL AND height <= $3 AND pending_spent_txid IS NULL THEN value_zat ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN spent_height IS NULL AND height > $3 AND pending_spent_txid IS NULL THEN value_zat ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN spent_height IS NULL AND pending_spent_txid IS NOT NULL THEN value_zat ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN spent_height IS NULL THEN value_zat ELSE 0 END), 0)
+FROM notes
+WHERE wallet_id = $1 AND recipient_address = $2
+`, walletID, recipientAddress, confirmedThrough).Scan(
+		&out.AvailableZat,
+		&out.PendingIncomingZat,
+		&out.PendingOutgoingZat,
+		&out.TotalUnspentZat,
+	); err != nil {
+		return out, fmt.Errorf("postgres: address balance: %w", err)
+	}
+	return out, nil
 }
 
 func (s *Store) ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]store.Note, error) {
@@ -1229,6 +1362,48 @@ func (s *Store) FirstOrchardCommitmentPositionFromHeight(ctx context.Context, he
 	return pos.Int64, true, nil
 }
 
+func (s *Store) ListOrchardActionHeights(ctx context.Context, startHeight, endHeight int64) ([]int64, error) {
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT height FROM orchard_actions WHERE height >= $1 AND height <= $2 ORDER BY height`, startHeight, endHeight)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list orchard action heights: %w", err)
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var h int64
+		if err := rows.Scan(&h); err != nil {
+			return nil, fmt.Errorf("postgres: list orchard action heights: %w", err)
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CountOrchardActionHeights(ctx context.Context) (int64, error) {
+	var count int64
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(DISTINCT height) FROM orchard_actions`).Scan(&count); err != nil {
+		return 0, fmt.Errorf("postgres: count orchard action heights: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) ListOrchardActionsAtHeight(ctx context.Context, height int64) ([]store.OrchardAction, error) {
+	rows, err := s.pool.Query(ctx, `SELECT height, txid, action_index, action_nullifier, cmx, ephemeral_key, enc_ciphertext FROM orchard_actions WHERE height = $1 ORDER BY txid, action_index`, height)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list orchard actions at height: %w", err)
+	}
+	defer rows.Close()
+	var out []store.OrchardAction
+	for rows.Next() {
+		var a store.OrchardAction
+		if err := rows.Scan(&a.Height, &a.TxID, &a.ActionIndex, &a.ActionNullifier, &a.CMX, &a.EphemeralKey, &a.EncCiphertext); err != nil {
+			return nil, fmt.Errorf("postgres: list orchard actions at height: %w", err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) OrchardTreeSizeAtHeight(ctx context.Context, height int64) (int64, error) {
 	var size int64
 	if err := s.pool.QueryRow(ctx, `
@@ -1328,6 +1503,73 @@ LIMIT $2
 		return nil, fmt.Errorf("postgres: list subtree roots: %w", err)
 	}
 	return out, nil
+}
+
+func (s *Store) ListOrchardShardRootsByIndexRange(ctx context.Context, startIndex int64, limit int) ([]store.OrchardShardRoot, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT version, shard_index, end_position, end_height, end_block_hash, root
+FROM orchard_shard_roots
+WHERE shard_index >= $1
+ORDER BY shard_index
+LIMIT $2
+`, startIndex, limit)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list shard roots: %w", err)
+	}
+	defer rows.Close()
+	out := make([]store.OrchardShardRoot, 0, limit)
+	for rows.Next() {
+		var r store.OrchardShardRoot
+		if err := rows.Scan(&r.Version, &r.ShardIndex, &r.EndPosition, &r.EndHeight, &r.EndBlockHash, &r.Root); err != nil {
+			return nil, fmt.Errorf("postgres: list shard roots: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list shard roots: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) OrchardShardBackfillCursor(ctx context.Context) (version int32, nextIndex int64, err error) {
+	err = s.pool.QueryRow(ctx, `SELECT version, next_index FROM orchard_shard_cache_state WHERE singleton = TRUE`).Scan(&version, &nextIndex)
+	if err != nil {
+		return 0, 0, fmt.Errorf("postgres: shard cache cursor: %w", err)
+	}
+	return version, nextIndex, nil
+}
+
+func (s *Store) SetOrchardShardBackfillCursor(ctx context.Context, version int32, nextIndex int64) error {
+	_, err := s.pool.Exec(ctx, `UPDATE orchard_shard_cache_state SET version = $1, next_index = $2, updated_at = NOW() WHERE singleton = TRUE`, version, nextIndex)
+	if err != nil {
+		return fmt.Errorf("postgres: set shard cache cursor: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ApplyOrchardShardRoot(ctx context.Context, r store.OrchardShardRoot, nextIndex int64) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: shard root begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+INSERT INTO orchard_shard_roots (version, shard_index, end_position, end_height, end_block_hash, root)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (shard_index) DO UPDATE SET version = EXCLUDED.version, end_position = EXCLUDED.end_position, end_height = EXCLUDED.end_height, end_block_hash = EXCLUDED.end_block_hash, root = EXCLUDED.root
+`, r.Version, r.ShardIndex, r.EndPosition, r.EndHeight, r.EndBlockHash, r.Root); err != nil {
+		return fmt.Errorf("postgres: apply shard root: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE orchard_shard_cache_state SET version = $1, next_index = $2, updated_at = NOW() WHERE singleton = TRUE`, r.Version, nextIndex); err != nil {
+		return fmt.Errorf("postgres: advance shard cursor: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: shard root commit: %w", err)
+	}
+	return nil
 }
 
 type pgTx struct {
@@ -1490,12 +1732,14 @@ func (t *pgTx) InsertNote(ctx context.Context, n store.Note) (bool, error) {
 	var inserted int
 	err := t.tx.QueryRow(ctx, `
 INSERT INTO notes (
-  wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier
+  wallet_id, txid, action_index, height, position, deposit_eligible, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-ON CONFLICT (wallet_id, txid, action_index) DO NOTHING
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+ON CONFLICT (wallet_id, txid, action_index) DO UPDATE
+SET deposit_eligible = EXCLUDED.deposit_eligible
+WHERE notes.deposit_eligible IS DISTINCT FROM EXCLUDED.deposit_eligible
 RETURNING 1
-`, n.WalletID, n.TxID, n.ActionIndex, n.Height, n.Position, int64(n.DiversifierIndex), n.RecipientAddress, n.ValueZat, n.MemoHex, n.NoteNullifier).Scan(&inserted)
+`, n.WalletID, n.TxID, n.ActionIndex, n.Height, n.Position, !n.IsInternal, int64(n.DiversifierIndex), n.RecipientAddress, n.ValueZat, n.MemoHex, n.NoteNullifier).Scan(&inserted)
 	if err == nil {
 		return true, nil
 	}
@@ -1503,6 +1747,28 @@ RETURNING 1
 		return false, nil
 	}
 	return false, fmt.Errorf("postgres: insert note: %w", err)
+}
+
+func (t *pgTx) MarkTransactionInternal(ctx context.Context, txid string) (bool, error) {
+	tag, err := t.tx.Exec(ctx, `UPDATE notes SET deposit_eligible=FALSE WHERE txid=$1 AND deposit_eligible=TRUE`, txid)
+	if err != nil {
+		return false, fmt.Errorf("postgres: mark internal notes: %w", err)
+	}
+	tag2, err := t.tx.Exec(ctx, `DELETE FROM events WHERE kind IN ('DepositEvent','DepositConfirmed','DepositOrphaned','DepositUnconfirmed') AND payload->>'txid'=$1`, txid)
+	if err != nil {
+		return false, fmt.Errorf("postgres: quarantine internal deposit events: %w", err)
+	}
+	repaired := tag.RowsAffected() > 0 || tag2.RowsAffected() > 0
+	if repaired {
+		epoch, err := store.NewEventEpoch()
+		if err != nil {
+			return false, err
+		}
+		if _, err := t.tx.Exec(ctx, `INSERT INTO scanner_metadata (key,value) VALUES ('event_epoch',$1) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`, epoch); err != nil {
+			return false, fmt.Errorf("postgres: rotate event epoch: %w", err)
+		}
+	}
+	return repaired, nil
 }
 
 func (t *pgTx) InsertOutgoingOutput(ctx context.Context, o store.OutgoingOutput) (bool, error) {
@@ -1593,7 +1859,7 @@ func (t *pgTx) ConfirmNotes(ctx context.Context, confirmationHeight int64, maxNo
 UPDATE notes
 SET confirmed_height = $1
 WHERE confirmed_height IS NULL AND height <= $2
-RETURNING wallet_id, txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
+RETURNING wallet_id, txid, action_index, height, position, NOT deposit_eligible, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier, spent_height, spent_txid, confirmed_height, spent_confirmed_height, created_at
 `, confirmationHeight, maxNoteHeight)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: confirm notes: %w", err)
@@ -1613,6 +1879,7 @@ RETURNING wallet_id, txid, action_index, height, position, diversifier_index, re
 			&n.ActionIndex,
 			&n.Height,
 			&n.Position,
+			&n.IsInternal,
 			&divIdx,
 			&n.RecipientAddress,
 			&n.ValueZat,

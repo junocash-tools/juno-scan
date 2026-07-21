@@ -35,6 +35,7 @@ curl -sS -X POST http://127.0.0.1:8080/v1/wallets \
 ```
 
 Wallets added after the scanner has already advanced past a height are only detected going forward until you backfill them.
+`wallet_id` and UFVK form an immutable one-to-one identity. Reusing a UFVK under another ID, changing an ID's UFVK, or increasing a stored birthday is rejected. An earlier birthday is allowed and safely resets backfill progress. Wallet and backfill responses expose `ufvk_fingerprint` as SHA-256 of the trimmed UFVK (64 lowercase hex characters).
 To backfill a wallet in an existing database, call:
 
 ```sh
@@ -59,6 +60,8 @@ Pending spends are *sticky*: if a spend disappears from the mempool before it is
 The notes endpoint returns incoming notes plus mined outgoing notes recovered via OVK. Each note object includes `direction` (`incoming` or `outgoing`) and `memo_hex`; when no memo is stored it is returned as `null`. Outgoing notes include `ovk_scope` / `recipient_scope` when available, and `spent` filtering applies only to incoming notes.
 When additional pages exist, the notes response includes `next_cursor`; pass it back as `cursor` to continue.
 
+Every health and event-page response includes `event_epoch`, exactly 64 lowercase hexadecimal characters. Bind persisted event cursors to this value. A fresh/recreated scanner database or a repaired event journal has a new epoch; discard old cursors and restart consumption.
+
 If you configured `-api-bearer-token`, include `-H 'Authorization: Bearer <token>'` in all requests.
 
 ## Configuration
@@ -74,9 +77,16 @@ Durations use Go’s `time.ParseDuration` format (e.g. `500ms`, `2s`, `1m`).
 | `-rpc-user` | `JUNO_SCAN_RPC_USER` | _(empty)_ | `junocashd` RPC username |
 | `-rpc-pass` | `JUNO_SCAN_RPC_PASS` | _(empty)_ | `junocashd` RPC password |
 | `-ua-hrp` | `JUNO_SCAN_UA_HRP` | `j` | Unified Address HRP (`j`, `jtest`, `jregtest`, …) |
+| `-network` | `JUNO_SCAN_NETWORK` or `JUNO_NETWORK` | `auto` | `mainnet`, `testnet`, or `regtest`; derives the UA HRP when it is omitted and fails on explicit mismatch |
 | `-poll-interval` | `JUNO_SCAN_POLL_INTERVAL` | `2s` | Used when ZMQ is not enabled |
 | `-zmq-hashblock` | `JUNO_SCAN_ZMQ_HASHBLOCK` | _(empty)_ | `tcp://host:port` to receive `hashblock` notifications |
 | `-confirmations` | `JUNO_SCAN_CONFIRMATIONS` | `100` | Confirmations required for `*Confirmed` events |
+| `-max-ready-lag` | `JUNO_SCAN_MAX_READY_LAG` | `2` | Maximum node-to-scanner block lag reported as ready |
+| `-shard-cache-enabled` | `JUNO_SCAN_SHARD_CACHE_ENABLED` | `true` | Enable versioned 4,096-leaf Orchard shard-root cache backfill |
+| `-shard-cache-batch` | `JUNO_SCAN_SHARD_CACHE_BATCH` | `1` | Maximum roots computed per background pass (1-64) |
+| `-shard-cache-poll` | `JUNO_SCAN_SHARD_CACHE_POLL` | `5s` | Background cache poll interval |
+| `-shard-cache-yield` | `JUNO_SCAN_SHARD_CACHE_YIELD` | `25ms` | Yield between root computations |
+| `-witness-mode` | `JUNO_SCAN_WITNESS_MODE` | `auto` | `auto`, `shard`, `subtree`, or `legacy`; forced modes are intended for verification and rollback |
 | `-db-driver` | `JUNO_SCAN_DB_DRIVER` | `postgres` | `postgres`, `rocksdb`, `mysql` |
 | `-db-dsn` | `JUNO_SCAN_DB_DSN` | _(empty)_ | DSN for Postgres/MySQL (preferred over `-db-url`) |
 | `-db-url` | `JUNO_SCAN_DB_URL` | `postgres://localhost:5432/junoscan?sslmode=disable` | Deprecated alias for `-db-dsn` |
@@ -177,6 +187,7 @@ The broker message key is derived from `payload.txid` when present (falls back t
 - `GET /v1/wallets` → list wallets
 - `POST /v1/wallets` → upsert wallet `{wallet_id, ufvk}`
 - `GET /v1/wallets/{wallet_id}/events?cursor=<id>&limit=<n>[&block_height=<h>][&kind=<k>][&txid=<txid>]` → wallet event stream (default limit: 100, max: 1000)
+- `GET /v1/wallets/{wallet_id}/addresses/{address}/balance?min_confirmations=<n>` → address balance under that registered UFVK (`0` includes every mined unspent note)
 - `POST /v1/wallets/{wallet_id}/backfill` → backfill wallet history (incremental)
 - `GET /v1/wallets/{wallet_id}/notes[?spent=true][&direction=incoming|outgoing|all][&min_value_zat=<zat>][&limit=<n>][&cursor=<c>]` → paged incoming/outgoing note list (default direction: `all`; mined outgoing only; incoming notes are unspent-only by default; limit: 1000, max: 1000)
 - `POST /v1/orchard/witness` → compute Orchard witnesses for commitment positions
@@ -213,6 +224,8 @@ Deposit lifecycle:
 - `DepositConfirmed`: the note reached the configured confirmation threshold.
 - `DepositOrphaned`: the original block was orphaned due to a reorg.
 - `DepositUnconfirmed`: a previously-confirmed deposit fell below the confirmation threshold after rollback.
+
+Deposit payloads always include `origin: "external"`. If a transaction spends any note owned by any registered UFVK, all incoming notes from that transaction are retained for balances but are ineligible for every `Deposit*` lifecycle event. This covers withdrawal change and transfers between exchange wallets. The gateway must separately require an exact match to an allocated customer address.
 
 Spend lifecycle:
 

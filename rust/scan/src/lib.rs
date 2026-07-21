@@ -64,6 +64,13 @@ struct ScanTxRequest {
     tx_hex: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ScanBlockRequest {
+    ua_hrp: String,
+    wallets: Vec<WalletIn>,
+    tx_hexes: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ActionOut {
     action_index: u32,
@@ -95,6 +102,27 @@ enum ScanTxResponse {
     Err {
         error: String,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct ScanResultOut {
+    actions: Vec<ActionOut>,
+    notes: Vec<NoteOut>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ScanBlockResponse {
+    Ok { results: Vec<ScanResultOut> },
+    Err { error: String },
+}
+
+struct PreparedWallets {
+    wallet_ids: Vec<String>,
+    fvks: Vec<FullViewingKey>,
+    ivks: Vec<orchard::keys::PreparedIncomingViewingKey>,
+    ivk_wallet_index: Vec<usize>,
+    ivk_full: Vec<orchard::keys::IncomingViewingKey>,
 }
 
 #[derive(Debug, Serialize)]
@@ -154,11 +182,18 @@ struct WitnessTargetReq {
 enum WitnessOpReq {
     AppendBatch { cmx_hex: Vec<String> },
     InsertSubtreeRoots { subtree_roots: Vec<String> },
+    InsertShardRoots { shard_roots: Vec<String> },
 }
 
 #[derive(Debug, Deserialize)]
 struct SubtreeRootRequest {
     cmx_hex: Vec<String>,
+    #[serde(default = "default_root_level")]
+    level: u8,
+}
+
+fn default_root_level() -> u8 {
+    16
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -186,17 +221,15 @@ enum SubtreeRootResponse {
     Err { error: String },
 }
 
-type OrchardShardTree = ShardTree<MemoryShardStore<MerkleHashOrchard, u32>, 32, 16>;
-
-struct WitnessState {
+struct WitnessState<const SHARD_HEIGHT: u8> {
     anchor_height: u32,
     expected_by_position: BTreeMap<u32, MerkleHashOrchard>,
-    tree: OrchardShardTree,
+    tree: ShardTree<MemoryShardStore<MerkleHashOrchard, u32>, 32, SHARD_HEIGHT>,
     leaf_count: u64,
     error: Option<String>,
 }
 
-impl WitnessState {
+impl<const SHARD_HEIGHT: u8> WitnessState<SHARD_HEIGHT> {
     fn new(anchor_height: u32, targets: Vec<WitnessTargetReq>) -> Result<Self, String> {
         if targets.is_empty() {
             return Err("targets_required".to_string());
@@ -261,14 +294,14 @@ impl WitnessState {
         self.leaf_count += 1;
     }
 
-    fn insert_subtree_root(&mut self, root_hex: &str) {
+    fn insert_cached_root(&mut self, root_hex: &str) {
         if self.error.is_some() {
             return;
         }
 
-        const SUBTREE_LEAVES: u64 = 1 << 16;
-        if self.leaf_count % SUBTREE_LEAVES != 0 {
-            self.error = Some("subtree_unaligned".to_string());
+        let subtree_leaves: u64 = 1 << SHARD_HEIGHT;
+        if self.leaf_count % subtree_leaves != 0 {
+            self.error = Some("cached_root_unaligned".to_string());
             return;
         }
         if self.leaf_count > u64::from(u32::MAX) {
@@ -279,32 +312,35 @@ impl WitnessState {
         let bytes = match hex::decode(root_hex) {
             Ok(v) => v,
             Err(_) => {
-                self.error = Some("invalid_subtree_root".to_string());
+                self.error = Some("invalid_cached_root".to_string());
                 return;
             }
         };
         let bytes: [u8; 32] = match bytes.try_into() {
             Ok(v) => v,
             Err(_) => {
-                self.error = Some("invalid_subtree_root".to_string());
+                self.error = Some("invalid_cached_root".to_string());
                 return;
             }
         };
         let root = match Option::from(MerkleHashOrchard::from_bytes(&bytes)) {
             Some(v) => v,
             None => {
-                self.error = Some("invalid_subtree_root".to_string());
+                self.error = Some("invalid_cached_root".to_string());
                 return;
             }
         };
 
         let pos = Position::from(self.leaf_count);
-        let addr = OrchardShardTree::subtree_addr(pos);
+        let addr =
+            ShardTree::<MemoryShardStore<MerkleHashOrchard, u32>, 32, SHARD_HEIGHT>::subtree_addr(
+                pos,
+            );
         if self.tree.insert(addr, root).is_err() {
-            self.error = Some("subtree_insert_failed".to_string());
+            self.error = Some("cached_root_insert_failed".to_string());
             return;
         }
-        self.leaf_count += SUBTREE_LEAVES;
+        self.leaf_count += subtree_leaves;
     }
 
     fn finish(mut self) -> Result<(String, Vec<WitnessPathOut>, u64), String> {
@@ -387,6 +423,20 @@ pub extern "C" fn juno_scan_scan_tx_json(req_json: *const c_char) -> *mut c_char
             error: e.to_string(),
         }),
         Err(_) => to_c_string(ScanTxResponse::Err {
+            error: ScanError::Panic.to_string(),
+        }),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn juno_scan_scan_block_json(req_json: *const c_char) -> *mut c_char {
+    let res = std::panic::catch_unwind(|| scan_block_json_inner(req_json));
+    match res {
+        Ok(Ok(v)) => to_c_string(v),
+        Ok(Err(e)) => to_c_string(ScanBlockResponse::Err {
+            error: e.to_string(),
+        }),
+        Err(_) => to_c_string(ScanBlockResponse::Err {
             error: ScanError::Panic.to_string(),
         }),
     }
@@ -533,62 +583,92 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
         .to_string();
     let req: ScanTxRequest = serde_json::from_str(&s).map_err(|_| ScanError::ReqJSONInvalid)?;
 
-    let ua_hrp = req.ua_hrp.trim().to_string();
+    let ua_hrp = validate_ua_hrp(&req.ua_hrp)?;
+    let prepared = prepare_wallets(&req.wallets)?;
+    let result = scan_tx_prepared(&ua_hrp, &prepared, &req.tx_hex)?;
+    Ok(ScanTxResponse::Ok {
+        actions: result.actions,
+        notes: result.notes,
+    })
+}
+
+fn scan_block_json_inner(req_json: *const c_char) -> Result<ScanBlockResponse, ScanError> {
+    if req_json.is_null() {
+        return Err(ScanError::ReqJSONInvalid);
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(req_json) }
+        .to_string_lossy()
+        .to_string();
+    let req: ScanBlockRequest = serde_json::from_str(&s).map_err(|_| ScanError::ReqJSONInvalid)?;
+    let ua_hrp = validate_ua_hrp(&req.ua_hrp)?;
+    let prepared = prepare_wallets(&req.wallets)?;
+    let mut results = Vec::with_capacity(req.tx_hexes.len());
+    for tx_hex in &req.tx_hexes {
+        results.push(scan_tx_prepared(&ua_hrp, &prepared, tx_hex)?);
+    }
+    Ok(ScanBlockResponse::Ok { results })
+}
+
+fn validate_ua_hrp(value: &str) -> Result<String, ScanError> {
+    let ua_hrp = value.trim().to_string();
     if ua_hrp.is_empty() || ua_hrp.len() > 16 {
         return Err(ScanError::UAHrpInvalid);
     }
+    Ok(ua_hrp)
+}
 
-    let mut tx_bytes = hex::decode(req.tx_hex.trim()).map_err(|_| ScanError::TxHexInvalid)?;
+fn prepare_wallets(wallets: &[WalletIn]) -> Result<PreparedWallets, ScanError> {
+    let mut prepared = PreparedWallets {
+        wallet_ids: Vec::with_capacity(wallets.len()),
+        fvks: Vec::with_capacity(wallets.len()),
+        ivks: Vec::with_capacity(wallets.len() * 2),
+        ivk_wallet_index: Vec::with_capacity(wallets.len() * 2),
+        ivk_full: Vec::with_capacity(wallets.len() * 2),
+    };
+    for w in wallets {
+        if w.wallet_id.trim().is_empty() {
+            return Err(ScanError::UFVKInvalid);
+        }
+        let fvk = parse_orchard_fvk_from_ufvk(&w.ufvk)?;
+        let widx = prepared.wallet_ids.len();
+        prepared.wallet_ids.push(w.wallet_id.trim().to_string());
+        prepared.fvks.push(fvk);
+        let ivk_external = prepared.fvks[widx].to_ivk(Scope::External);
+        let ivk_internal = prepared.fvks[widx].to_ivk(Scope::Internal);
+        prepared.ivks.push(ivk_external.prepare());
+        prepared.ivk_wallet_index.push(widx);
+        prepared.ivk_full.push(ivk_external);
+        prepared.ivks.push(ivk_internal.prepare());
+        prepared.ivk_wallet_index.push(widx);
+        prepared.ivk_full.push(ivk_internal);
+    }
+    Ok(prepared)
+}
+
+fn scan_tx_prepared(
+    ua_hrp: &str,
+    prepared: &PreparedWallets,
+    tx_hex: &str,
+) -> Result<ScanResultOut, ScanError> {
+    let mut tx_bytes = hex::decode(tx_hex.trim()).map_err(|_| ScanError::TxHexInvalid)?;
     let Some(branch_id) = v5_branch_id_from_tx_bytes(&tx_bytes)? else {
         tx_bytes.zeroize();
-        return Ok(ScanTxResponse::Ok {
+        return Ok(ScanResultOut {
             actions: vec![],
             notes: vec![],
         });
     };
-    let tx =
-        Transaction::read(&tx_bytes[..], branch_id).map_err(|_| ScanError::TxParseFailed)?;
+    let tx = Transaction::read(&tx_bytes[..], branch_id).map_err(|_| ScanError::TxParseFailed)?;
     tx_bytes.zeroize();
-
     let orchard_bundle = match tx.orchard_bundle() {
         Some(b) => b,
         None => {
-            return Ok(ScanTxResponse::Ok {
+            return Ok(ScanResultOut {
                 actions: vec![],
                 notes: vec![],
             })
         }
     };
-
-    let mut wallet_ids = Vec::with_capacity(req.wallets.len());
-    let mut fvks = Vec::with_capacity(req.wallets.len());
-    let mut ivks = Vec::with_capacity(req.wallets.len() * 2);
-    let mut ivk_wallet_index = Vec::with_capacity(req.wallets.len() * 2);
-    let mut ivk_full = Vec::with_capacity(req.wallets.len() * 2);
-
-    for w in &req.wallets {
-        if w.wallet_id.trim().is_empty() {
-            return Err(ScanError::UFVKInvalid);
-        }
-
-        let fvk = parse_orchard_fvk_from_ufvk(&w.ufvk)?;
-
-        let widx = wallet_ids.len();
-        wallet_ids.push(w.wallet_id.trim().to_string());
-        fvks.push(fvk);
-
-        let ivk_external = fvks[widx].to_ivk(Scope::External);
-        let ivk_internal = fvks[widx].to_ivk(Scope::Internal);
-        let pivk_external = ivk_external.prepare();
-        let pivk_internal = ivk_internal.prepare();
-
-        ivks.push(pivk_external);
-        ivk_wallet_index.push(widx);
-        ivk_full.push(ivk_external);
-        ivks.push(pivk_internal);
-        ivk_wallet_index.push(widx);
-        ivk_full.push(ivk_internal);
-    }
 
     let mut actions_out = Vec::new();
     let mut outputs = Vec::new();
@@ -608,14 +688,14 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
         outputs.push((domain, compact));
     }
 
-    if outputs.is_empty() || ivks.is_empty() {
-        return Ok(ScanTxResponse::Ok {
+    if outputs.is_empty() || prepared.ivks.is_empty() {
+        return Ok(ScanResultOut {
             actions: actions_out,
             notes: vec![],
         });
     }
 
-    let decrypted = batch::try_compact_note_decryption(&ivks, &outputs);
+    let decrypted = batch::try_compact_note_decryption(&prepared.ivks, &outputs);
     let mut notes_out = Vec::new();
 
     for (action_index, maybe) in decrypted.into_iter().enumerate() {
@@ -623,13 +703,18 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
             continue;
         };
 
-        let wallet_index = *ivk_wallet_index.get(ivk_index).ok_or(ScanError::Internal)?;
-        let wallet_id = wallet_ids
+        let wallet_index = *prepared
+            .ivk_wallet_index
+            .get(ivk_index)
+            .ok_or(ScanError::Internal)?;
+        let wallet_id = prepared
+            .wallet_ids
             .get(wallet_index)
             .ok_or(ScanError::Internal)?
             .clone();
 
-        let di = ivk_full
+        let di = prepared
+            .ivk_full
             .get(ivk_index)
             .and_then(|ivk| ivk.diversifier_index(&recipient))
             .and_then(|di| u32::try_from(di).ok())
@@ -637,16 +722,16 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
 
         let addr_bytes = recipient.to_raw_address_bytes();
         let recipient_address =
-            zip316::encode_unified_container(&ua_hrp, TYPECODE_ORCHARD, &addr_bytes)
+            zip316::encode_unified_container(ua_hrp, TYPECODE_ORCHARD, &addr_bytes)
                 .map_err(|_| ScanError::UAHrpInvalid)?;
 
-        let nf = note.nullifier(&fvks[wallet_index]).to_bytes();
+        let nf = note.nullifier(&prepared.fvks[wallet_index]).to_bytes();
         let action = orchard_bundle
             .actions()
             .get(action_index)
             .ok_or(ScanError::Internal)?;
         let domain = OrchardDomain::for_action(action);
-        let memo_hex = match try_note_decryption(&domain, &ivks[ivk_index], action) {
+        let memo_hex = match try_note_decryption(&domain, &prepared.ivks[ivk_index], action) {
             Some((_, _, memo)) if !is_empty_memo(&memo) => Some(hex::encode(memo)),
             _ => None,
         };
@@ -662,7 +747,7 @@ fn scan_tx_json_inner(req_json: *const c_char) -> Result<ScanTxResponse, ScanErr
         });
     }
 
-    Ok(ScanTxResponse::Ok {
+    Ok(ScanResultOut {
         actions: actions_out,
         notes: notes_out,
     })
@@ -690,8 +775,7 @@ fn recover_outgoing_tx_json_inner(
         tx_bytes.zeroize();
         return Ok(RecoverOutgoingTxResponse::Ok { outputs: vec![] });
     };
-    let tx =
-        Transaction::read(&tx_bytes[..], branch_id).map_err(|_| ScanError::TxParseFailed)?;
+    let tx = Transaction::read(&tx_bytes[..], branch_id).map_err(|_| ScanError::TxParseFailed)?;
     tx_bytes.zeroize();
 
     let orchard_bundle = match tx.orchard_bundle() {
@@ -875,7 +959,22 @@ fn orchard_witness_with_ops(req: WitnessRequest) -> Result<WitnessResponse, Scan
     let targets = req.targets.ok_or(ScanError::InvalidRequest)?;
     let ops = req.ops.ok_or(ScanError::InvalidRequest)?;
 
-    let mut st = match WitnessState::new(anchor_height, targets) {
+    if ops
+        .iter()
+        .any(|op| matches!(op, WitnessOpReq::InsertShardRoots { .. }))
+    {
+        orchard_witness_with_ops_mode::<12>(anchor_height, targets, ops)
+    } else {
+        orchard_witness_with_ops_mode::<16>(anchor_height, targets, ops)
+    }
+}
+
+fn orchard_witness_with_ops_mode<const SHARD_HEIGHT: u8>(
+    anchor_height: u32,
+    targets: Vec<WitnessTargetReq>,
+    ops: Vec<WitnessOpReq>,
+) -> Result<WitnessResponse, ScanError> {
+    let mut st = match WitnessState::<SHARD_HEIGHT>::new(anchor_height, targets) {
         Ok(s) => s,
         Err(err) => {
             return Ok(WitnessResponse::Err { error: err });
@@ -891,7 +990,12 @@ fn orchard_witness_with_ops(req: WitnessRequest) -> Result<WitnessResponse, Scan
             }
             WitnessOpReq::InsertSubtreeRoots { subtree_roots } => {
                 for root in subtree_roots {
-                    st.insert_subtree_root(&root);
+                    st.insert_cached_root(&root);
+                }
+            }
+            WitnessOpReq::InsertShardRoots { shard_roots } => {
+                for root in shard_roots {
+                    st.insert_cached_root(&root);
                 }
             }
         }
@@ -918,7 +1022,7 @@ fn orchard_subtree_root_json_inner(
     let req: SubtreeRootRequest =
         serde_json::from_str(&s).map_err(|_| ScanError::ReqJSONInvalid)?;
 
-    match compute_subtree_root(&req.cmx_hex) {
+    match compute_root(&req.cmx_hex, req.level) {
         Ok(root) => Ok(SubtreeRootResponse::Ok { root }),
         Err(err) => Ok(SubtreeRootResponse::Err { error: err }),
     }
@@ -934,36 +1038,39 @@ fn parse_cmx_hex(cmx_hex: &str) -> Result<MerkleHashOrchard, ScanError> {
     Ok(MerkleHashOrchard::from_cmx(&cmx))
 }
 
-fn compute_subtree_root(cmxs: &[String]) -> Result<String, String> {
-    const SUBTREE_LEAVES: usize = 1 << 16;
-    if cmxs.len() != SUBTREE_LEAVES {
-        return Err("invalid_subtree_leaf_count".to_string());
+fn compute_root(cmxs: &[String], level: u8) -> Result<String, String> {
+    if level != 12 && level != 16 {
+        return Err("invalid_root_level".to_string());
+    }
+    let expected_leaves: usize = 1usize << level;
+    if cmxs.len() != expected_leaves {
+        return Err("invalid_root_leaf_count".to_string());
     }
 
-    let mut level = Vec::with_capacity(SUBTREE_LEAVES);
+    let mut nodes = Vec::with_capacity(expected_leaves);
     for cmx in cmxs {
         let leaf = parse_cmx_hex(cmx).map_err(|_| "invalid_cmx".to_string())?;
-        level.push(leaf);
+        nodes.push(leaf);
     }
 
-    for height in 0u8..16u8 {
-        if level.len() % 2 != 0 {
+    for height in 0u8..level {
+        if nodes.len() % 2 != 0 {
             return Err("subtree_build_failed".to_string());
         }
-        let mut next = Vec::with_capacity(level.len() / 2);
+        let mut next = Vec::with_capacity(nodes.len() / 2);
         let mut idx = 0usize;
-        while idx < level.len() {
-            let left = level[idx];
-            let right = level[idx + 1];
+        while idx < nodes.len() {
+            let left = nodes[idx];
+            let right = nodes[idx + 1];
             next.push(MerkleHashOrchard::combine(height.into(), &left, &right));
             idx += 2;
         }
-        level = next;
+        nodes = next;
     }
-    if level.len() != 1 {
+    if nodes.len() != 1 {
         return Err("subtree_build_failed".to_string());
     }
-    Ok(hex::encode(level[0].to_bytes()))
+    Ok(hex::encode(nodes[0].to_bytes()))
 }
 
 fn parse_hex_32(s: &str) -> Result<[u8; 32], ()> {
@@ -1067,6 +1174,118 @@ mod tests {
                 assert!(notes.is_empty());
             }
             ScanTxResponse::Err { error } => panic!("unexpected scan error: {error}"),
+        }
+    }
+
+    #[test]
+    fn scan_block_reuses_prepared_wallet_set_across_transactions() {
+        let req = CString::new(format!(
+            r#"{{"ua_hrp":"j","wallets":[],"tx_hexes":["{}","{}"]}}"#,
+            hex::encode(empty_v5_tx(BranchId::Nu6_2)),
+            hex::encode(empty_v4_tx())
+        ))
+        .unwrap();
+
+        match scan_block_json_inner(req.as_ptr()).expect("scan block response") {
+            ScanBlockResponse::Ok { results } => {
+                assert_eq!(results.len(), 2);
+                assert!(results
+                    .iter()
+                    .all(|r| r.actions.is_empty() && r.notes.is_empty()));
+            }
+            ScanBlockResponse::Err { error } => panic!("unexpected scan error: {error}"),
+        }
+    }
+
+    fn deterministic_valid_cmx(start: u64) -> String {
+        for value in start.. {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&value.to_le_bytes());
+            if bool::from(ExtractedNoteCommitment::from_bytes(&bytes).is_some()) {
+                return hex::encode(bytes);
+            }
+        }
+        unreachable!("the Orchard base field contains valid encodings")
+    }
+
+    #[test]
+    fn level_12_cached_shard_matches_legacy_witness() {
+        const SHARD_LEAVES: usize = 1 << 12;
+        let cmx = deterministic_valid_cmx(0);
+        let commitments = vec![cmx.clone(); 2 * SHARD_LEAVES];
+        let target_position = 7u32;
+
+        let legacy = orchard_witness_legacy(WitnessRequest {
+            cmx_hex: commitments.clone(),
+            positions: vec![target_position],
+            anchor_height: None,
+            targets: None,
+            ops: None,
+        })
+        .expect("legacy witness");
+        let cached_root = compute_root(&commitments[SHARD_LEAVES..], 12)
+            .expect("deterministic cached shard root");
+        let cached = orchard_witness_with_ops(WitnessRequest {
+            cmx_hex: vec![],
+            positions: vec![],
+            anchor_height: Some(42),
+            targets: Some(vec![WitnessTargetReq {
+                position: target_position,
+                cmx_hex: cmx.clone(),
+            }]),
+            ops: Some(vec![
+                WitnessOpReq::AppendBatch {
+                    cmx_hex: commitments[..SHARD_LEAVES].to_vec(),
+                },
+                WitnessOpReq::InsertShardRoots {
+                    shard_roots: vec![cached_root],
+                },
+            ]),
+        })
+        .expect("cached witness");
+
+        let (legacy_root, legacy_paths) = match legacy {
+            WitnessResponse::Ok { root, paths } => (root, paths),
+            WitnessResponse::Err { error } => panic!("legacy witness failed: {error}"),
+        };
+        let (cached_root, cached_paths) = match cached {
+            WitnessResponse::Ok { root, paths } => (root, paths),
+            WitnessResponse::Err { error } => panic!("cached witness failed: {error}"),
+        };
+        assert_eq!(cached_root, legacy_root);
+        assert_eq!(cached_paths.len(), 1);
+        assert_eq!(cached_paths[0].position, legacy_paths[0].position);
+        assert_eq!(cached_paths[0].auth_path, legacy_paths[0].auth_path);
+    }
+
+    #[test]
+    fn cached_witness_rejects_target_cmx_mismatch() {
+        let expected = deterministic_valid_cmx(0);
+        let mut actual_start = 1u64;
+        let actual = loop {
+            let candidate = deterministic_valid_cmx(actual_start);
+            if candidate != expected {
+                break candidate;
+            }
+            actual_start += 1;
+        };
+        let response = orchard_witness_with_ops(WitnessRequest {
+            cmx_hex: vec![],
+            positions: vec![],
+            anchor_height: Some(42),
+            targets: Some(vec![WitnessTargetReq {
+                position: 0,
+                cmx_hex: expected,
+            }]),
+            ops: Some(vec![WitnessOpReq::AppendBatch {
+                cmx_hex: vec![actual],
+            }]),
+        })
+        .expect("structured mismatch response");
+
+        match response {
+            WitnessResponse::Err { error } => assert_eq!(error, "cmx_mismatch"),
+            WitnessResponse::Ok { .. } => panic!("mismatched target CMX was accepted"),
         }
     }
 }

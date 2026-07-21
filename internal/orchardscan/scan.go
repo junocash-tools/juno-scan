@@ -143,6 +143,59 @@ func ScanTx(ctx context.Context, uaHRP string, wallets []Wallet, txHex string) (
 	}
 }
 
+func ScanBlock(ctx context.Context, uaHRP string, wallets []Wallet, txHexes []string) ([]Result, error) {
+	_ = ctx
+	req := scanBlockRequest{UAHRP: uaHRP, Wallets: make([]walletIn, 0, len(wallets)), TxHexes: txHexes}
+	for _, w := range wallets {
+		req.Wallets = append(req.Wallets, walletIn{WalletID: w.WalletID, UFVK: w.UFVK})
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		return nil, errors.New("orchardscan: marshal request")
+	}
+	raw, err := ffi.ScanBlockJSON(string(b))
+	if err != nil {
+		return nil, err
+	}
+	var resp scanBlockResponse
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+		return nil, errors.New("orchardscan: invalid response")
+	}
+	if resp.Status == "err" {
+		if resp.Error == "" {
+			return nil, errors.New("orchardscan: invalid response")
+		}
+		return nil, &Error{Code: ErrorCode(resp.Error)}
+	}
+	if resp.Status != "ok" || len(resp.Results) != len(txHexes) {
+		return nil, errors.New("orchardscan: invalid response")
+	}
+	out := make([]Result, 0, len(resp.Results))
+	for _, result := range resp.Results {
+		converted, err := convertScanResult(result.Actions, result.Notes)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, converted)
+	}
+	return out, nil
+}
+
+func convertScanResult(actions []actionOut, notes []noteOut) (Result, error) {
+	out := Result{Actions: make([]Action, 0, len(actions)), Notes: make([]Note, 0, len(notes))}
+	for _, a := range actions {
+		out.Actions = append(out.Actions, Action{ActionIndex: a.ActionIndex, ActionNullifier: a.ActionNullifier, CMX: a.CMX, EphemeralKey: a.EphemeralKey, EncCiphertext: a.EncCiphertext})
+	}
+	for _, n := range notes {
+		v, err := strconv.ParseUint(n.ValueZat, 10, 64)
+		if err != nil {
+			return Result{}, errors.New("orchardscan: invalid response")
+		}
+		out.Notes = append(out.Notes, Note{WalletID: n.WalletID, ActionIndex: n.ActionIndex, DiversifierIndex: n.DiversifierIndex, RecipientAddress: n.RecipientAddress, ValueZat: v, MemoHex: n.MemoHex, NoteNullifier: n.NoteNullifier})
+	}
+	return out, nil
+}
+
 func RecoverOutgoingTx(ctx context.Context, uaHRP string, wallets []Wallet, txHex string) ([]OutgoingOutput, error) {
 	_ = ctx // reserved for future (ffi call is synchronous)
 
@@ -206,6 +259,21 @@ type scanTxRequest struct {
 	UAHRP   string     `json:"ua_hrp"`
 	Wallets []walletIn `json:"wallets"`
 	TxHex   string     `json:"tx_hex"`
+}
+
+type scanBlockRequest struct {
+	UAHRP   string     `json:"ua_hrp"`
+	Wallets []walletIn `json:"wallets"`
+	TxHexes []string   `json:"tx_hexes"`
+}
+
+type scanBlockResponse struct {
+	Status  string `json:"status"`
+	Results []struct {
+		Actions []actionOut `json:"actions"`
+		Notes   []noteOut   `json:"notes"`
+	} `json:"results,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 type walletIn struct {

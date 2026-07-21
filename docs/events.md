@@ -16,6 +16,8 @@ Each item has:
 - `kind`: identifies the payload type
 - `payload`: the event payload JSON object
 
+The page also has `event_epoch` (64 lowercase hex characters). Persist it with the cursor. A different epoch means the scanner database or event projection changed; reset the cursor.
+
 This document describes the `payload` shapes for each `kind`.
 
 ## Common types
@@ -51,6 +53,7 @@ Base fields:
 
 Scanner-added fields:
 
+- `origin`: always `"external"`
 - `recipient_address` (optional): unified address (j1...) if the UFVK allowed recovery
 - `note_nullifier` (optional): note nullifier (hex) if available
 
@@ -74,6 +77,8 @@ Scanner-added fields:
 - `rollback_height`
 - `required_confirmations` (optional)
 - `previous_confirmed_height`
+
+Incoming notes created by a transaction that spends any note owned by any registered scanner UFVK are internal. They remain in balances/notes but never emit `DepositEvent`, `DepositConfirmed`, `DepositUnconfirmed`, or `DepositOrphaned`. Address allocation remains a gateway responsibility.
 
 ## Spend events
 

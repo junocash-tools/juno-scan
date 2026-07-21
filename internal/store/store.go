@@ -3,12 +3,20 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
+)
+
+var (
+	ErrWalletUFVKMismatch    = errors.New("wallet_ufvk_immutable")
+	ErrUFVKAlreadyRegistered = errors.New("ufvk_already_registered")
+	ErrBirthdayIncrease      = errors.New("birthday_height_increase_forbidden")
 )
 
 type Store interface {
 	Close() error
 	Migrate(ctx context.Context) error
+	EventEpoch(ctx context.Context) (string, error)
 
 	WithTx(ctx context.Context, fn func(Tx) error) error
 
@@ -25,6 +33,7 @@ type Store interface {
 
 	ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, filter EventFilter) (events []Event, nextCursor int64, err error)
 	ListWalletNotesPage(ctx context.Context, walletID string, query NotesQuery) (notes []Note, nextCursor *NotesCursor, err error)
+	AddressBalance(ctx context.Context, walletID, recipientAddress string, minConfirmations, scannerHeight int64) (AddressBalance, error)
 	ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]Note, error)
 	ListWalletOutgoingOutputsPage(ctx context.Context, walletID string, query OutgoingOutputsQuery) (outputs []OutgoingOutput, nextCursor *NotesCursor, err error)
 	UpdatePendingSpends(ctx context.Context, pending map[string]PendingSpend, chainHeight int64, seenAt time.Time) error
@@ -48,6 +57,7 @@ type Tx interface {
 	ConfirmOutgoingOutputs(ctx context.Context, confirmationHeight int64, maxMinedHeight int64) ([]OutgoingOutput, error)
 	ExpireOutgoingOutputs(ctx context.Context, chainHeight int64, expiredAt time.Time) ([]OutgoingOutput, error)
 	InsertEvent(ctx context.Context, e Event) error
+	MarkTransactionInternal(ctx context.Context, txid string) (bool, error)
 }
 
 type PendingSpend struct {
@@ -56,9 +66,22 @@ type PendingSpend struct {
 }
 
 type Wallet struct {
-	WalletID   string
-	CreatedAt  time.Time
-	DisabledAt *time.Time
+	WalletID        string
+	UFVKFingerprint string
+	BirthdayHeight  int64
+	CreatedAt       time.Time
+	DisabledAt      *time.Time
+}
+
+type WalletBackfillProgress struct {
+	WalletID        string    `json:"wallet_id"`
+	UFVKFingerprint string    `json:"ufvk_fingerprint"`
+	BirthdayHeight  int64     `json:"birthday_height"`
+	NextHeight      int64     `json:"next_height"`
+	TargetHeight    int64     `json:"target_height"`
+	State           string    `json:"state"`
+	LastError       string    `json:"last_error,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type WalletUFVK struct {
@@ -88,6 +111,11 @@ type OrchardAction struct {
 	EncCiphertext   string
 }
 
+type OrchardActionHeight struct {
+	Height  int64
+	Actions []OrchardAction
+}
+
 type OrchardCommitment struct {
 	Position    int64
 	Height      int64
@@ -104,12 +132,22 @@ type OrchardSubtreeRoot struct {
 	Root         string
 }
 
+type OrchardShardRoot struct {
+	Version      int32
+	ShardIndex   int64
+	EndPosition  int64
+	EndHeight    int64
+	EndBlockHash string
+	Root         string
+}
+
 type Note struct {
 	WalletID                 string
 	TxID                     string
 	ActionIndex              int32
 	Height                   int64
 	Position                 *int64
+	IsInternal               bool
 	DiversifierIndex         uint32
 	RecipientAddress         string
 	ValueZat                 int64
@@ -147,10 +185,19 @@ type NotesCursor struct {
 }
 
 type NotesQuery struct {
-	OnlyUnspent bool
-	MinValueZat int64
-	Limit       int
-	Cursor      *NotesCursor
+	OnlyUnspent      bool
+	MinValueZat      int64
+	RecipientAddress string
+	Limit            int
+	Cursor           *NotesCursor
+}
+
+type AddressBalance struct {
+	WalletFound        bool
+	AvailableZat       int64
+	PendingIncomingZat int64
+	PendingOutgoingZat int64
+	TotalUnspentZat    int64
 }
 
 type OutgoingOutputsQuery struct {

@@ -1,0 +1,5 @@
+.git
+.cache
+bin
+tmp
+rust/scan/target

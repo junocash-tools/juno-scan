@@ -73,6 +73,12 @@ paths:
             text/plain:
               schema:
                 type: string
+        "409":
+          description: Immutable wallet identity, duplicate UFVK, or forbidden birthday increase
+          content:
+            text/plain:
+              schema:
+                type: string
         "500":
           description: Validation/DB error
           content:
@@ -156,6 +162,22 @@ paths:
               schema:
                 type: string
   /v1/wallets/{wallet_id}/backfill:
+    get:
+      summary: Read persisted historical backfill progress
+      parameters:
+        - name: wallet_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Persisted progress
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackfillStatus"
+        "404":
+          description: Unknown wallet or progress
     post:
       summary: Backfill wallet history (incremental)
       parameters:
@@ -233,6 +255,12 @@ paths:
             format: int64
             minimum: 0
             description: Minimum note value in zatoshis
+        - name: recipient_address
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Exact incoming recipient-address filter
         - name: limit
           in: query
           required: false
@@ -272,6 +300,33 @@ paths:
             text/plain:
               schema:
                 type: string
+  /v1/wallets/{wallet_id}/addresses/{address}/balance:
+    get:
+      summary: Balance for one address observed under a registered wallet UFVK
+      parameters:
+        - name: wallet_id
+          in: path
+          required: true
+          schema: {type: string}
+        - name: address
+          in: path
+          required: true
+          schema: {type: string}
+        - name: min_confirmations
+          in: query
+          required: false
+          schema: {type: integer, format: int64, minimum: 0, default: 100}
+      responses:
+        "200":
+          description: Balance buckets; an address with no notes returns zeros
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AddressBalanceResponse"
+        "404":
+          description: Unknown wallet
+        "503":
+          description: Scanner has no indexed tip
   /v1/orchard/witness:
     post:
       summary: Compute Orchard witnesses
@@ -314,23 +369,52 @@ components:
   schemas:
     HealthResponse:
       type: object
-      required: [status]
+      required: [status, event_epoch]
       properties:
         status:
           type: string
-          enum: [ok]
+          enum: [ok, degraded]
+        ready:
+          type: boolean
+        event_epoch:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        network:
+          type: string
+          enum: [mainnet, testnet, regtest]
+        ua_hrp:
+          type: string
         scanned_height:
           type: integer
           format: int64
         scanned_hash:
           type: string
+        node_height:
+          type: integer
+          format: int64
+        scanner_lag:
+          type: integer
+          format: int64
+        max_ready_lag:
+          type: integer
+          format: int64
+        history_complete:
+          type: boolean
+        history_pending_wallets:
+          type: integer
       additionalProperties: true
     Wallet:
       type: object
-      required: [wallet_id, created_at]
+      required: [wallet_id, ufvk_fingerprint, birthday_height, created_at]
       properties:
         wallet_id:
           type: string
+        ufvk_fingerprint:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        birthday_height:
+          type: integer
+          format: int64
         created_at:
           type: string
           format: date-time
@@ -355,14 +439,25 @@ components:
           type: string
         ufvk:
           type: string
+        birthday_height:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Defaults to zero for a new wallet; omission preserves an existing wallet birthday.
       additionalProperties: false
     UpsertWalletResponse:
       type: object
-      required: [status]
+      required: [status, birthday_height, ufvk_fingerprint]
       properties:
         status:
           type: string
           enum: [ok]
+        birthday_height:
+          type: integer
+          format: int64
+        ufvk_fingerprint:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
       additionalProperties: true
     WalletEvent:
       type: object
@@ -385,8 +480,11 @@ components:
       additionalProperties: true
     ListWalletEventsResponse:
       type: object
-      required: [events, next_cursor]
+      required: [event_epoch, events, next_cursor]
       properties:
+        event_epoch:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
         events:
           type: array
           items:
@@ -454,7 +552,44 @@ components:
         inserted_events:
           type: integer
           format: int64
+        visited_action_heights:
+          type: integer
+          format: int64
+        skipped_heights:
+          type: integer
+          format: int64
+        rpc_calls:
+          type: integer
+          format: int64
       additionalProperties: true
+    BackfillStatus:
+      type: object
+      required: [wallet_id, ufvk_fingerprint, birthday_height, next_height, target_height, state, updated_at]
+      properties:
+        wallet_id: {type: string}
+        birthday_height: {type: integer, format: int64}
+        ufvk_fingerprint: {type: string, pattern: "^[0-9a-f]{64}$"}
+        next_height: {type: integer, format: int64}
+        target_height: {type: integer, format: int64}
+        state: {type: string, enum: [pending, running, complete, error]}
+        last_error: {type: string}
+        updated_at: {type: string, format: date-time}
+      additionalProperties: false
+    AddressBalanceResponse:
+      type: object
+      required: [wallet_id, recipient_address, available_zat, pending_incoming_zat, pending_outgoing_zat, total_unspent_zat, min_confirmations, as_of_node_height, as_of_scanner_height, scanner_lag]
+      properties:
+        wallet_id: {type: string}
+        recipient_address: {type: string}
+        available_zat: {type: integer, format: int64}
+        pending_incoming_zat: {type: integer, format: int64}
+        pending_outgoing_zat: {type: integer, format: int64}
+        total_unspent_zat: {type: integer, format: int64}
+        min_confirmations: {type: integer, format: int64}
+        as_of_node_height: {type: integer, format: int64}
+        as_of_scanner_height: {type: integer, format: int64}
+        scanner_lag: {type: integer, format: int64}
+      additionalProperties: false
     WalletNote:
       type: object
       required: [direction, txid, action_index, height, recipient_address, value_zat, memo_hex, created_at]

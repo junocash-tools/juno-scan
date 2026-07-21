@@ -15,8 +15,13 @@ type WitnessPath struct {
 }
 
 type WitnessResult struct {
-	Root  string
-	Paths []WitnessPath
+	Root              string
+	Paths             []WitnessPath
+	ComputeMode       string
+	FallbackFrom      string
+	FallbackReason    string
+	StreamedLeafCount int64
+	InsertedRootCount int
 }
 
 func OrchardWitness(ctx context.Context, cmxHex []string, positions []uint32) (WitnessResult, error) {
@@ -39,12 +44,14 @@ type WitnessOperationType string
 const (
 	WitnessOpAppendBatch        WitnessOperationType = "append_batch"
 	WitnessOpInsertSubtreeRoots WitnessOperationType = "insert_subtree_roots"
+	WitnessOpInsertShardRoots   WitnessOperationType = "insert_shard_roots"
 )
 
 type WitnessOperation struct {
 	Type         WitnessOperationType
 	CMXHex       []string
 	SubtreeRoots []string
+	ShardRoots   []string
 }
 
 func OrchardWitnessWithOps(ctx context.Context, anchorHeight uint32, targets []WitnessTarget, ops []WitnessOperation) (WitnessResult, error) {
@@ -66,15 +73,24 @@ func OrchardWitnessWithOps(ctx context.Context, anchorHeight uint32, targets []W
 			Type:         string(op.Type),
 			CMXHex:       op.CMXHex,
 			SubtreeRoots: op.SubtreeRoots,
+			ShardRoots:   op.ShardRoots,
 		})
 	}
 	return callOrchardWitness(req)
 }
 
 func OrchardSubtreeRoot(ctx context.Context, cmxHex []string) (string, error) {
+	return orchardCachedRoot(ctx, cmxHex, 16)
+}
+
+func OrchardShardRoot(ctx context.Context, cmxHex []string) (string, error) {
+	return orchardCachedRoot(ctx, cmxHex, 12)
+}
+
+func orchardCachedRoot(ctx context.Context, cmxHex []string, level uint8) (string, error) {
 	_ = ctx // reserved for future (ffi call is synchronous)
 
-	b, err := json.Marshal(subtreeRootRequest{CMXHex: cmxHex})
+	b, err := json.Marshal(subtreeRootRequest{CMXHex: cmxHex, Level: level})
 	if err != nil {
 		return "", errors.New("orchardscan: marshal request")
 	}
@@ -164,10 +180,12 @@ type witnessOperationReq struct {
 	Type         string   `json:"type"`
 	CMXHex       []string `json:"cmx_hex,omitempty"`
 	SubtreeRoots []string `json:"subtree_roots,omitempty"`
+	ShardRoots   []string `json:"shard_roots,omitempty"`
 }
 
 type subtreeRootRequest struct {
 	CMXHex []string `json:"cmx_hex"`
+	Level  uint8    `json:"level,omitempty"`
 }
 
 type witnessResponse struct {

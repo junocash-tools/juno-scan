@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/Abdullah1738/juno-scan/internal/events"
 	"github.com/Abdullah1738/juno-scan/internal/orchardscan"
@@ -19,6 +20,23 @@ type Service struct {
 	rpc           *sdkjunocashd.Client
 	uaHRP         string
 	confirmations int64
+	mu            sync.RWMutex
+	active        int
+}
+
+type Status struct {
+	Active     int `json:"active"`
+	QueueDepth int `json:"queue_depth"`
+}
+
+func (s *Service) Snapshot() Status {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return Status{Active: s.active}
+}
+
+type orchardActionIndexStore interface {
+	ListOrchardActionHeights(context.Context, int64, int64) ([]int64, error)
 }
 
 func New(st store.Store, rpc *sdkjunocashd.Client, uaHRP string, confirmations int64) (*Service, error) {
@@ -52,11 +70,22 @@ type Result struct {
 	ScannedTo   int64
 	NextHeight  int64
 
-	InsertedNotes  int64
-	InsertedEvents int64
+	InsertedNotes        int64
+	InsertedEvents       int64
+	VisitedActionHeights int64
+	SkippedHeights       int64
+	RPCCalls             int64
 }
 
 func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, error) {
+	s.mu.Lock()
+	s.active++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.active--
+		s.mu.Unlock()
+	}()
 	req.WalletID = strings.TrimSpace(req.WalletID)
 	if req.WalletID == "" {
 		return Result{}, errors.New("backfill: wallet_id required")
@@ -74,11 +103,19 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 		req.BatchSize = 10_000
 	}
 
-	walletUFVK, ok, err := s.walletUFVK(ctx, req.WalletID)
+	registered, err := s.st.ListEnabledWalletUFVKs(ctx)
 	if err != nil {
 		return Result{}, err
 	}
-	if !ok {
+	wallets := make([]orchardscan.Wallet, 0, len(registered))
+	walletUFVK := ""
+	for _, w := range registered {
+		wallets = append(wallets, orchardscan.Wallet{WalletID: w.WalletID, UFVK: w.UFVK})
+		if w.WalletID == req.WalletID {
+			walletUFVK = w.UFVK
+		}
+	}
+	if walletUFVK == "" {
 		return Result{}, errors.New("backfill: wallet not found (or disabled)")
 	}
 
@@ -96,8 +133,20 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 
 	var insertedNotes int64
 	var insertedEvents int64
+	actionHeights := make([]int64, 0, scanTo-req.FromHeight+1)
+	if indexed, ok := s.st.(orchardActionIndexStore); ok {
+		actionHeights, err = indexed.ListOrchardActionHeights(ctx, req.FromHeight, scanTo)
+		if err != nil {
+			return Result{}, fmt.Errorf("backfill: action index: %w", err)
+		}
+	} else {
+		for height := req.FromHeight; height <= scanTo; height++ {
+			actionHeights = append(actionHeights, height)
+		}
+	}
+	var rpcCalls int64
 
-	for height := req.FromHeight; height <= scanTo; height++ {
+	for _, height := range actionHeights {
 		hash, ok, err := s.st.HashAtHeight(ctx, height)
 		if err != nil {
 			return Result{}, err
@@ -110,6 +159,7 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 		if err := s.rpc.Call(ctx, "getblock", []any{hash, 2}, &blk); err != nil {
 			return Result{}, fmt.Errorf("backfill: getblock(%d): %w", height, err)
 		}
+		rpcCalls++
 		if blk.Height != height {
 			return Result{}, fmt.Errorf("backfill: daemon returned unexpected height: got %d want %d", blk.Height, height)
 		}
@@ -118,12 +168,17 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 
 		err = s.st.WithTx(ctx, func(tx store.Tx) error {
 			posByTxAction := make(map[string]map[uint32]int64)
-
+			txHexes := make([]string, 0, len(blk.Tx))
 			for _, t := range blk.Tx {
-				res, err := orchardscan.ScanTx(ctx, s.uaHRP, []orchardscan.Wallet{{WalletID: req.WalletID, UFVK: walletUFVK}}, t.Hex)
-				if err != nil {
-					return fmt.Errorf("backfill: scan tx %s: %w", t.TxID, err)
-				}
+				txHexes = append(txHexes, t.Hex)
+			}
+			scanResults, err := orchardscan.ScanBlock(ctx, s.uaHRP, wallets, txHexes)
+			if err != nil {
+				return fmt.Errorf("backfill: scan block %d: %w", height, err)
+			}
+
+			for txIndex, t := range blk.Tx {
+				res := scanResults[txIndex]
 
 				if len(res.Actions) == 0 {
 					continue
@@ -177,6 +232,17 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 						return err
 					}
 					insertedEvents++
+				}
+
+				recoveredByRegisteredWallet, err := orchardscan.RecoverOutgoingTx(ctx, s.uaHRP, wallets, t.Hex)
+				if err != nil {
+					return fmt.Errorf("backfill: classify transaction origin %s: %w", t.TxID, err)
+				}
+				isInternalTx := len(spentNotes) > 0 || len(recoveredByRegisteredWallet) > 0
+				if isInternalTx {
+					if _, err := tx.MarkTransactionInternal(ctx, t.TxID); err != nil {
+						return err
+					}
 				}
 
 				// Record outgoing outputs for spends (recipient/value/memo via OVK output recovery).
@@ -265,6 +331,9 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 				}
 
 				for _, n := range res.Notes {
+					if n.WalletID != req.WalletID {
+						continue
+					}
 					pos, ok := posByTxAction[t.TxID][n.ActionIndex]
 					if !ok {
 						continue
@@ -282,6 +351,7 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 						ActionIndex:      int32(n.ActionIndex),
 						Height:           height,
 						Position:         &posCopy,
+						IsInternal:       isInternalTx,
 						DiversifierIndex: n.DiversifierIndex,
 						RecipientAddress: n.RecipientAddress,
 						ValueZat:         int64(n.ValueZat),
@@ -293,8 +363,10 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 					}
 					if inserted {
 						insertedNotes++
-
+					}
+					if inserted && !isInternalTx {
 						payload := events.DepositEventPayload{
+							Origin: "external",
 							DepositEvent: types.DepositEvent{
 								Version:          types.V1,
 								WalletID:         n.WalletID,
@@ -359,19 +431,44 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 		}
 	}
 
+	// Coalesce confirmation progress across barren ranges into one final write.
+	if err := s.st.WithTx(ctx, func(tx store.Tx) error {
+		_, eventsAdded, err := confirmDepositConfirmations(ctx, tx, s.confirmations, scanTo)
+		if err != nil {
+			return err
+		}
+		insertedEvents += eventsAdded
+		_, eventsAdded, err = confirmSpendConfirmations(ctx, tx, s.confirmations, scanTo)
+		if err != nil {
+			return err
+		}
+		insertedEvents += eventsAdded
+		_, eventsAdded, err = confirmOutgoingOutputConfirmations(ctx, tx, s.confirmations, scanTo)
+		if err != nil {
+			return err
+		}
+		insertedEvents += eventsAdded
+		return nil
+	}); err != nil {
+		return Result{}, err
+	}
+
 	nextHeight := scanTo + 1
 	if nextHeight < req.FromHeight {
 		nextHeight = req.FromHeight
 	}
 
 	return Result{
-		FromHeight:     req.FromHeight,
-		ToHeight:       req.ToHeight,
-		ScannedFrom:    req.FromHeight,
-		ScannedTo:      scanTo,
-		NextHeight:     nextHeight,
-		InsertedNotes:  insertedNotes,
-		InsertedEvents: insertedEvents,
+		FromHeight:           req.FromHeight,
+		ToHeight:             req.ToHeight,
+		ScannedFrom:          req.FromHeight,
+		ScannedTo:            scanTo,
+		NextHeight:           nextHeight,
+		InsertedNotes:        insertedNotes,
+		InsertedEvents:       insertedEvents,
+		VisitedActionHeights: int64(len(actionHeights)),
+		SkippedHeights:       (scanTo - req.FromHeight + 1) - int64(len(actionHeights)),
+		RPCCalls:             rpcCalls,
 	}, nil
 }
 
@@ -401,6 +498,9 @@ func confirmDepositConfirmations(ctx context.Context, tx store.Tx, confirmations
 
 	var inserted int64
 	for _, n := range notes {
+		if n.IsInternal {
+			continue
+		}
 		memoHex := ""
 		if n.MemoHex != nil {
 			memoHex = *n.MemoHex
@@ -412,6 +512,7 @@ func confirmDepositConfirmations(ctx context.Context, tx store.Tx, confirmations
 
 		payload := events.DepositConfirmedPayload{
 			DepositEventPayload: events.DepositEventPayload{
+				Origin: "external",
 				DepositEvent: types.DepositEvent{
 					Version:          types.V1,
 					WalletID:         n.WalletID,

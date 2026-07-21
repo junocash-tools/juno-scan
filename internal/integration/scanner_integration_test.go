@@ -83,6 +83,7 @@ func TestScanner_DepositDetected(t *testing.T) {
 
 	var confirmedPayload struct {
 		TxID                  string `json:"txid"`
+		Origin                string `json:"origin"`
 		RequiredConfirmations int64  `json:"required_confirmations"`
 		ConfirmedHeight       int64  `json:"confirmed_height"`
 		Status                struct {
@@ -94,6 +95,9 @@ func TestScanner_DepositDetected(t *testing.T) {
 	}
 	if confirmedPayload.TxID == "" {
 		t.Fatalf("missing txid in confirmed payload")
+	}
+	if confirmedPayload.Origin != "external" {
+		t.Fatalf("origin=%q want external", confirmedPayload.Origin)
 	}
 	if confirmedPayload.TxID != mustTxIDFromPayload(t, deposit.Payload) {
 		t.Fatalf("confirmed txid mismatch")
@@ -195,6 +199,83 @@ func TestScanner_DepositDetected(t *testing.T) {
 	}
 	if !foundSpent {
 		t.Fatalf("spent note not found")
+	}
+}
+
+func TestScanner_CrossWalletTransferIsNotDeposit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	st, err := rocksdb.Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	jd, err := testutil.StartJunocashd(ctx, testutil.JunocashdConfig{})
+	if err != nil {
+		if errors.Is(err, testutil.ErrJunocashdNotFound) || errors.Is(err, testutil.ErrJunocashCLIOnPath) || errors.Is(err, testutil.ErrListenNotAllowed) {
+			t.Skip(err.Error())
+		}
+		t.Fatal(err)
+	}
+	defer func() { _ = jd.Stop(context.Background()) }()
+	addrA, ufvkA := mustCreateWalletAndUFVK(t, ctx, jd)
+	addrB, ufvkB := mustCreateWalletAndUFVK(t, ctx, jd)
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertWallet(ctx, "wallet-a", ufvkA); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertWallet(ctx, "wallet-b", ufvkB); err != nil {
+		t.Fatal(err)
+	}
+	rpc := sdkjunocashd.New(jd.RPCURL, jd.RPCUser, jd.RPCPassword)
+	sc, err := scanner.New(st, rpc, strings.SplitN(addrA, "1", 2)[0], 100*time.Millisecond, 2, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, runCancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() { errCh <- sc.Run(runCtx) }()
+	defer func() {
+		runCancel()
+		select {
+		case <-errCh:
+		case <-time.After(5 * time.Second):
+		}
+	}()
+	mustRun(t, jd.CLICommand(ctx, "generate", "101"))
+	opid := mustShieldCoinbase(t, ctx, jd, mustCoinbaseAddress(t, ctx, jd), addrA)
+	mustWaitOpSuccess(t, ctx, jd, opid)
+	mustRun(t, jd.CLICommand(ctx, "generate", "2"))
+	waitForEventKind(t, ctx, st, "wallet-a", "DepositConfirmed")
+	transferOpID := mustSendMany(t, ctx, jd, addrA, addrB, "0.01")
+	mustWaitOpSuccess(t, ctx, jd, transferOpID)
+	transferTxID := mustTxIDForOpID(t, ctx, jd, transferOpID)
+	mustRun(t, jd.CLICommand(ctx, "generate", "2"))
+	waitForEventKind(t, ctx, st, "wallet-a", "SpendConfirmed")
+	waitForScannerTip(t, ctx, st, rpc)
+	notesB, err := st.ListWalletNotes(ctx, "wallet-b", false, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundIncoming := false
+	for _, note := range notesB {
+		if note.TxID == transferTxID {
+			foundIncoming = true
+		}
+	}
+	if !foundIncoming {
+		t.Fatalf("wallet-b incoming note %s was not stored", transferTxID)
+	}
+	eventsB, _, err := st.ListWalletEvents(ctx, "wallet-b", 0, 1000, store.EventFilter{TxID: transferTxID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range eventsB {
+		if strings.HasPrefix(event.Kind, "Deposit") {
+			t.Fatalf("cross-wallet transfer emitted deposit lifecycle: %+v", event)
+		}
 	}
 }
 

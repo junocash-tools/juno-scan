@@ -22,6 +22,7 @@ const (
 
 type DepositEventPayload struct {
 	types.DepositEvent
+	Origin           string `json:"origin"`
 	RecipientAddress string `json:"recipient_address,omitempty"`
 	NoteNullifier    string `json:"note_nullifier,omitempty"`
 }

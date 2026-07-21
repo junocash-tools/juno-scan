@@ -44,6 +44,7 @@ func TestIntegration_API_BackfillWallet(t *testing.T) {
 	defer func() { _ = jd.Stop(context.Background()) }()
 
 	addr, ufvk := mustCreateWalletAndUFVK(t, ctx, jd)
+	_, otherUFVK := mustCreateWalletAndUFVK(t, ctx, jd)
 	uaHRP := strings.SplitN(addr, "1", 2)[0]
 
 	if err := st.Migrate(ctx); err != nil {
@@ -73,6 +74,10 @@ func TestIntegration_API_BackfillWallet(t *testing.T) {
 	opid := mustShieldCoinbase(t, ctx, jd, fromAddr, addr)
 	mustWaitOpSuccess(t, ctx, jd, opid)
 	mustRun(t, jd.CLICommand(ctx, "generate", "2"))
+	toAddr := mustCreateUnifiedAddress(t, ctx, jd)
+	withdrawOpID := mustSendMany(t, ctx, jd, addr, toAddr, "0.01")
+	mustWaitOpSuccess(t, ctx, jd, withdrawOpID)
+	mustRun(t, jd.CLICommand(ctx, "generate", "2"))
 
 	waitForScannerTip(t, ctx, st, rpc)
 
@@ -89,16 +94,52 @@ func TestIntegration_API_BackfillWallet(t *testing.T) {
 	defer srv.Close()
 
 	upsertBody, _ := json.Marshal(map[string]any{
-		"wallet_id": "hot",
-		"ufvk":      ufvk,
+		"wallet_id":       "hot",
+		"ufvk":            ufvk,
+		"birthday_height": 10,
 	})
 	resp, err := http.Post(srv.URL+"/v1/wallets", "application/json", bytes.NewReader(upsertBody))
 	if err != nil {
 		t.Fatalf("POST /v1/wallets: %v", err)
 	}
-	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
 		t.Fatalf("POST /v1/wallets status=%d", resp.StatusCode)
+	}
+	var registration struct {
+		UFVKFingerprint string `json:"ufvk_fingerprint"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&registration); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if registration.UFVKFingerprint != store.UFVKFingerprint(ufvk) {
+		t.Fatalf("registration fingerprint=%q", registration.UFVKFingerprint)
+	}
+	if status := postWalletStatus(t, srv.URL, map[string]any{"wallet_id": "hot", "ufvk": otherUFVK, "birthday_height": 10}); status != http.StatusConflict {
+		t.Fatalf("changed UFVK status=%d", status)
+	}
+	if status := postWalletStatus(t, srv.URL, map[string]any{"wallet_id": "other", "ufvk": ufvk, "birthday_height": 10}); status != http.StatusConflict {
+		t.Fatalf("duplicate UFVK status=%d", status)
+	}
+	if status := postWalletStatus(t, srv.URL, map[string]any{"wallet_id": "hot", "ufvk": ufvk, "birthday_height": 11}); status != http.StatusConflict {
+		t.Fatalf("birthday increase status=%d", status)
+	}
+	if status := postWalletStatus(t, srv.URL, map[string]any{"wallet_id": "hot", "ufvk": ufvk, "birthday_height": 0}); status != http.StatusOK {
+		t.Fatalf("birthday rewind status=%d", status)
+	}
+	statusResp, err := http.Get(srv.URL + "/v1/wallets/hot/backfill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var backfillStatus store.WalletBackfillProgress
+	if err := json.NewDecoder(statusResp.Body).Decode(&backfillStatus); err != nil {
+		_ = statusResp.Body.Close()
+		t.Fatal(err)
+	}
+	_ = statusResp.Body.Close()
+	if statusResp.StatusCode != http.StatusOK || backfillStatus.UFVKFingerprint != store.UFVKFingerprint(ufvk) {
+		t.Fatalf("backfill status=%d fingerprint=%q", statusResp.StatusCode, backfillStatus.UFVKFingerprint)
 	}
 
 	// Without backfill, the historic deposit is not detected.
@@ -127,6 +168,9 @@ func TestIntegration_API_BackfillWallet(t *testing.T) {
 	}
 	if countKind(evs, "DepositConfirmed") != 1 {
 		t.Fatalf("expected DepositConfirmed after backfill")
+	}
+	if countKind(evs, "SpendEvent") != 1 {
+		t.Fatalf("expected withdrawal SpendEvent after backfill")
 	}
 
 	// Backfill again should be idempotent (no duplicated DepositEvent).
@@ -164,6 +208,88 @@ func TestIntegration_API_BackfillWallet(t *testing.T) {
 		if e.Height != depositHeight {
 			t.Fatalf("expected all filtered events at height=%d, got %+v", depositHeight, evsAtHeight)
 		}
+	}
+}
+
+func TestIntegration_BackfillCrossWalletTransferOrderIndependent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+	jd, err := testutil.StartJunocashd(ctx, testutil.JunocashdConfig{})
+	if err != nil {
+		if errors.Is(err, testutil.ErrJunocashdNotFound) || errors.Is(err, testutil.ErrJunocashCLIOnPath) || errors.Is(err, testutil.ErrListenNotAllowed) {
+			t.Skip(err.Error())
+		}
+		t.Fatal(err)
+	}
+	defer func() { _ = jd.Stop(context.Background()) }()
+	addrA, ufvkA := mustCreateWalletAndUFVK(t, ctx, jd)
+	addrB, ufvkB := mustCreateWalletAndUFVK(t, ctx, jd)
+	uaHRP := strings.SplitN(addrA, "1", 2)[0]
+	rpc := sdkjunocashd.New(jd.RPCURL, jd.RPCUser, jd.RPCPassword)
+	mustRun(t, jd.CLICommand(ctx, "generate", "101"))
+	shieldOpID := mustShieldCoinbase(t, ctx, jd, mustCoinbaseAddress(t, ctx, jd), addrA)
+	mustWaitOpSuccess(t, ctx, jd, shieldOpID)
+	mustRun(t, jd.CLICommand(ctx, "generate", "2"))
+	mustWaitOrchardBalanceForViewingKey(t, ctx, jd, ufvkA, 2)
+	transferOpID := mustSendMany(t, ctx, jd, addrA, addrB, "0.01")
+	mustWaitOpSuccess(t, ctx, jd, transferOpID)
+	transferTxID := mustTxIDForOpID(t, ctx, jd, transferOpID)
+	mustRun(t, jd.CLICommand(ctx, "generate", "2"))
+	tip, err := rpc.GetBlockCount(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, order := range [][]string{{"wallet-a", "wallet-b"}, {"wallet-b", "wallet-a"}} {
+		order := order
+		t.Run(strings.Join(order, "-then-"), func(t *testing.T) {
+			st, err := rocksdb.Open(filepath.Join(t.TempDir(), "db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			if err := st.Migrate(ctx); err != nil {
+				t.Fatal(err)
+			}
+			sc, err := scanner.New(st, rpc, uaHRP, 50*time.Millisecond, 2, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			runCtx, runCancel := context.WithCancel(ctx)
+			errCh := make(chan error, 1)
+			go func() { errCh <- sc.Run(runCtx) }()
+			waitForScannerTip(t, ctx, st, rpc)
+			runCancel()
+			select {
+			case <-errCh:
+			case <-time.After(5 * time.Second):
+				t.Fatal("scanner did not stop")
+			}
+			if err := st.UpsertWallet(ctx, "wallet-a", ufvkA); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.UpsertWallet(ctx, "wallet-b", ufvkB); err != nil {
+				t.Fatal(err)
+			}
+			bf, err := backfill.New(st, rpc, uaHRP, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, walletID := range order {
+				if _, err := bf.BackfillWallet(ctx, backfill.Request{WalletID: walletID, FromHeight: 0, ToHeight: tip, BatchSize: tip + 1}); err != nil {
+					t.Fatalf("backfill %s: %v", walletID, err)
+				}
+			}
+			eventsB, _, err := st.ListWalletEvents(ctx, "wallet-b", 0, 1000, store.EventFilter{TxID: transferTxID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, event := range eventsB {
+				if strings.HasPrefix(event.Kind, "Deposit") {
+					t.Fatalf("order %v exposed cross-wallet deposit: %+v", order, event)
+				}
+			}
+		})
 	}
 }
 
@@ -228,4 +354,15 @@ func countKind(evs []walletEvent, kind string) int {
 		}
 	}
 	return n
+}
+
+func postWalletStatus(t *testing.T, baseURL string, body map[string]any) int {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	resp, err := http.Post(baseURL+"/v1/wallets", "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
 }

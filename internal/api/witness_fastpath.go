@@ -11,6 +11,7 @@ import (
 
 const (
 	orchardSubtreeLeafCount      int64 = 1 << 16
+	orchardShardLeafCount        int64 = 1 << 12
 	witnessAppendBatchSize             = 5000
 	witnessSubtreeRootBatchSize        = 256
 	witnessSubtreeRootChunkSize        = 2048
@@ -27,24 +28,59 @@ var (
 )
 
 type orchardWitnessFastStore interface {
+	HashAtHeight(ctx context.Context, height int64) (string, bool, error)
 	OrchardTreeSizeAtHeight(ctx context.Context, height int64) (int64, error)
 	ListOrchardCommitmentCMXByPositionRange(ctx context.Context, anchorHeight, startPos, endPos int64) ([]string, error)
 	ListOrchardCommitmentsByPositionsUpToHeight(ctx context.Context, anchorHeight int64, positions []int64) ([]store.OrchardCommitment, error)
 	ListOrchardSubtreeRootsByIndexRange(ctx context.Context, startIndex int64, limit int) ([]store.OrchardSubtreeRoot, error)
+	ListOrchardShardRootsByIndexRange(ctx context.Context, startIndex int64, limit int) ([]store.OrchardShardRoot, error)
 }
 
 func (s *Server) computeOrchardWitness(ctx context.Context, anchorHeight int64, positions []uint32) (orchardscan.WitnessResult, error) {
-	if fs, ok := s.st.(orchardWitnessFastStore); ok {
-		res, err := computeOrchardWitnessFast(ctx, fs, anchorHeight, positions)
-		if err == nil {
-			return res, nil
-		}
-		if errors.Is(err, errPreferLegacyWitnessPath) {
-			return computeOrchardWitnessLegacy(ctx, s.st, anchorHeight, positions)
-		}
-		return orchardscan.WitnessResult{}, err
+	if s.witnessMode == "legacy" {
+		return computeOrchardWitnessLegacy(ctx, s.st, anchorHeight, positions)
 	}
-	return computeOrchardWitnessLegacy(ctx, s.st, anchorHeight, positions)
+	fs, ok := s.st.(orchardWitnessFastStore)
+	if !ok {
+		return computeOrchardWitnessLegacy(ctx, s.st, anchorHeight, positions)
+	}
+	if s.witnessMode == "shard" {
+		return computeOrchardWitnessCached(ctx, fs, anchorHeight, positions, true)
+	}
+	if s.witnessMode == "subtree" {
+		return computeOrchardWitnessCached(ctx, fs, anchorHeight, positions, false)
+	}
+	shardErr := error(nil)
+	if res, err := computeOrchardWitnessCached(ctx, fs, anchorHeight, positions, true); err == nil {
+		return res, nil
+	} else if ctx.Err() != nil {
+		return orchardscan.WitnessResult{}, ctx.Err()
+	} else {
+		shardErr = err
+	}
+	if res, err := computeOrchardWitnessCached(ctx, fs, anchorHeight, positions, false); err == nil {
+		res.FallbackFrom = "shard"
+		res.FallbackReason = witnessFallbackReason(shardErr)
+		return res, nil
+	} else if ctx.Err() != nil {
+		return orchardscan.WitnessResult{}, ctx.Err()
+	}
+	res, err := computeOrchardWitnessLegacy(ctx, s.st, anchorHeight, positions)
+	if err == nil {
+		res.FallbackFrom = "shard,subtree"
+		res.FallbackReason = witnessFallbackReason(shardErr)
+	}
+	return res, err
+}
+
+func witnessFallbackReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, errPreferLegacyWitnessPath) {
+		return "cache_incomplete"
+	}
+	return "fast_path_error"
 }
 
 func computeOrchardWitnessLegacy(ctx context.Context, st store.Store, anchorHeight int64, positions []uint32) (orchardscan.WitnessResult, error) {
@@ -66,10 +102,17 @@ func computeOrchardWitnessLegacy(ctx context.Context, st store.Store, anchorHeig
 		cmxHex = append(cmxHex, c.CMX)
 	}
 
-	return orchardscan.OrchardWitness(ctx, cmxHex, positions)
+	res, err := orchardscan.OrchardWitness(ctx, cmxHex, positions)
+	res.ComputeMode = "legacy"
+	res.StreamedLeafCount = int64(len(cmxHex))
+	return res, err
 }
 
 func computeOrchardWitnessFast(ctx context.Context, st orchardWitnessFastStore, anchorHeight int64, positions []uint32) (orchardscan.WitnessResult, error) {
+	return computeOrchardWitnessCached(ctx, st, anchorHeight, positions, false)
+}
+
+func computeOrchardWitnessCached(ctx context.Context, st orchardWitnessFastStore, anchorHeight int64, positions []uint32, useShards bool) (orchardscan.WitnessResult, error) {
 	if anchorHeight < 0 || anchorHeight > int64(^uint32(0)) {
 		return orchardscan.WitnessResult{}, &orchardscan.Error{Code: orchardscan.ErrInvalidRequest}
 	}
@@ -123,33 +166,62 @@ func computeOrchardWitnessFast(ctx context.Context, st orchardWitnessFastStore, 
 	}
 
 	rootByIndex := make(map[int64]string)
-	fullSubtrees := leafCount / orchardSubtreeLeafCount
+	groupLeafCount := orchardSubtreeLeafCount
+	maxStreamGroups := witnessFastMaxStreamSubtrees
+	if useShards {
+		groupLeafCount = orchardShardLeafCount
+		maxStreamGroups *= int(orchardSubtreeLeafCount / orchardShardLeafCount)
+	}
+	fullSubtrees := leafCount / groupLeafCount
 	for start := int64(0); start < fullSubtrees; start += witnessSubtreeRootChunkSize {
 		limit := int(fullSubtrees - start)
 		if limit > witnessSubtreeRootChunkSize {
 			limit = witnessSubtreeRootChunkSize
 		}
-		roots, err := st.ListOrchardSubtreeRootsByIndexRange(ctx, start, limit)
-		if err != nil {
-			return orchardscan.WitnessResult{}, fmt.Errorf("%w: list subtree roots: %v", errDBAccess, err)
-		}
-		for _, root := range roots {
-			if root.SubtreeIndex < start {
-				continue
+		if useShards {
+			roots, err := st.ListOrchardShardRootsByIndexRange(ctx, start, limit)
+			if err != nil {
+				return orchardscan.WitnessResult{}, fmt.Errorf("%w: list shard roots: %v", errDBAccess, err)
 			}
-			if root.SubtreeIndex >= start+int64(limit) {
-				continue
+			for _, root := range roots {
+				expectedEndPosition := (root.ShardIndex+1)*groupLeafCount - 1
+				if root.Version != 1 || root.ShardIndex < start || root.ShardIndex >= start+int64(limit) || root.Root == "" || root.EndPosition != expectedEndPosition || root.EndHeight < 0 || root.EndHeight > anchorHeight {
+					continue
+				}
+				canonical, ok, err := st.HashAtHeight(ctx, root.EndHeight)
+				if err != nil {
+					return orchardscan.WitnessResult{}, fmt.Errorf("%w: validate shard root: %v", errDBAccess, err)
+				}
+				if !ok || canonical != root.EndBlockHash {
+					continue
+				}
+				rootByIndex[root.ShardIndex] = root.Root
 			}
-			if root.Root == "" {
-				continue
+		} else {
+			roots, err := st.ListOrchardSubtreeRootsByIndexRange(ctx, start, limit)
+			if err != nil {
+				return orchardscan.WitnessResult{}, fmt.Errorf("%w: list subtree roots: %v", errDBAccess, err)
 			}
-			rootByIndex[root.SubtreeIndex] = root.Root
+			for _, root := range roots {
+				expectedEndPosition := (root.SubtreeIndex+1)*groupLeafCount - 1
+				if root.SubtreeIndex < start || root.SubtreeIndex >= start+int64(limit) || root.Root == "" || root.EndPosition != expectedEndPosition || root.EndHeight < 0 || root.EndHeight > anchorHeight {
+					continue
+				}
+				canonical, ok, err := st.HashAtHeight(ctx, root.EndHeight)
+				if err != nil {
+					return orchardscan.WitnessResult{}, fmt.Errorf("%w: validate subtree root: %v", errDBAccess, err)
+				}
+				if !ok || canonical != root.EndBlockHash {
+					continue
+				}
+				rootByIndex[root.SubtreeIndex] = root.Root
+			}
 		}
 	}
 
 	targetedSubtrees := make(map[int64]struct{}, len(positions))
 	for _, p := range positions {
-		subtreeIndex := int64(p) / orchardSubtreeLeafCount
+		subtreeIndex := int64(p) / groupLeafCount
 		if subtreeIndex < fullSubtrees {
 			targetedSubtrees[subtreeIndex] = struct{}{}
 		}
@@ -165,21 +237,25 @@ func computeOrchardWitnessFast(ctx context.Context, st orchardWitnessFastStore, 
 		rootedNonTargetedSubtrees++
 	}
 	subtreesToStream := int(fullSubtrees) - rootedNonTargetedSubtrees
-	if subtreesToStream > witnessFastMaxStreamSubtrees {
+	if subtreesToStream > maxStreamGroups {
 		return orchardscan.WitnessResult{}, errPreferLegacyWitnessPath
 	}
 
 	ops := make([]orchardscan.WitnessOperation, 0, 32)
 	rootBatch := make([]string, 0, witnessSubtreeRootBatchSize)
+	insertedRootCount := 0
+	streamedLeafCount := int64(0)
 
 	flushRootBatch := func() {
 		if len(rootBatch) == 0 {
 			return
 		}
-		ops = append(ops, orchardscan.WitnessOperation{
-			Type:         orchardscan.WitnessOpInsertSubtreeRoots,
-			SubtreeRoots: append([]string(nil), rootBatch...),
-		})
+		op := orchardscan.WitnessOperation{Type: orchardscan.WitnessOpInsertSubtreeRoots, SubtreeRoots: append([]string(nil), rootBatch...)}
+		if useShards {
+			op = orchardscan.WitnessOperation{Type: orchardscan.WitnessOpInsertShardRoots, ShardRoots: append([]string(nil), rootBatch...)}
+		}
+		ops = append(ops, op)
+		insertedRootCount += len(rootBatch)
 		rootBatch = rootBatch[:0]
 	}
 
@@ -191,6 +267,7 @@ func computeOrchardWitnessFast(ctx context.Context, st orchardWitnessFastStore, 
 		if int64(len(cmxHex)) != endPos-startPos {
 			return errInvalidCommitmentPositions
 		}
+		streamedLeafCount += int64(len(cmxHex))
 		for offset := 0; offset < len(cmxHex); offset += witnessAppendBatchSize {
 			end := offset + witnessAppendBatchSize
 			if end > len(cmxHex) {
@@ -205,8 +282,8 @@ func computeOrchardWitnessFast(ctx context.Context, st orchardWitnessFastStore, 
 	}
 
 	for subtreeIndex := int64(0); subtreeIndex < fullSubtrees; subtreeIndex++ {
-		startPos := subtreeIndex * orchardSubtreeLeafCount
-		endPos := startPos + orchardSubtreeLeafCount
+		startPos := subtreeIndex * groupLeafCount
+		endPos := startPos + groupLeafCount
 
 		_, targeted := targetedSubtrees[subtreeIndex]
 		rootHex, hasRoot := rootByIndex[subtreeIndex]
@@ -225,12 +302,20 @@ func computeOrchardWitnessFast(ctx context.Context, st orchardWitnessFastStore, 
 	}
 	flushRootBatch()
 
-	remainderStart := fullSubtrees * orchardSubtreeLeafCount
+	remainderStart := fullSubtrees * groupLeafCount
 	if remainderStart < leafCount {
 		if err := appendRangeAsBatches(remainderStart, leafCount); err != nil {
 			return orchardscan.WitnessResult{}, err
 		}
 	}
 
-	return orchardWitnessWithOpsFn(ctx, uint32(anchorHeight), targets, ops)
+	res, err := orchardWitnessWithOpsFn(ctx, uint32(anchorHeight), targets, ops)
+	if useShards {
+		res.ComputeMode = "shard"
+	} else {
+		res.ComputeMode = "subtree"
+	}
+	res.StreamedLeafCount = streamedLeafCount
+	res.InsertedRootCount = insertedRootCount
+	return res, err
 }

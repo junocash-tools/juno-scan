@@ -14,6 +14,7 @@ import (
 	"github.com/Abdullah1738/juno-scan/internal/backfill"
 	"github.com/Abdullah1738/juno-scan/internal/events"
 	"github.com/Abdullah1738/juno-scan/internal/orchardscan"
+	"github.com/Abdullah1738/juno-scan/internal/shardcache"
 	"github.com/Abdullah1738/juno-scan/internal/store"
 )
 
@@ -49,7 +50,14 @@ type Server struct {
 	st store.Store
 	bf *backfill.Service
 
-	bearerToken string
+	bearerToken          string
+	defaultConfirmations int64
+	network              string
+	uaHRP                string
+	nodeHeight           func() (int64, bool)
+	maxReadyLag          int64
+	shardCache           *shardcache.Service
+	witnessMode          string
 }
 
 type Option func(*Server)
@@ -67,15 +75,48 @@ func WithBearerToken(token string) Option {
 	}
 }
 
+func WithRuntimeStatus(network, uaHRP string, defaultConfirmations, maxReadyLag int64, nodeHeight func() (int64, bool)) Option {
+	return func(s *Server) {
+		s.network = strings.TrimSpace(network)
+		s.uaHRP = strings.TrimSpace(uaHRP)
+		if defaultConfirmations > 0 {
+			s.defaultConfirmations = defaultConfirmations
+		}
+		if maxReadyLag >= 0 {
+			s.maxReadyLag = maxReadyLag
+		}
+		s.nodeHeight = nodeHeight
+	}
+}
+
+func WithShardCacheService(cache *shardcache.Service) Option {
+	return func(s *Server) { s.shardCache = cache }
+}
+
+func WithWitnessMode(mode string) Option {
+	return func(s *Server) {
+		mode = strings.ToLower(strings.TrimSpace(mode))
+		if mode == "" {
+			mode = "auto"
+		}
+		s.witnessMode = mode
+	}
+}
+
 func New(st store.Store, opts ...Option) (*Server, error) {
 	if st == nil {
 		return nil, errors.New("api: store is nil")
 	}
-	s := &Server{st: st}
+	s := &Server{st: st, defaultConfirmations: 100, maxReadyLag: 2, witnessMode: "auto"}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(s)
 		}
+	}
+	switch s.witnessMode {
+	case "auto", "shard", "subtree", "legacy":
+	default:
+		return nil, errors.New("api: invalid witness mode")
 	}
 	return s, nil
 }
@@ -111,7 +152,27 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	resp := map[string]any{
-		"status": "ok",
+		"status":        "ok",
+		"ready":         true,
+		"max_ready_lag": s.maxReadyLag,
+	}
+	eventEpoch, err := s.st.EventEpoch(ctx)
+	if err != nil || len(eventEpoch) != store.EventEpochHexLength || !isLowerHex(eventEpoch) {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	resp["event_epoch"] = eventEpoch
+	if s.network != "" {
+		resp["network"] = s.network
+	}
+	if s.uaHRP != "" {
+		resp["ua_hrp"] = s.uaHRP
+	}
+	if s.shardCache != nil {
+		resp["shard_cache"] = s.shardCache.Snapshot()
+	}
+	if s.bf != nil {
+		resp["backfills"] = s.bf.Snapshot()
 	}
 
 	if tip, ok, err := s.st.Tip(ctx); err != nil {
@@ -120,6 +181,68 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	} else if ok {
 		resp["scanned_height"] = tip.Height
 		resp["scanned_hash"] = tip.Hash
+		actionIndex := map[string]any{"indexed_through": tip.Height}
+		if counter, ok := s.st.(interface {
+			CountOrchardActionHeights(context.Context) (int64, error)
+		}); ok {
+			if count, countErr := counter.CountOrchardActionHeights(ctx); countErr == nil {
+				actionIndex["action_heights"] = count
+			}
+		}
+		resp["action_index"] = actionIndex
+		historyComplete := true
+		historyPending := 0
+		wallets, walletsErr := s.st.ListWallets(ctx)
+		if walletsErr != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		progressStore, hasProgress := s.st.(walletBackfillStore)
+		for _, wallet := range wallets {
+			if wallet.DisabledAt != nil {
+				continue
+			}
+			if !hasProgress {
+				historyComplete = false
+				historyPending++
+				continue
+			}
+			progress, found, progressErr := progressStore.WalletBackfillStatus(ctx, wallet.WalletID)
+			if progressErr != nil {
+				http.Error(w, "db error", http.StatusInternalServerError)
+				return
+			}
+			if !found || progress.State != "complete" {
+				historyComplete = false
+				historyPending++
+			}
+		}
+		resp["history_complete"] = historyComplete
+		resp["history_pending_wallets"] = historyPending
+		if !historyComplete {
+			resp["ready"] = false
+			resp["status"] = "degraded"
+		}
+		if s.nodeHeight != nil {
+			if nodeHeight, known := s.nodeHeight(); known {
+				lag := nodeHeight - tip.Height
+				if lag < 0 {
+					lag = 0
+				}
+				resp["node_height"] = nodeHeight
+				resp["scanner_lag"] = lag
+				if lag > s.maxReadyLag {
+					resp["ready"] = false
+					resp["status"] = "degraded"
+				}
+			} else {
+				resp["ready"] = false
+				resp["status"] = "degraded"
+			}
+		}
+	} else {
+		resp["ready"] = false
+		resp["status"] = "degraded"
 	}
 
 	writeJSON(w, resp)
@@ -152,14 +275,95 @@ func (s *Server) handleWalletSubroutes(w http.ResponseWriter, r *http.Request) {
 		s.handleListWalletNotes(w, r, walletID)
 	case "backfill":
 		s.handleBackfillWallet(w, r, walletID)
+	case "addresses":
+		if len(parts) == 4 && parts[2] != "" && parts[3] == "balance" {
+			s.handleAddressBalance(w, r, walletID, parts[2])
+			return
+		}
+		http.NotFound(w, r)
 	default:
 		http.NotFound(w, r)
 	}
 }
 
+func (s *Server) handleAddressBalance(w http.ResponseWriter, r *http.Request, walletID, recipientAddress string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if walletID == "" || !isSafeWalletID(walletID) {
+		http.Error(w, "invalid wallet_id", http.StatusBadRequest)
+		return
+	}
+	recipientAddress = strings.TrimSpace(recipientAddress)
+	if recipientAddress == "" || len(recipientAddress) > 1024 || strings.Contains(recipientAddress, "/") {
+		http.Error(w, "invalid recipient_address", http.StatusBadRequest)
+		return
+	}
+	minConfirmations := s.defaultConfirmations
+	if v := strings.TrimSpace(r.URL.Query().Get("min_confirmations")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 || n > 1_000_000 {
+			http.Error(w, "invalid min_confirmations", http.StatusBadRequest)
+			return
+		}
+		minConfirmations = n
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	tip, ok, err := s.st.Tip(ctx)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		http.Error(w, "scanner not ready", http.StatusServiceUnavailable)
+		return
+	}
+	balance, err := s.st.AddressBalance(ctx, walletID, recipientAddress, minConfirmations, tip.Height)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	if !balance.WalletFound {
+		http.Error(w, "wallet not found", http.StatusNotFound)
+		return
+	}
+	nodeHeight := tip.Height
+	if s.nodeHeight != nil {
+		if h, known := s.nodeHeight(); known {
+			nodeHeight = h
+		}
+	}
+	lag := nodeHeight - tip.Height
+	if lag < 0 {
+		lag = 0
+	}
+	writeJSON(w, map[string]any{
+		"wallet_id":            walletID,
+		"recipient_address":    recipientAddress,
+		"available_zat":        balance.AvailableZat,
+		"pending_incoming_zat": balance.PendingIncomingZat,
+		"pending_outgoing_zat": balance.PendingOutgoingZat,
+		"total_unspent_zat":    balance.TotalUnspentZat,
+		"min_confirmations":    minConfirmations,
+		"as_of_node_height":    nodeHeight,
+		"as_of_scanner_height": tip.Height,
+		"scanner_lag":          lag,
+	})
+}
+
 type walletRequest struct {
-	WalletID string `json:"wallet_id"`
-	UFVK     string `json:"ufvk"`
+	WalletID       string `json:"wallet_id"`
+	UFVK           string `json:"ufvk"`
+	BirthdayHeight *int64 `json:"birthday_height,omitempty"`
+}
+
+type walletBackfillStore interface {
+	UpsertWalletBirthday(context.Context, string, string, int64) error
+	WalletBackfillStatus(context.Context, string) (store.WalletBackfillProgress, bool, error)
+	SetWalletBackfillProgress(context.Context, store.WalletBackfillProgress) error
 }
 
 func (s *Server) handleUpsertWallet(w http.ResponseWriter, r *http.Request) {
@@ -172,6 +376,14 @@ func (s *Server) handleUpsertWallet(w http.ResponseWriter, r *http.Request) {
 	req.UFVK = strings.TrimSpace(req.UFVK)
 	if req.WalletID == "" || req.UFVK == "" {
 		http.Error(w, "wallet_id and ufvk are required", http.StatusBadRequest)
+		return
+	}
+	birthdayHeight := int64(0)
+	if req.BirthdayHeight != nil {
+		birthdayHeight = *req.BirthdayHeight
+	}
+	if birthdayHeight < 0 {
+		http.Error(w, "invalid birthday_height", http.StatusBadRequest)
 		return
 	}
 	if !isSafeWalletID(req.WalletID) {
@@ -201,12 +413,35 @@ func (s *Server) handleUpsertWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.st.UpsertWallet(ctx, req.WalletID, req.UFVK); err != nil {
+	var err error
+	if req.BirthdayHeight == nil {
+		err = s.st.UpsertWallet(ctx, req.WalletID, req.UFVK)
+	} else if bfs, ok := s.st.(walletBackfillStore); ok {
+		err = bfs.UpsertWalletBirthday(ctx, req.WalletID, req.UFVK, birthdayHeight)
+	} else {
+		err = errors.New("birthday height unsupported")
+	}
+	if err != nil {
+		if errors.Is(err, store.ErrWalletUFVKMismatch) || errors.Is(err, store.ErrUFVKAlreadyRegistered) || errors.Is(err, store.ErrBirthdayIncrease) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, map[string]any{"status": "ok"})
+	wallets, err := s.st.ListWallets(ctx)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	for _, wallet := range wallets {
+		if wallet.WalletID == req.WalletID {
+			birthdayHeight = wallet.BirthdayHeight
+			break
+		}
+	}
+	writeJSON(w, map[string]any{"status": "ok", "birthday_height": birthdayHeight, "ufvk_fingerprint": store.UFVKFingerprint(req.UFVK)})
 }
 
 func (s *Server) handleListWallets(w http.ResponseWriter, r *http.Request) {
@@ -214,9 +449,11 @@ func (s *Server) handleListWallets(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	type wallet struct {
-		WalletID   string     `json:"wallet_id"`
-		CreatedAt  time.Time  `json:"created_at"`
-		DisabledAt *time.Time `json:"disabled_at,omitempty"`
+		WalletID        string     `json:"wallet_id"`
+		UFVKFingerprint string     `json:"ufvk_fingerprint"`
+		BirthdayHeight  int64      `json:"birthday_height"`
+		CreatedAt       time.Time  `json:"created_at"`
+		DisabledAt      *time.Time `json:"disabled_at,omitempty"`
 	}
 
 	wallets, err := s.st.ListWallets(ctx)
@@ -228,9 +465,11 @@ func (s *Server) handleListWallets(w http.ResponseWriter, r *http.Request) {
 	out := make([]wallet, 0, len(wallets))
 	for _, w0 := range wallets {
 		out = append(out, wallet{
-			WalletID:   w0.WalletID,
-			CreatedAt:  w0.CreatedAt,
-			DisabledAt: w0.DisabledAt,
+			WalletID:        w0.WalletID,
+			UFVKFingerprint: w0.UFVKFingerprint,
+			BirthdayHeight:  w0.BirthdayHeight,
+			CreatedAt:       w0.CreatedAt,
+			DisabledAt:      w0.DisabledAt,
 		})
 	}
 
@@ -309,9 +548,32 @@ func (s *Server) handleListWalletEvents(w http.ResponseWriter, r *http.Request, 
 		TxID:        txid,
 	}
 
-	evs, nextCursor, err := s.st.ListWalletEvents(ctx, walletID, cursor, int(limit), filter)
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
+	var evs []store.Event
+	var nextCursor int64
+	var eventEpoch string
+	for attempt := 0; attempt < 3; attempt++ {
+		before, err := s.st.EventEpoch(ctx)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		evs, nextCursor, err = s.st.ListWalletEvents(ctx, walletID, cursor, int(limit), filter)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		after, err := s.st.EventEpoch(ctx)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		if before == after && len(after) == store.EventEpochHexLength && isLowerHex(after) {
+			eventEpoch = after
+			break
+		}
+	}
+	if eventEpoch == "" {
+		http.Error(w, "event journal changed; retry", http.StatusConflict)
 		return
 	}
 
@@ -327,6 +589,7 @@ func (s *Server) handleListWalletEvents(w http.ResponseWriter, r *http.Request, 
 	}
 
 	writeJSON(w, map[string]any{
+		"event_epoch": eventEpoch,
 		"events":      events,
 		"next_cursor": nextCursor,
 	})
@@ -380,6 +643,10 @@ func isLowerHex(s string) bool {
 }
 
 func (s *Server) handleBackfillWallet(w http.ResponseWriter, r *http.Request, walletID string) {
+	if r.Method == http.MethodGet {
+		s.handleBackfillStatus(w, r, walletID)
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -394,7 +661,7 @@ func (s *Server) handleBackfillWallet(w http.ResponseWriter, r *http.Request, wa
 	}
 
 	var req struct {
-		FromHeight int64  `json:"from_height"`
+		FromHeight *int64 `json:"from_height,omitempty"`
 		ToHeight   *int64 `json:"to_height,omitempty"`
 		BatchSize  int64  `json:"batch_size,omitempty"`
 	}
@@ -407,6 +674,22 @@ func (s *Server) handleBackfillWallet(w http.ResponseWriter, r *http.Request, wa
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
+	fromHeight := int64(0)
+	progressStore, hasProgressStore := s.st.(walletBackfillStore)
+	progress, progressFound := store.WalletBackfillProgress{}, false
+	var err error
+	if hasProgressStore {
+		progress, progressFound, err = progressStore.WalletBackfillStatus(ctx, walletID)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+	}
+	if req.FromHeight != nil {
+		fromHeight = *req.FromHeight
+	} else if progressFound {
+		fromHeight = progress.NextHeight
+	}
 
 	tip, ok, err := s.st.Tip(ctx)
 	if err != nil {
@@ -429,27 +712,72 @@ func (s *Server) handleBackfillWallet(w http.ResponseWriter, r *http.Request, wa
 
 	res, err := s.bf.BackfillWallet(ctx, backfill.Request{
 		WalletID:   walletID,
-		FromHeight: req.FromHeight,
+		FromHeight: fromHeight,
 		ToHeight:   toHeight,
 		BatchSize:  req.BatchSize,
 	})
 	if err != nil {
+		if hasProgressStore && progressFound {
+			progress.State, progress.LastError, progress.TargetHeight = "error", err.Error(), toHeight
+			_ = progressStore.SetWalletBackfillProgress(ctx, progress)
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	next := res.NextHeight
+	if hasProgressStore {
+		if !progressFound {
+			progress = store.WalletBackfillProgress{WalletID: walletID, BirthdayHeight: fromHeight}
+		}
+		progress.NextHeight, progress.TargetHeight, progress.LastError = next, toHeight, ""
+		progress.State = "running"
+		if next > toHeight {
+			progress.State = "complete"
+		}
+		if err := progressStore.SetWalletBackfillProgress(ctx, progress); err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+	}
 	writeJSON(w, map[string]any{
-		"status":          "ok",
-		"wallet_id":       walletID,
-		"from_height":     res.FromHeight,
-		"to_height":       res.ToHeight,
-		"scanned_from":    res.ScannedFrom,
-		"scanned_to":      res.ScannedTo,
-		"next_height":     next,
-		"inserted_notes":  res.InsertedNotes,
-		"inserted_events": res.InsertedEvents,
+		"status":                 "ok",
+		"wallet_id":              walletID,
+		"from_height":            res.FromHeight,
+		"to_height":              res.ToHeight,
+		"scanned_from":           res.ScannedFrom,
+		"scanned_to":             res.ScannedTo,
+		"next_height":            next,
+		"inserted_notes":         res.InsertedNotes,
+		"inserted_events":        res.InsertedEvents,
+		"visited_action_heights": res.VisitedActionHeights,
+		"skipped_heights":        res.SkippedHeights,
+		"rpc_calls":              res.RPCCalls,
 	})
+}
+
+func (s *Server) handleBackfillStatus(w http.ResponseWriter, r *http.Request, walletID string) {
+	if walletID == "" || !isSafeWalletID(walletID) {
+		http.Error(w, "invalid wallet_id", http.StatusBadRequest)
+		return
+	}
+	progressStore, ok := s.st.(walletBackfillStore)
+	if !ok {
+		http.Error(w, "backfill status unsupported", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	progress, found, err := progressStore.WalletBackfillStatus(ctx, walletID)
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.Error(w, "wallet not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, progress)
 }
 
 func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, walletID string) {
@@ -484,6 +812,11 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 		}
 		minValueZat = n
 	}
+	recipientAddress := strings.TrimSpace(r.URL.Query().Get("recipient_address"))
+	if len(recipientAddress) > 1024 || strings.Contains(recipientAddress, "/") {
+		http.Error(w, "invalid recipient_address", http.StatusBadRequest)
+		return
+	}
 
 	direction := noteDirectionAll
 	if v := strings.TrimSpace(r.URL.Query().Get("direction")); v != "" {
@@ -514,10 +847,11 @@ func (s *Server) handleListWalletNotes(w http.ResponseWriter, r *http.Request, w
 
 	if direction != noteDirectionOutgoing {
 		incomingRows, incomingMore, err = s.st.ListWalletNotesPage(ctx, walletID, store.NotesQuery{
-			OnlyUnspent: onlyUnspent,
-			MinValueZat: minValueZat,
-			Limit:       int(limit),
-			Cursor:      notesCursorTriple(cursor),
+			OnlyUnspent:      onlyUnspent,
+			MinValueZat:      minValueZat,
+			RecipientAddress: recipientAddress,
+			Limit:            int(limit),
+			Cursor:           notesCursorTriple(cursor),
 		})
 		if err != nil {
 			http.Error(w, "db error", http.StatusInternalServerError)
@@ -689,10 +1023,15 @@ func (s *Server) handleOrchardWitness(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]any{
-		"status":        "ok",
-		"anchor_height": anchorHeight,
-		"root":          res.Root,
-		"paths":         res.Paths,
+		"status":              "ok",
+		"anchor_height":       anchorHeight,
+		"root":                res.Root,
+		"paths":               res.Paths,
+		"compute_mode":        res.ComputeMode,
+		"fallback_from":       res.FallbackFrom,
+		"fallback_reason":     res.FallbackReason,
+		"streamed_leaf_count": res.StreamedLeafCount,
+		"inserted_root_count": res.InsertedRootCount,
 	})
 }
 
