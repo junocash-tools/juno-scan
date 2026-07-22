@@ -381,7 +381,7 @@ func (s *Service) BackfillWallet(ctx context.Context, req Request) (Result, erro
 					if inserted && !isInternalTx {
 						payload := events.DepositEventPayload{
 							Origin: string(types.DepositOriginExternal),
-							DepositEvent: types.DepositEvent{
+							DepositEvent: events.DepositEvent{
 								Version:          types.V1,
 								WalletID:         n.WalletID,
 								DiversifierIndex: n.DiversifierIndex,
@@ -555,7 +555,7 @@ func confirmDepositConfirmations(ctx context.Context, tx store.Tx, confirmations
 		payload := events.DepositConfirmedPayload{
 			DepositEventPayload: events.DepositEventPayload{
 				Origin: string(types.DepositOriginExternal),
-				DepositEvent: types.DepositEvent{
+				DepositEvent: events.DepositEvent{
 					Version:          types.V1,
 					WalletID:         n.WalletID,
 					DiversifierIndex: n.DiversifierIndex,

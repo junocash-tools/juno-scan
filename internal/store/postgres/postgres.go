@@ -545,7 +545,7 @@ SET next_height = birthday_height,
 				payload := events.DepositOrphanedPayload{
 					DepositEventPayload: events.DepositEventPayload{
 						Origin: string(types.DepositOriginExternal),
-						DepositEvent: types.DepositEvent{
+						DepositEvent: events.DepositEvent{
 							Version:          types.V1,
 							WalletID:         n.WalletID,
 							DiversifierIndex: n.DiversifierIndex,
@@ -593,7 +593,7 @@ SET next_height = birthday_height,
 				payload := events.DepositUnconfirmedPayload{
 					DepositEventPayload: events.DepositEventPayload{
 						Origin: string(types.DepositOriginExternal),
-						DepositEvent: types.DepositEvent{
+						DepositEvent: events.DepositEvent{
 							Version:          types.V1,
 							WalletID:         n.WalletID,
 							DiversifierIndex: n.DiversifierIndex,

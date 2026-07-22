@@ -48,7 +48,7 @@ Fields:
 
 Base fields:
 
-- `version`, `wallet_id`, `account_id` (optional), `diversifier_index` (optional)
+- `version`, `wallet_id`, `account_id` (optional), `diversifier_index`
 - `txid`, `height`, `action_index`
 - `amount_zatoshis`, `memo_hex` (optional)
 - `status`
@@ -81,6 +81,8 @@ Scanner-added fields:
 - `previous_confirmed_height`
 
 Incoming notes created by a transaction that spends any note owned by any registered scanner UFVK are internal. They remain in balances/notes but never emit `DepositEvent`, `DepositConfirmed`, `DepositUnconfirmed`, or `DepositOrphaned`. Address allocation remains a gateway responsibility.
+
+`diversifier_index` is always present, including when its value is `0`. Consumers should reject a missing value. A compatibility reader may recover an older omitted zero only when an independent, trusted address ledger maps the exact `recipient_address` to index `0`.
 
 ## Spend events
 

@@ -21,10 +21,26 @@ const (
 )
 
 type DepositEventPayload struct {
-	types.DepositEvent
+	DepositEvent
 	Origin           string `json:"origin"`
 	RecipientAddress string `json:"recipient_address,omitempty"`
 	NoteNullifier    string `json:"note_nullifier,omitempty"`
+}
+
+// DepositEvent is the scanner's durable event contract. DiversifierIndex is
+// intentionally not omitted when it is zero: address index zero is valid and
+// downstream consumers must be able to distinguish it from a missing field.
+type DepositEvent struct {
+	Version          types.Version  `json:"version"`
+	WalletID         string         `json:"wallet_id"`
+	AccountID        string         `json:"account_id,omitempty"`
+	DiversifierIndex uint32         `json:"diversifier_index"`
+	TxID             string         `json:"txid"`
+	Height           int64          `json:"height"`
+	ActionIndex      uint32         `json:"action_index"`
+	AmountZatoshis   uint64         `json:"amount_zatoshis"`
+	MemoHex          string         `json:"memo_hex,omitempty"`
+	Status           types.TxStatus `json:"status"`
 }
 
 type DepositConfirmedPayload struct {

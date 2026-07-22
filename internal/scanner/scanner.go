@@ -822,7 +822,7 @@ func (s *Scanner) processBlock(ctx context.Context, blk blockVerbose2) error {
 				if inserted && !isInternalTx {
 					payload := events.DepositEventPayload{
 						Origin: string(types.DepositOriginExternal),
-						DepositEvent: types.DepositEvent{
+						DepositEvent: events.DepositEvent{
 							Version:          types.V1,
 							WalletID:         n.WalletID,
 							DiversifierIndex: n.DiversifierIndex,
@@ -1037,7 +1037,7 @@ func (s *Scanner) confirmDepositConfirmations(ctx context.Context, tx store.Tx, 
 		payload := events.DepositConfirmedPayload{
 			DepositEventPayload: events.DepositEventPayload{
 				Origin: string(types.DepositOriginExternal),
-				DepositEvent: types.DepositEvent{
+				DepositEvent: events.DepositEvent{
 					Version:          types.V1,
 					WalletID:         n.WalletID,
 					DiversifierIndex: n.DiversifierIndex,

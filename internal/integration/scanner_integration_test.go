@@ -76,10 +76,12 @@ func TestScanner_DepositDetected(t *testing.T) {
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 
 	deposit := waitForEventKind(t, ctx, st, "hot", "DepositEvent")
+	assertJSONFieldPresent(t, deposit.Payload, "diversifier_index")
 
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 
 	confirmed := waitForEventKind(t, ctx, st, "hot", "DepositConfirmed")
+	assertJSONFieldPresent(t, confirmed.Payload, "diversifier_index")
 
 	var confirmedPayload struct {
 		TxID                  string `json:"txid"`
@@ -199,6 +201,17 @@ func TestScanner_DepositDetected(t *testing.T) {
 	}
 	if !foundSpent {
 		t.Fatalf("spent note not found")
+	}
+}
+
+func assertJSONFieldPresent(t *testing.T, payload json.RawMessage, field string) {
+	t.Helper()
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("unmarshal event payload: %v", err)
+	}
+	if _, ok := decoded[field]; !ok {
+		t.Fatalf("event payload omitted %s: %s", field, payload)
 	}
 }
 

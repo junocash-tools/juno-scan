@@ -1692,7 +1692,7 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 			payload := events.DepositOrphanedPayload{
 				DepositEventPayload: events.DepositEventPayload{
 					Origin: string(types.DepositOriginExternal),
-					DepositEvent: types.DepositEvent{
+					DepositEvent: events.DepositEvent{
 						Version:          types.V1,
 						WalletID:         n.WalletID,
 						DiversifierIndex: n.DiversifierIndex,
@@ -1740,7 +1740,7 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 			payload := events.DepositUnconfirmedPayload{
 				DepositEventPayload: events.DepositEventPayload{
 					Origin: string(types.DepositOriginExternal),
-					DepositEvent: types.DepositEvent{
+					DepositEvent: events.DepositEvent{
 						Version:          types.V1,
 						WalletID:         n.WalletID,
 						DiversifierIndex: n.DiversifierIndex,
