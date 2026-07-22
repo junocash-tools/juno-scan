@@ -1058,6 +1058,135 @@ func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query 
 	return out[:query.Limit], next, nil
 }
 
+func (s *Store) WalletNoteStatuses(ctx context.Context, walletID string, refs []store.NoteRef) (store.WalletNoteStatusSnapshot, error) {
+	var out store.WalletNoteStatusSnapshot
+	if err := store.ValidateNoteStatusRefs(refs); err != nil {
+		return out, err
+	}
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return out, fmt.Errorf("mysql: note statuses begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := tx.QueryRowContext(ctx, "SELECT value FROM scanner_metadata WHERE `key`='event_epoch'").Scan(&out.EventEpoch); err != nil {
+		return out, fmt.Errorf("mysql: note statuses event epoch: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT height, hash FROM blocks ORDER BY height DESC LIMIT 1`).Scan(&out.AsOfScannerHeight, &out.AsOfScannerHash); err == nil {
+		if out.AsOfScannerHeight < 0 || strings.TrimSpace(out.AsOfScannerHash) == "" {
+			return store.WalletNoteStatusSnapshot{}, store.ErrInvalidWalletNoteState
+		}
+		out.TipFound = true
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return out, fmt.Errorf("mysql: note statuses tip: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM wallets WHERE wallet_id=? AND disabled_at IS NULL)`, walletID).Scan(&out.WalletFound); err != nil {
+		return out, fmt.Errorf("mysql: note statuses wallet: %w", err)
+	}
+	out.Notes = make(map[store.NoteRef]store.Note, len(refs))
+	if out.WalletFound && out.TipFound {
+		query := strings.Builder{}
+		query.WriteString(`
+			SELECT txid, action_index, height, position, diversifier_index, recipient_address, value_zat, memo_hex, note_nullifier,
+			       pending_spent_txid, pending_spent_at, pending_spent_expiry_height, spent_height, spent_txid,
+			       confirmed_height, spent_confirmed_height, created_at
+			FROM notes
+			WHERE wallet_id=? AND (txid, action_index) IN (`)
+		args := []any{walletID}
+		included := 0
+		for _, ref := range refs {
+			if ref.ActionIndex > uint32(1<<31-1) {
+				continue
+			}
+			if included > 0 {
+				query.WriteByte(',')
+			}
+			query.WriteString("(?,?)")
+			args = append(args, ref.TxID, int32(ref.ActionIndex))
+			included++
+		}
+		query.WriteByte(')')
+
+		if included > 0 {
+			rows, err := tx.QueryContext(ctx, query.String(), args...)
+			if err != nil {
+				return store.WalletNoteStatusSnapshot{}, fmt.Errorf("mysql: note statuses query: %w", err)
+			}
+			for rows.Next() {
+				var n store.Note
+				var position sql.NullInt64
+				var divIdx sql.NullInt64
+				var memo sql.NullString
+				var pendingTxID sql.NullString
+				var pendingAt sql.NullTime
+				var pendingExpiryHeight sql.NullInt64
+				var spentHeight sql.NullInt64
+				var spentTxID sql.NullString
+				var confirmedHeight sql.NullInt64
+				var spentConfirmedHeight sql.NullInt64
+				n.WalletID = walletID
+				if err := rows.Scan(
+					&n.TxID, &n.ActionIndex, &n.Height, &position, &divIdx, &n.RecipientAddress, &n.ValueZat,
+					&memo, &n.NoteNullifier, &pendingTxID, &pendingAt, &pendingExpiryHeight,
+					&spentHeight, &spentTxID, &confirmedHeight, &spentConfirmedHeight, &n.CreatedAt,
+				); err != nil {
+					rows.Close()
+					return store.WalletNoteStatusSnapshot{}, fmt.Errorf("mysql: note statuses scan: %w", err)
+				}
+				if n.ActionIndex < 0 || !divIdx.Valid || divIdx.Int64 < 0 || divIdx.Int64 > int64(^uint32(0)) {
+					rows.Close()
+					return store.WalletNoteStatusSnapshot{}, store.ErrInvalidWalletNoteState
+				}
+				if position.Valid {
+					n.Position = &position.Int64
+				}
+				n.DiversifierIndex = uint32(divIdx.Int64)
+				if memo.Valid {
+					n.MemoHex = &memo.String
+				}
+				if pendingTxID.Valid {
+					n.PendingSpentTxID = &pendingTxID.String
+				}
+				if pendingAt.Valid {
+					t := pendingAt.Time.UTC()
+					n.PendingSpentAt = &t
+				}
+				if pendingExpiryHeight.Valid {
+					n.PendingSpentExpiryHeight = &pendingExpiryHeight.Int64
+				}
+				if spentHeight.Valid {
+					n.SpentHeight = &spentHeight.Int64
+				}
+				if spentTxID.Valid {
+					n.SpentTxID = &spentTxID.String
+				}
+				if confirmedHeight.Valid {
+					n.ConfirmedHeight = &confirmedHeight.Int64
+				}
+				if spentConfirmedHeight.Valid {
+					n.SpentConfirmedHeight = &spentConfirmedHeight.Int64
+				}
+				ref := store.NoteRef{TxID: n.TxID, ActionIndex: uint32(n.ActionIndex)}
+				if _, duplicate := out.Notes[ref]; duplicate {
+					rows.Close()
+					return store.WalletNoteStatusSnapshot{}, store.ErrInvalidWalletNoteState
+				}
+				out.Notes[ref] = n
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return store.WalletNoteStatusSnapshot{}, fmt.Errorf("mysql: note statuses rows: %w", err)
+			}
+			rows.Close()
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return store.WalletNoteStatusSnapshot{}, fmt.Errorf("mysql: note statuses commit: %w", err)
+	}
+	return out, nil
+}
+
 func (s *Store) WalletNoteSummary(ctx context.Context, walletID string, minConfirmations, minNoteZat int64, maxNotes int) (store.WalletNoteSummary, error) {
 	var out store.WalletNoteSummary
 	if minConfirmations < 0 || minNoteZat < 0 || maxNotes < 1 || maxNotes > 1_000_000 {
@@ -1361,10 +1490,8 @@ func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]stor
 	    pending_spent_expiry_height = NULL
 	WHERE spent_height IS NULL
 	  AND pending_spent_txid IS NOT NULL
-	  AND (
-	    pending_spent_expiry_height IS NULL OR
-	    ? > pending_spent_expiry_height
-	  )
+	  AND pending_spent_expiry_height IS NOT NULL
+	  AND ? > pending_spent_expiry_height
 	`, chainHeight); err != nil {
 			return fmt.Errorf("mysql: clear pending spends: %w", err)
 		}
@@ -1377,10 +1504,8 @@ SET pending_spent_txid = NULL,
 WHERE spent_height IS NULL
   AND pending_spent_txid IS NOT NULL
   AND note_nullifier NOT IN (?` + strings.Repeat(",?", len(nullifiers)-1) + `)
-  AND (
-    pending_spent_expiry_height IS NULL OR
-    ? > pending_spent_expiry_height
-  )
+  AND pending_spent_expiry_height IS NOT NULL
+  AND ? > pending_spent_expiry_height
 `
 		args := make([]any, 0, len(nullifiers)+1)
 		for _, nf := range nullifiers {

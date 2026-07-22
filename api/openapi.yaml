@@ -313,6 +313,68 @@ paths:
             text/plain:
               schema:
                 type: string
+  /v1/wallets/{wallet_id}/notes/status:
+    post:
+      summary: Reconcile source-note spend states
+      description: >-
+        Private, point-lookup endpoint for transaction builders and reservation recovery. Results preserve request order.
+        `unknown` is fail-closed and never means spendable. The response is one storage snapshot, fenced by both
+        `event_epoch` and the scanner tip; retry a 409 with the same idempotent request. A complete pending-spend
+        refresh must have succeeded for that exact epoch and tip or the endpoint returns 503.
+      parameters:
+        - name: wallet_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WalletNoteStatusesRequest"
+      responses:
+        "200":
+          description: Stable scanner snapshot with one result per requested note ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletNoteStatusesResponse"
+        "400":
+          description: Invalid content type, JSON, field, batch size, duplicate, or non-canonical note ID
+          content:
+            text/plain:
+              schema: {type: string}
+        "401":
+          description: Unauthorized when API bearer authentication is configured
+          content:
+            text/plain:
+              schema: {type: string}
+        "404":
+          description: Unknown or disabled wallet
+          content:
+            text/plain:
+              schema: {type: string}
+        "409":
+          description: Event epoch or scanner tip changed around the snapshot; retry the complete request
+          content:
+            text/plain:
+              schema: {type: string}
+        "413":
+          description: Request body exceeds 32 KiB
+          content:
+            text/plain:
+              schema: {type: string}
+        "500":
+          description: Storage error or inconsistent persisted note state
+          content:
+            text/plain:
+              schema: {type: string}
+        "503":
+          description: Scanner has no indexed tip, pending-spend refresh for the current epoch and tip, or the bounded read timed out
+          content:
+            text/plain:
+              schema: {type: string}
   /v1/wallets/{wallet_id}/addresses/{address}/balance:
     get:
       summary: Balance for one address observed under a registered wallet UFVK
@@ -388,14 +450,17 @@ components:
   schemas:
     HealthResponse:
       type: object
-      required: [status, event_epoch, confirmations]
+      required: [status, ready, event_epoch, confirmations, pending_spends_ready]
       properties:
         status:
           type: string
           enum: [ok, degraded]
         ready:
           type: boolean
-          description: True only with a scanned tip, acceptable node lag, and every enabled wallet complete beyond that tip with matching identity and birthday.
+          description: True only with a scanned tip, a current pending-spend refresh, acceptable node lag, and every enabled wallet complete beyond that tip with matching identity and birthday.
+        pending_spends_ready:
+          type: boolean
+          description: True only after a successful pending-spend refresh bound to the exact current event_epoch and scanned tip.
         event_epoch:
           type: string
           pattern: "^[0-9a-f]{64}$"
@@ -684,6 +749,87 @@ components:
         next_cursor:
           type: string
       additionalProperties: true
+    WalletNoteStatusesRequest:
+      type: object
+      required: [note_ids]
+      properties:
+        note_ids:
+          type: array
+          minItems: 1
+          maxItems: 200
+          uniqueItems: true
+          items:
+            type: string
+            pattern: "^[0-9a-f]{64}:(0|[1-9][0-9]{0,9})$"
+            description: Canonical creating transaction ID and Orchard action index; the decimal index must fit uint32.
+      additionalProperties: false
+    WalletNoteStatusesResponse:
+      type: object
+      required: [wallet_id, event_epoch, as_of_scanner_height, as_of_scanner_hash, statuses]
+      properties:
+        wallet_id:
+          type: string
+        event_epoch:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        as_of_scanner_height:
+          type: integer
+          format: int64
+          minimum: 0
+        as_of_scanner_hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        statuses:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items:
+            oneOf:
+              - $ref: "#/components/schemas/UnknownWalletNoteStatus"
+              - $ref: "#/components/schemas/UnspentWalletNoteStatus"
+              - $ref: "#/components/schemas/PendingWalletNoteStatus"
+              - $ref: "#/components/schemas/SpentWalletNoteStatus"
+      additionalProperties: false
+    UnknownWalletNoteStatus:
+      type: object
+      required: [note_id, state]
+      properties:
+        note_id: {type: string}
+        state: {type: string, enum: [unknown]}
+      additionalProperties: false
+    UnspentWalletNoteStatus:
+      type: object
+      required: [note_id, state, source_height, value_zat]
+      properties:
+        note_id: {type: string}
+        state: {type: string, enum: [unspent]}
+        source_height: {type: integer, format: int64, minimum: 0}
+        value_zat: {type: integer, format: int64, minimum: 0}
+      additionalProperties: false
+    PendingWalletNoteStatus:
+      type: object
+      required: [note_id, state, source_height, value_zat, pending_spent_txid, pending_spent_at]
+      properties:
+        note_id: {type: string}
+        state: {type: string, enum: [pending]}
+        source_height: {type: integer, format: int64, minimum: 0}
+        value_zat: {type: integer, format: int64, minimum: 0}
+        pending_spent_txid: {type: string, pattern: "^[0-9a-f]{64}$"}
+        pending_spent_at: {type: string, format: date-time}
+        pending_spent_expiry_height: {type: integer, format: int64, minimum: 0}
+      additionalProperties: false
+    SpentWalletNoteStatus:
+      type: object
+      required: [note_id, state, source_height, value_zat, spent_txid, spent_height]
+      properties:
+        note_id: {type: string}
+        state: {type: string, enum: [spent]}
+        source_height: {type: integer, format: int64, minimum: 0}
+        value_zat: {type: integer, format: int64, minimum: 0}
+        spent_txid: {type: string, pattern: "^[0-9a-f]{64}$"}
+        spent_height: {type: integer, format: int64, minimum: 0}
+        spent_confirmed_height: {type: integer, format: int64, minimum: 0}
+      additionalProperties: false
     WitnessRequest:
       type: object
       required: [positions]

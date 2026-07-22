@@ -44,7 +44,7 @@ func TestBackfillAPIOnlyAdvancesPersistedContiguousProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := New(st, WithBackfillService(bf))
+	server, err := New(st, WithBackfillService(bf), liveMempoolRefreshOption(st))
 	if err != nil {
 		t.Fatal(err)
 	}

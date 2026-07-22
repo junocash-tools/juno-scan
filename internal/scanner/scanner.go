@@ -34,23 +34,47 @@ type Scanner struct {
 	statusMu        sync.RWMutex
 	nodeHeight      int64
 	nodeHeightKnown bool
+	mempoolRefresh  MempoolRefreshStatus
+}
+
+type MempoolRefreshStatus struct {
+	Ready      bool
+	EventEpoch string
+	Height     int64
+	Hash       string
 }
 
 type Status struct {
 	NodeHeight      int64
 	NodeHeightKnown bool
+	MempoolRefresh  MempoolRefreshStatus
 }
 
 func (s *Scanner) Status() Status {
 	s.statusMu.RLock()
 	defer s.statusMu.RUnlock()
-	return Status{NodeHeight: s.nodeHeight, NodeHeightKnown: s.nodeHeightKnown}
+	return Status{
+		NodeHeight:      s.nodeHeight,
+		NodeHeightKnown: s.nodeHeightKnown,
+		MempoolRefresh:  s.mempoolRefresh,
+	}
 }
 
 func (s *Scanner) recordNodeHeight(height int64) {
 	s.statusMu.Lock()
 	s.nodeHeight = height
 	s.nodeHeightKnown = true
+	s.statusMu.Unlock()
+}
+
+func (s *Scanner) recordMempoolRefresh(eventEpoch string, tip store.BlockTip) {
+	s.statusMu.Lock()
+	s.mempoolRefresh = MempoolRefreshStatus{
+		Ready:      true,
+		EventEpoch: eventEpoch,
+		Height:     tip.Height,
+		Hash:       tip.Hash,
+	}
 	s.statusMu.Unlock()
 }
 
@@ -532,6 +556,19 @@ func (s *Scanner) updatePendingSpends(ctx context.Context, chainHeight int64) er
 	}); err != nil {
 		return err
 	}
+
+	eventEpoch, err := s.st.EventEpoch(ctx)
+	if err != nil {
+		return fmt.Errorf("scanner: read event epoch after mempool refresh: %w", err)
+	}
+	tip, ok, err := s.st.Tip(ctx)
+	if err != nil {
+		return fmt.Errorf("scanner: read tip after mempool refresh: %w", err)
+	}
+	if !ok || tip.Height != chainHeight {
+		return fmt.Errorf("scanner: mempool refresh tip mismatch: found=%t height=%d chain_height=%d", ok, tip.Height, chainHeight)
+	}
+	s.recordMempoolRefresh(eventEpoch, tip)
 
 	return nil
 }

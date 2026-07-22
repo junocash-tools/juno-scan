@@ -53,6 +53,21 @@ func TestMySQLWalletNoteSummary(t *testing.T) {
 	}
 }
 
+func TestMySQLWalletNoteStatuses(t *testing.T) {
+	rootDSN := strings.TrimSpace(os.Getenv("JUNO_TEST_MYSQL_ROOT_DSN"))
+	if rootDSN == "" {
+		t.Skip("JUNO_TEST_MYSQL_ROOT_DSN not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	st, cleanup := openMySQLTestStore(t, ctx, rootDSN)
+	defer cleanup()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	exerciseWalletNoteStatuses(t, ctx, st)
+}
+
 func TestMySQLRollbackConcurrencyExpiryAndShardParity(t *testing.T) {
 	rootDSN := strings.TrimSpace(os.Getenv("JUNO_TEST_MYSQL_ROOT_DSN"))
 	if rootDSN == "" {

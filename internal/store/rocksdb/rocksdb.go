@@ -2331,6 +2331,135 @@ func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query 
 	return out[:query.Limit], next, nil
 }
 
+func (s *Store) WalletNoteStatuses(ctx context.Context, walletID string, refs []store.NoteRef) (store.WalletNoteStatusSnapshot, error) {
+	var out store.WalletNoteStatusSnapshot
+	if err := store.ValidateNoteStatusRefs(refs); err != nil {
+		return out, err
+	}
+	if err := ctx.Err(); err != nil {
+		return out, err
+	}
+
+	snapshot := s.db.NewSnapshot()
+	defer func() { _ = snapshot.Close() }()
+
+	epochBytes, epochCloser, err := snapshot.Get(keyMeta("event_epoch"))
+	if err != nil {
+		return out, fmt.Errorf("rocksdb: note statuses event epoch: %w", err)
+	}
+	out.EventEpoch = string(epochBytes)
+	_ = epochCloser.Close()
+
+	tipIter, err := snapshot.NewIter(&pebble.IterOptions{LowerBound: blockPrefix, UpperBound: prefixUpperBound(blockPrefix)})
+	if err != nil {
+		return out, fmt.Errorf("rocksdb: note statuses tip iter: %w", err)
+	}
+	if tipIter.Last() {
+		height, parseErr := parseFixed20Int64(bytes.TrimPrefix(tipIter.Key(), blockPrefix))
+		if parseErr != nil {
+			_ = tipIter.Close()
+			return out, fmt.Errorf("rocksdb: note statuses tip key: %w", parseErr)
+		}
+		var rec blockRecord
+		if err := json.Unmarshal(tipIter.Value(), &rec); err != nil {
+			_ = tipIter.Close()
+			return out, fmt.Errorf("rocksdb: note statuses tip decode: %w", err)
+		}
+		if height < 0 || strings.TrimSpace(rec.Hash) == "" {
+			_ = tipIter.Close()
+			return out, store.ErrInvalidWalletNoteState
+		}
+		out.TipFound = true
+		out.AsOfScannerHeight = height
+		out.AsOfScannerHash = rec.Hash
+	} else if err := tipIter.Error(); err != nil {
+		_ = tipIter.Close()
+		return out, fmt.Errorf("rocksdb: note statuses tip: %w", err)
+	}
+	if err := tipIter.Close(); err != nil {
+		return out, fmt.Errorf("rocksdb: note statuses tip close: %w", err)
+	}
+
+	walletBytes, closer, err := snapshot.Get(keyWallet(walletID))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return out, nil
+	}
+	if err != nil {
+		return out, fmt.Errorf("rocksdb: note statuses wallet: %w", err)
+	}
+	var wallet walletRecord
+	if err := json.Unmarshal(walletBytes, &wallet); err != nil {
+		_ = closer.Close()
+		return out, fmt.Errorf("rocksdb: note statuses wallet decode: %w", err)
+	}
+	_ = closer.Close()
+	if wallet.DisabledAtUnix != nil {
+		return out, nil
+	}
+	out.WalletFound = true
+	if !out.TipFound {
+		return out, nil
+	}
+
+	out.Notes = make(map[store.NoteRef]store.Note, len(refs))
+	for _, ref := range refs {
+		if err := ctx.Err(); err != nil {
+			return store.WalletNoteStatusSnapshot{}, err
+		}
+		if ref.ActionIndex > uint32(^uint32(0)>>1) {
+			continue
+		}
+		v, noteCloser, err := snapshot.Get(keyNote(walletID, ref.TxID, int32(ref.ActionIndex)))
+		if errors.Is(err, pebble.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return store.WalletNoteStatusSnapshot{}, fmt.Errorf("rocksdb: note statuses get note: %w", err)
+		}
+		var rec noteRecord
+		if err := json.Unmarshal(v, &rec); err != nil {
+			_ = noteCloser.Close()
+			return store.WalletNoteStatusSnapshot{}, fmt.Errorf("rocksdb: note statuses decode note: %w", err)
+		}
+		_ = noteCloser.Close()
+		if rec.WalletID != walletID || rec.TxID != ref.TxID || rec.ActionIndex < 0 || uint32(rec.ActionIndex) != ref.ActionIndex {
+			return store.WalletNoteStatusSnapshot{}, store.ErrInvalidWalletNoteState
+		}
+		var pendingAt *time.Time
+		if rec.PendingSpentAtUnix != nil {
+			t := time.Unix(*rec.PendingSpentAtUnix, 0).UTC()
+			pendingAt = &t
+		}
+		var position *int64
+		if rec.Position != nil {
+			p := int64(*rec.Position)
+			position = &p
+		}
+		out.Notes[ref] = store.Note{
+			WalletID:                 rec.WalletID,
+			TxID:                     rec.TxID,
+			ActionIndex:              rec.ActionIndex,
+			Height:                   rec.Height,
+			Position:                 position,
+			IsInternal:               noteRecordIsInternal(rec),
+			DiversifierIndex:         rec.DiversifierIndex,
+			RecipientAddress:         rec.RecipientAddress,
+			ValueZat:                 rec.ValueZat,
+			MemoHex:                  rec.MemoHex,
+			NoteNullifier:            rec.NoteNullifier,
+			PendingSpentTxID:         rec.PendingSpentTxID,
+			PendingSpentAt:           pendingAt,
+			PendingSpentExpiryHeight: rec.PendingSpentExpiryHeight,
+			SpentHeight:              rec.SpentHeight,
+			SpentTxID:                rec.SpentTxID,
+			ConfirmedHeight:          rec.ConfirmedHeight,
+			SpentConfirmedHeight:     rec.SpentConfirmedHeight,
+			CreatedAt:                time.Unix(rec.CreatedAtUnix, 0).UTC(),
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) WalletNoteSummary(ctx context.Context, walletID string, minConfirmations, minNoteZat int64, maxNotes int) (store.WalletNoteSummary, error) {
 	var out store.WalletNoteSummary
 	if minConfirmations < 0 || minNoteZat < 0 || maxNotes < 1 || maxNotes > 1_000_000 {
@@ -2810,9 +2939,9 @@ func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]stor
 			continue
 		}
 
-		// Clear pending markers only once the tx is deterministically expired:
-		// chainHeight > pending_spent_expiry_height, or if expiry height is unknown.
-		shouldClear := true
+		// Clear pending markers only once a known expiry is deterministically past.
+		// Unknown-expiry spends remain reserved when absent from the mempool.
+		shouldClear := false
 
 		// Clear pending markers on the note record, if we still have it.
 		locBytes, closer, err := s.db.Get(keyNullifier(nf))
@@ -2834,9 +2963,7 @@ func (s *Store) UpdatePendingSpends(ctx context.Context, pending map[string]stor
 					_ = closer.Close()
 				}
 
-				if rec.PendingSpentExpiryHeight != nil && chainHeight <= *rec.PendingSpentExpiryHeight {
-					shouldClear = false
-				}
+				shouldClear = rec.PendingSpentExpiryHeight != nil && chainHeight > *rec.PendingSpentExpiryHeight
 				if shouldClear {
 					rec.PendingSpentTxID = nil
 					rec.PendingSpentAtUnix = nil

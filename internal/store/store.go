@@ -15,7 +15,10 @@ var (
 	ErrCanonicalBlockChanged    = errors.New("canonical_block_changed")
 	ErrWalletNoteSummaryLimit   = errors.New("wallet_note_summary_limit_exceeded")
 	ErrInvalidWalletNoteState   = errors.New("invalid_wallet_note_state")
+	ErrInvalidNoteStatusQuery   = errors.New("invalid_note_status_query")
 )
+
+const MaxNoteStatusBatch = 200
 
 type Store interface {
 	Close() error
@@ -39,6 +42,7 @@ type Store interface {
 
 	ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, filter EventFilter) (events []Event, nextCursor int64, err error)
 	ListWalletNotesPage(ctx context.Context, walletID string, query NotesQuery) (notes []Note, nextCursor *NotesCursor, err error)
+	WalletNoteStatuses(ctx context.Context, walletID string, refs []NoteRef) (WalletNoteStatusSnapshot, error)
 	WalletNoteSummary(ctx context.Context, walletID string, minConfirmations, minNoteZat int64, maxNotes int) (WalletNoteSummary, error)
 	AddressBalance(ctx context.Context, walletID, recipientAddress string, minConfirmations, scannerHeight int64) (AddressBalance, error)
 	ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]Note, error)
@@ -201,6 +205,42 @@ type NotesQuery struct {
 	RecipientAddress string
 	Limit            int
 	Cursor           *NotesCursor
+}
+
+type NoteRef struct {
+	TxID        string
+	ActionIndex uint32
+}
+
+type WalletNoteStatusSnapshot struct {
+	WalletFound       bool
+	TipFound          bool
+	EventEpoch        string
+	AsOfScannerHeight int64
+	AsOfScannerHash   string
+	Notes             map[NoteRef]Note
+}
+
+func ValidateNoteStatusRefs(refs []NoteRef) error {
+	if len(refs) < 1 || len(refs) > MaxNoteStatusBatch {
+		return ErrInvalidNoteStatusQuery
+	}
+	seen := make(map[NoteRef]struct{}, len(refs))
+	for _, ref := range refs {
+		if len(ref.TxID) != 64 {
+			return ErrInvalidNoteStatusQuery
+		}
+		for i := range ref.TxID {
+			if (ref.TxID[i] < '0' || ref.TxID[i] > '9') && (ref.TxID[i] < 'a' || ref.TxID[i] > 'f') {
+				return ErrInvalidNoteStatusQuery
+			}
+		}
+		if _, ok := seen[ref]; ok {
+			return ErrInvalidNoteStatusQuery
+		}
+		seen[ref] = struct{}{}
+	}
+	return nil
 }
 
 type AddressBalance struct {

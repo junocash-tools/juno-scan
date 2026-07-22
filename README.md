@@ -54,19 +54,50 @@ curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes"           # u
 curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes?spent=true" # include spent
 curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes?min_value_zat=50000&limit=500" # filter + page size
 curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes/summary?min_confirmations=100&min_note_zat=100001&max_notes=100000"
+curl -sS -X POST "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes/status" \
+  -H 'content-type: application/json' \
+  -d '{"note_ids":["<64-lowercase-hex-txid>:0"]}'
 ```
 
 Note: when a note’s nullifier is observed in the node mempool, the note will include `pending_spent_txid` / `pending_spent_at` and (when known) `pending_spent_expiry_height`.
-Pending spends are *sticky*: if a spend disappears from the mempool before it is mined, the note remains pending until the spend is mined or the chain height passes `pending_spent_expiry_height`.
+Pending spends are *sticky*: if a spend disappears from the mempool before it is mined, the note remains pending until the spend is mined or the chain height passes a known `pending_spent_expiry_height`. A pending spend with no known expiry remains reserved indefinitely rather than being reported as spendable.
 The notes endpoint returns incoming notes plus mined outgoing notes recovered via OVK. Each note object includes `direction` (`incoming` or `outgoing`) and `memo_hex`; when no memo is stored it is returned as `null`. Outgoing notes include `ovk_scope` / `recipient_scope` when available, and `spent` filtering applies only to incoming notes.
 When additional pages exist, the notes response includes `next_cursor`; pass it back as `cursor` to continue.
 
 The note-summary endpoint returns one atomic store aggregate for incoming unspent notes. Buckets are mutually exclusive in this order: pending spend, immature, witness unavailable, below the requested minimum, then spendable. It returns `422` instead of truncating when the inventory exceeds `max_notes`.
 RocksDB schema v5 builds a transactionally maintained wallet-unspent index during migration. The one-time v4 upgrade scans existing notes and fails closed on inconsistent note indexes; normal summary requests examine at most `max_notes + 1` unspent candidates rather than lifetime spent history.
 
+The private note-status endpoint reconciles 1–200 source note IDs without scanning wallet history. A source note ID is the creating transaction ID and Orchard action index from an incoming `/notes` item, formatted exactly as `<64 lowercase hex txid>:<uint32 decimal>` with no leading zeroes. The request is strict JSON: unknown fields, duplicates, non-canonical IDs, trailing JSON, and bodies over 32 KiB are rejected.
+
+Example response:
+
+```json
+{
+  "wallet_id": "exchange-hot-001",
+  "event_epoch": "<64 lowercase hex>",
+  "as_of_scanner_height": 12345,
+  "as_of_scanner_hash": "<block hash>",
+  "statuses": [
+    {
+      "note_id": "<source txid>:0",
+      "state": "pending",
+      "source_height": 12000,
+      "value_zat": 500000,
+      "pending_spent_txid": "<spending txid>",
+      "pending_spent_at": "2026-07-22T12:00:00Z",
+      "pending_spent_expiry_height": 12360
+    }
+  ]
+}
+```
+
+Results preserve request order. `unknown` contains only `note_id` and `state` and must be treated as fail-closed, never as spendable. `unspent` adds `source_height` and `value_zat`. `pending` also identifies the observed mempool spend and its first-seen time, plus expiry height when known. `spent` identifies the mined spending transaction and height, plus `spent_confirmed_height` once confirmed. Pending marks are sticky until the spend mines or the scanner advances past its known expiry; after expiry without mining the note becomes `unspent` again.
+
+Use this endpoint after a builder/broadcaster timeout or service restart to reconcile local note reservations. Keep `pending` and `unknown` notes reserved, finalize `spent` notes as consumed, and release an `unspent` reservation only after your own broadcast/expiry policy says the attempt is abandoned. Each response is one storage snapshot bound to both `event_epoch` and the scanner tip. The endpoint returns `503` until a complete pending-spend refresh has succeeded for that exact epoch and tip. Retry the complete idempotent request on HTTP `409`; treat `503` as unavailable and do not change reservations. Keep this endpoint on the private service network and enable bearer authentication (preferably behind mTLS) in production.
+
 Every health and event-page response includes `event_epoch`, exactly 64 lowercase hexadecimal characters. Bind persisted event cursors to this value. It rotates once on every scanner process start and after a destructive event-journal reset or repair. Discard old cursors and restart consumption whenever it changes.
 The events API rejects a cursor above the wallet's durable event maximum with HTTP `409`; verify `event_epoch` and reset the cursor.
-Health also reports `confirmations`; gateways should fail readiness when it differs from their configured default.
+Health reports `pending_spends_ready`; it is `true` only after a successful pending-spend refresh for the exact current `event_epoch` and scanned tip. Keep the gateway unavailable while it is `false`. Health also reports `confirmations`; gateways should fail readiness when it differs from their configured default.
 
 If you configured `-api-bearer-token`, include `-H 'Authorization: Bearer <token>'` in all requests.
 
@@ -197,6 +228,7 @@ The broker message key is derived from `payload.txid` when present (falls back t
 - `POST /v1/wallets/{wallet_id}/backfill` → backfill wallet history (incremental)
 - `GET /v1/wallets/{wallet_id}/notes[?spent=true][&direction=incoming|outgoing|all][&min_value_zat=<zat>][&limit=<n>][&cursor=<c>]` → paged incoming/outgoing note list (default direction: `all`; mined outgoing only; incoming notes are unspent-only by default; limit: 1000, max: 1000)
 - `GET /v1/wallets/{wallet_id}/notes/summary[?min_confirmations=<n>][&min_note_zat=<zat>][&max_notes=<n>]` → atomic aggregate note liquidity bound to `as_of_scanner_height` and `as_of_scanner_hash` (default max: 100000; maximum: 1000000; no partial result)
+- `POST /v1/wallets/{wallet_id}/notes/status` → strict, ordered batch reconciliation for 1–200 canonical source note IDs (`unknown`, `unspent`, `pending`, or `spent`)
 - `POST /v1/orchard/witness` → compute Orchard witnesses for commitment positions
 
 HTTP API authentication (optional):

@@ -26,7 +26,7 @@ func TestHealthRequiresTipAndBackfillBeyondTip(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	server, err := New(st)
+	server, err := New(st, liveMempoolRefreshOption(st))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestHealthDegradesWhenScannerTipIsAheadOfNode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server, err := New(st, WithRuntimeStatus("regtest", "jregtest", 100, 2, func() (int64, bool) {
+	server, err := New(st, currentMempoolRefreshOption(t, st), WithRuntimeStatus("regtest", "jregtest", 100, 2, func() (int64, bool) {
 		return 9, true
 	}))
 	if err != nil {
@@ -169,4 +169,62 @@ func TestHealthDegradesWhenScannerTipIsAheadOfNode(t *testing.T) {
 	if response.Ready || response.Status != "degraded" || response.NodeHeight != 9 || response.ScannedHeight != 10 || response.ScannerLag != 0 {
 		t.Fatalf("scanner-ahead health=%+v body=%s", response, rr.Body.String())
 	}
+}
+
+func TestHealthRequiresPendingSpendRefreshForCurrentEpochAndTip(t *testing.T) {
+	ctx := context.Background()
+	st, err := rocksdb.Open(t.TempDir() + "/pending-refresh.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.WithTx(ctx, func(tx store.Tx) error {
+		return tx.InsertBlock(ctx, store.Block{Height: 10, Hash: "hash-10"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	current := currentMempoolRefreshStatus(t, st)
+	refresh := MempoolRefreshStatus{}
+	server, err := New(st, WithMempoolRefreshStatus(func() MempoolRefreshStatus { return refresh }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(wantReady bool) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+		rr := httptest.NewRecorder()
+		server.Handler().ServeHTTP(rr, req)
+		var response struct {
+			Status             string `json:"status"`
+			Ready              bool   `json:"ready"`
+			PendingSpendsReady bool   `json:"pending_spends_ready"`
+		}
+		if rr.Code != http.StatusOK || json.Unmarshal(rr.Body.Bytes(), &response) != nil {
+			t.Fatalf("health status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		if response.Ready != wantReady || response.PendingSpendsReady != wantReady {
+			t.Fatalf("health=%+v want_ready=%v body=%s", response, wantReady, rr.Body.String())
+		}
+		wantStatus := "degraded"
+		if wantReady {
+			wantStatus = "ok"
+		}
+		if response.Status != wantStatus {
+			t.Fatalf("status=%q want=%q body=%s", response.Status, wantStatus, rr.Body.String())
+		}
+	}
+
+	check(false)
+	refresh = current
+	refresh.EventEpoch = "wrong-epoch"
+	check(false)
+	refresh = current
+	refresh.Hash = "wrong-tip"
+	check(false)
+	refresh = current
+	check(true)
 }

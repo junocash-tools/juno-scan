@@ -3,10 +3,22 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Abdullah1738/juno-scan/internal/store/rocksdb"
 )
+
+func TestHTTPServerBoundsRequestReads(t *testing.T) {
+	srv := newHTTPServer("127.0.0.1:0", http.NotFoundHandler())
+	if srv.ReadHeaderTimeout != 5*time.Second || srv.ReadTimeout != 15*time.Second {
+		t.Fatalf("read_header_timeout=%v read_timeout=%v", srv.ReadHeaderTimeout, srv.ReadTimeout)
+	}
+	if srv.WriteTimeout != 0 {
+		t.Fatalf("write_timeout=%v want unbounded for long backfills", srv.WriteTimeout)
+	}
+}
 
 type startupStoreRecorder struct {
 	migrations int

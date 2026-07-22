@@ -118,6 +118,25 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 	if *notes[0].Position < 0 {
 		t.Fatalf("invalid note position: %d", *notes[0].Position)
 	}
+	sourceNoteIDs := make([]string, 0, len(notes))
+	for _, note := range notes {
+		if note.Direction == "incoming" {
+			sourceNoteIDs = append(sourceNoteIDs, fmt.Sprintf("%s:%d", note.TxID, note.ActionIndex))
+		}
+	}
+	if len(sourceNoteIDs) == 0 {
+		t.Fatal("expected an incoming source note")
+	}
+	unknownNoteID := strings.Repeat("f", 64) + ":4294967295"
+	initialStatuses := mustGetNoteStatuses(t, ctx, baseURL, "hot", append([]string{unknownNoteID}, sourceNoteIDs...))
+	if len(initialStatuses.Statuses) != len(sourceNoteIDs)+1 || initialStatuses.Statuses[0].NoteID != unknownNoteID || initialStatuses.Statuses[0].State != "unknown" {
+		t.Fatalf("initial note statuses did not preserve request order: %+v", initialStatuses)
+	}
+	for _, status := range initialStatuses.Statuses[1:] {
+		if status.State != "unspent" || status.SourceHeight == nil || status.ValueZat == nil {
+			t.Fatalf("confirmed source note is not unspent: %+v", status)
+		}
+	}
 
 	wit := mustGetWitness(t, ctx, baseURL, []uint32{uint32(*notes[0].Position)})
 	if wit.Root == "" {
@@ -142,12 +161,17 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 	mustWaitForOutgoingOutputEventState(t, ctx, baseURL, "hot", spendTxID, "mempool")
 	pendingSummary := mustWaitForPendingNoteSummary(t, ctx, baseURL, "hot", 2, 0, 100)
 	assertNoteSummaryPartition(t, pendingSummary)
+	pendingSource := mustWaitForPendingSourceNote(t, ctx, baseURL, "hot", sourceNoteIDs, spendTxID)
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	mustWaitForEventKind(t, ctx, baseURL, "hot", "SpendEvent")
 	mustWaitForOutgoingOutputEventState(t, ctx, baseURL, "hot", spendTxID, "confirmed")
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	mustWaitForEventKind(t, ctx, baseURL, "hot", "SpendConfirmed")
 	mustWaitForEventKindTxID(t, ctx, baseURL, "hot", "OutgoingOutputConfirmed", spendTxID)
+	spentStatus := mustWaitForNoteStatusState(t, ctx, baseURL, "hot", pendingSource, "spent")
+	if spentStatus.SpentTxID == nil || *spentStatus.SpentTxID != spendTxID || spentStatus.SpentHeight == nil || spentStatus.SpentConfirmedHeight == nil {
+		t.Fatalf("spent source note lacks mined/confirmed spend identity: %+v", spentStatus)
+	}
 
 	allNotes := mustGetNotes(t, ctx, baseURL, "hot", true, "")
 	foundSpent := false
@@ -414,12 +438,35 @@ type apiNote struct {
 	Direction      string  `json:"direction"`
 	TxID           string  `json:"txid"`
 	ActionIndex    int32   `json:"action_index"`
+	Height         int64   `json:"height"`
+	ValueZat       int64   `json:"value_zat"`
 	Position       *int64  `json:"position,omitempty"`
 	MemoHex        *string `json:"memo_hex"`
 	NoteNullifier  *string `json:"note_nullifier"`
 	OvkScope       *string `json:"ovk_scope,omitempty"`
 	RecipientScope *string `json:"recipient_scope,omitempty"`
 	SpentHeight    *int64  `json:"spent_height,omitempty"`
+}
+
+type apiNoteStatus struct {
+	NoteID                   string     `json:"note_id"`
+	State                    string     `json:"state"`
+	SourceHeight             *int64     `json:"source_height,omitempty"`
+	ValueZat                 *int64     `json:"value_zat,omitempty"`
+	PendingSpentTxID         *string    `json:"pending_spent_txid,omitempty"`
+	PendingSpentAt           *time.Time `json:"pending_spent_at,omitempty"`
+	PendingSpentExpiryHeight *int64     `json:"pending_spent_expiry_height,omitempty"`
+	SpentTxID                *string    `json:"spent_txid,omitempty"`
+	SpentHeight              *int64     `json:"spent_height,omitempty"`
+	SpentConfirmedHeight     *int64     `json:"spent_confirmed_height,omitempty"`
+}
+
+type apiNoteStatuses struct {
+	WalletID          string          `json:"wallet_id"`
+	EventEpoch        string          `json:"event_epoch"`
+	AsOfScannerHeight int64           `json:"as_of_scanner_height"`
+	AsOfScannerHash   string          `json:"as_of_scanner_hash"`
+	Statuses          []apiNoteStatus `json:"statuses"`
 }
 
 type apiNoteValueSummary struct {
@@ -513,6 +560,90 @@ func mustGetNotes(t *testing.T, ctx context.Context, baseURL, walletID string, s
 		t.Fatalf("decode notes: %v", err)
 	}
 	return out.Notes
+}
+
+func mustGetNoteStatuses(t *testing.T, ctx context.Context, baseURL, walletID string, noteIDs []string) apiNoteStatuses {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"note_ids": noteIDs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/wallets/"+walletID+"/notes/status", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST /v1/wallets/%s/notes/status: %v", walletID, err)
+		}
+		if resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusServiceUnavailable {
+			_ = resp.Body.Close()
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			responseBody, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			t.Fatalf("POST /v1/wallets/%s/notes/status status=%d body=%s", walletID, resp.StatusCode, responseBody)
+		}
+		var out apiNoteStatuses
+		decodeErr := json.NewDecoder(resp.Body).Decode(&out)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			t.Fatalf("decode note statuses: %v", decodeErr)
+		}
+		if out.WalletID != walletID || len(out.EventEpoch) != 64 || out.AsOfScannerHeight < 0 || strings.TrimSpace(out.AsOfScannerHash) == "" || len(out.Statuses) != len(noteIDs) {
+			t.Fatalf("invalid note status snapshot: %+v", out)
+		}
+		for i, status := range out.Statuses {
+			if status.NoteID != noteIDs[i] {
+				t.Fatalf("note status order[%d]=%q want=%q", i, status.NoteID, noteIDs[i])
+			}
+		}
+		return out
+	}
+	t.Fatalf("POST /v1/wallets/%s/notes/status did not become ready", walletID)
+	return apiNoteStatuses{}
+}
+
+func mustWaitForPendingSourceNote(t *testing.T, ctx context.Context, baseURL, walletID string, noteIDs []string, spendTxID string) string {
+	t.Helper()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+	for time.Now().Before(deadline) {
+		statuses := mustGetNoteStatuses(t, ctx, baseURL, walletID, noteIDs)
+		for _, status := range statuses.Statuses {
+			if status.State == "pending" && status.PendingSpentTxID != nil && *status.PendingSpentTxID == spendTxID && status.PendingSpentAt != nil {
+				return status.NoteID
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("pending source note for spend %s not observed", spendTxID)
+	return ""
+}
+
+func mustWaitForNoteStatusState(t *testing.T, ctx context.Context, baseURL, walletID, noteID, wantState string) apiNoteStatus {
+	t.Helper()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+	for time.Now().Before(deadline) {
+		statuses := mustGetNoteStatuses(t, ctx, baseURL, walletID, []string{noteID})
+		if len(statuses.Statuses) == 1 && statuses.Statuses[0].State == wantState {
+			return statuses.Statuses[0]
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("note %s did not reach state %s", noteID, wantState)
+	return apiNoteStatus{}
 }
 
 func mustWaitForNoteWithMemoPrefixViaAPI(t *testing.T, ctx context.Context, baseURL, walletID string, spent bool, memoPrefix string) apiNote {

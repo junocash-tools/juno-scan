@@ -64,6 +64,26 @@ func TestPostgresWalletNoteSummary(t *testing.T) {
 	}
 }
 
+func TestPostgresWalletNoteStatuses(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("JUNO_TEST_POSTGRES_DSN"))
+	if dsn == "" {
+		t.Skip("JUNO_TEST_POSTGRES_DSN not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	schema := fmt.Sprintf("junoscan_note_status_%d", time.Now().UnixNano())
+	st, err := postgres.Open(ctx, dsn, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	defer dropPostgresSchema(t, ctx, dsn, schema)
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	exerciseWalletNoteStatuses(t, ctx, st)
+}
+
 func TestPostgresRollbackConcurrencyExpiryAndShardParity(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv("JUNO_TEST_POSTGRES_DSN"))
 	if dsn == "" {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -58,6 +59,14 @@ type Server struct {
 	maxReadyLag          int64
 	shardCache           *shardcache.Service
 	witnessMode          string
+	mempoolRefresh       func() MempoolRefreshStatus
+}
+
+type MempoolRefreshStatus struct {
+	Ready      bool
+	EventEpoch string
+	Height     int64
+	Hash       string
 }
 
 type Option func(*Server)
@@ -101,6 +110,10 @@ func WithWitnessMode(mode string) Option {
 		}
 		s.witnessMode = mode
 	}
+}
+
+func WithMempoolRefreshStatus(status func() MempoolRefreshStatus) Option {
+	return func(s *Server) { s.mempoolRefresh = status }
 }
 
 func New(st store.Store, opts ...Option) (*Server, error) {
@@ -163,6 +176,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp["event_epoch"] = eventEpoch
+	refresh := s.mempoolRefreshStatus()
+	resp["pending_spends_ready"] = false
 	if s.network != "" {
 		resp["network"] = s.network
 	}
@@ -191,6 +206,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		resp["action_index"] = actionIndex
+		mempoolRefreshCurrent := refreshMatches(refresh, eventEpoch, tip)
+		resp["pending_spends_ready"] = mempoolRefreshCurrent
+		if !mempoolRefreshCurrent {
+			resp["ready"] = false
+			resp["status"] = "degraded"
+		}
 		historyComplete := true
 		historyPending := 0
 		wallets, walletsErr := s.st.ListWallets(ctx)
@@ -279,6 +300,8 @@ func (s *Server) handleWalletSubroutes(w http.ResponseWriter, r *http.Request) {
 			s.handleListWalletNotes(w, r, walletID)
 		case len(parts) == 3 && parts[2] == "summary":
 			s.handleWalletNoteSummary(w, r, walletID)
+		case len(parts) == 3 && parts[2] == "status":
+			s.handleWalletNoteStatuses(w, r, walletID)
 		default:
 			http.NotFound(w, r)
 		}
@@ -307,6 +330,41 @@ type apiWalletNoteSummary struct {
 	PendingSpend       store.PendingSpendNoteSummary `json:"pending_spend"`
 	BelowMinNote       store.NoteValueSummary        `json:"below_min_note"`
 	WitnessUnavailable store.NoteValueSummary        `json:"witness_unavailable"`
+}
+
+const walletNoteStatusMaxBodyBytes = 32 << 10
+
+var errWalletNoteStatusSnapshotChanged = errors.New("wallet note status snapshot changed")
+var errWalletNoteStatusMempoolNotReady = errors.New("wallet note status mempool refresh is not current")
+
+type apiWalletNoteStatusRequest struct {
+	NoteIDs []string `json:"note_ids"`
+}
+
+type apiWalletNoteStatus struct {
+	NoteID                   string     `json:"note_id"`
+	State                    string     `json:"state"`
+	SourceHeight             *int64     `json:"source_height,omitempty"`
+	ValueZat                 *int64     `json:"value_zat,omitempty"`
+	PendingSpentTxID         *string    `json:"pending_spent_txid,omitempty"`
+	PendingSpentAt           *time.Time `json:"pending_spent_at,omitempty"`
+	PendingSpentExpiryHeight *int64     `json:"pending_spent_expiry_height,omitempty"`
+	SpentTxID                *string    `json:"spent_txid,omitempty"`
+	SpentHeight              *int64     `json:"spent_height,omitempty"`
+	SpentConfirmedHeight     *int64     `json:"spent_confirmed_height,omitempty"`
+}
+
+type apiWalletNoteStatusesResponse struct {
+	WalletID          string                `json:"wallet_id"`
+	EventEpoch        string                `json:"event_epoch"`
+	AsOfScannerHeight int64                 `json:"as_of_scanner_height"`
+	AsOfScannerHash   string                `json:"as_of_scanner_hash"`
+	Statuses          []apiWalletNoteStatus `json:"statuses"`
+}
+
+type parsedWalletNoteStatusID struct {
+	ID  string
+	Ref store.NoteRef
 }
 
 func (s *Server) handleWalletNoteSummary(w http.ResponseWriter, r *http.Request, walletID string) {
@@ -380,6 +438,248 @@ func (s *Server) handleWalletNoteSummary(w http.ResponseWriter, r *http.Request,
 		BelowMinNote:       summary.BelowMinNote,
 		WitnessUnavailable: summary.WitnessUnavailable,
 	})
+}
+
+func (s *Server) handleWalletNoteStatuses(w http.ResponseWriter, r *http.Request, walletID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if walletID == "" || !isSafeWalletID(walletID) {
+		http.Error(w, "invalid wallet_id", http.StatusBadRequest)
+		return
+	}
+
+	mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(r.Header.Get("Content-Type")))
+	if err != nil || mediaType != "application/json" {
+		http.Error(w, "content-type must be application/json", http.StatusBadRequest)
+		return
+	}
+	if r.ContentLength > walletNoteStatusMaxBodyBytes {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, walletNoteStatusMaxBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var request apiWalletNoteStatusRequest
+	if err := decoder.Decode(&request); err != nil {
+		writeWalletNoteStatusDecodeError(w, err)
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		writeWalletNoteStatusDecodeError(w, err)
+		return
+	}
+	if len(request.NoteIDs) < 1 || len(request.NoteIDs) > store.MaxNoteStatusBatch {
+		http.Error(w, "note_ids must contain 1 to 200 items", http.StatusBadRequest)
+		return
+	}
+
+	parsed := make([]parsedWalletNoteStatusID, 0, len(request.NoteIDs))
+	refs := make([]store.NoteRef, 0, len(request.NoteIDs))
+	seen := make(map[store.NoteRef]struct{}, len(request.NoteIDs))
+	for _, noteID := range request.NoteIDs {
+		ref, ok := parseSourceNoteID(noteID)
+		if !ok {
+			http.Error(w, "invalid note_id", http.StatusBadRequest)
+			return
+		}
+		if _, duplicate := seen[ref]; duplicate {
+			http.Error(w, "duplicate note_id", http.StatusBadRequest)
+			return
+		}
+		seen[ref] = struct{}{}
+		parsed = append(parsed, parsedWalletNoteStatusID{ID: noteID, Ref: ref})
+		refs = append(refs, ref)
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	snapshot, err := s.readStableWalletNoteStatuses(ctx, walletID, refs)
+	if err != nil {
+		switch {
+		case errors.Is(err, errWalletNoteStatusSnapshotChanged):
+			http.Error(w, "scanner state changed; retry", http.StatusConflict)
+		case errors.Is(err, errWalletNoteStatusMempoolNotReady):
+			http.Error(w, "scanner pending-spend state not ready", http.StatusServiceUnavailable)
+		case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+			http.Error(w, "scanner temporarily unavailable", http.StatusServiceUnavailable)
+		default:
+			http.Error(w, "db error", http.StatusInternalServerError)
+		}
+		return
+	}
+	if !snapshot.WalletFound {
+		http.Error(w, "wallet not found", http.StatusNotFound)
+		return
+	}
+	if !snapshot.TipFound {
+		http.Error(w, "scanner not ready", http.StatusServiceUnavailable)
+		return
+	}
+	if len(snapshot.EventEpoch) != store.EventEpochHexLength || !isLowerHex(snapshot.EventEpoch) || snapshot.AsOfScannerHeight < 0 ||
+		len(snapshot.AsOfScannerHash) != 64 || !isLowerHex(snapshot.AsOfScannerHash) {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	statuses := make([]apiWalletNoteStatus, 0, len(parsed))
+	for _, requested := range parsed {
+		note, found := snapshot.Notes[requested.Ref]
+		if !found {
+			statuses = append(statuses, apiWalletNoteStatus{NoteID: requested.ID, State: "unknown"})
+			continue
+		}
+		status, err := walletNoteStatusFromStore(requested, walletID, snapshot.AsOfScannerHeight, note)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		statuses = append(statuses, status)
+	}
+
+	writeJSON(w, apiWalletNoteStatusesResponse{
+		WalletID:          walletID,
+		EventEpoch:        snapshot.EventEpoch,
+		AsOfScannerHeight: snapshot.AsOfScannerHeight,
+		AsOfScannerHash:   snapshot.AsOfScannerHash,
+		Statuses:          statuses,
+	})
+}
+
+func writeWalletNoteStatusDecodeError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, "invalid json", http.StatusBadRequest)
+}
+
+func parseSourceNoteID(noteID string) (store.NoteRef, bool) {
+	if len(noteID) < 66 || len(noteID) > 75 || noteID[64] != ':' {
+		return store.NoteRef{}, false
+	}
+	txid := noteID[:64]
+	if !isLowerHex(txid) {
+		return store.NoteRef{}, false
+	}
+	action := noteID[65:]
+	if action == "" || (len(action) > 1 && action[0] == '0') {
+		return store.NoteRef{}, false
+	}
+	for i := range action {
+		if action[i] < '0' || action[i] > '9' {
+			return store.NoteRef{}, false
+		}
+	}
+	actionIndex, err := strconv.ParseUint(action, 10, 32)
+	if err != nil || strconv.FormatUint(actionIndex, 10) != action {
+		return store.NoteRef{}, false
+	}
+	return store.NoteRef{TxID: txid, ActionIndex: uint32(actionIndex)}, true
+}
+
+func (s *Server) readStableWalletNoteStatuses(ctx context.Context, walletID string, refs []store.NoteRef) (store.WalletNoteStatusSnapshot, error) {
+	lastErr := errWalletNoteStatusSnapshotChanged
+	for attempt := 0; attempt < 2; attempt++ {
+		beforeRefresh := s.mempoolRefreshStatus()
+		beforeEpoch, err := s.st.EventEpoch(ctx)
+		if err != nil {
+			return store.WalletNoteStatusSnapshot{}, err
+		}
+		beforeTip, beforeTipFound, err := s.st.Tip(ctx)
+		if err != nil {
+			return store.WalletNoteStatusSnapshot{}, err
+		}
+		snapshot, err := s.st.WalletNoteStatuses(ctx, walletID, refs)
+		if err != nil {
+			return store.WalletNoteStatusSnapshot{}, err
+		}
+		afterTip, afterTipFound, err := s.st.Tip(ctx)
+		if err != nil {
+			return store.WalletNoteStatusSnapshot{}, err
+		}
+		afterEpoch, err := s.st.EventEpoch(ctx)
+		if err != nil {
+			return store.WalletNoteStatusSnapshot{}, err
+		}
+		afterRefresh := s.mempoolRefreshStatus()
+		snapshotTip, snapshotTipFound := snapshotBlockTip(snapshot)
+		if beforeEpoch == snapshot.EventEpoch && snapshot.EventEpoch == afterEpoch &&
+			sameBlockTip(beforeTip, beforeTipFound, snapshotTip, snapshotTipFound) &&
+			sameBlockTip(afterTip, afterTipFound, snapshotTip, snapshotTipFound) {
+			if snapshotTipFound && refreshMatches(beforeRefresh, snapshot.EventEpoch, snapshotTip) && refreshMatches(afterRefresh, snapshot.EventEpoch, snapshotTip) {
+				return snapshot, nil
+			}
+			lastErr = errWalletNoteStatusMempoolNotReady
+			continue
+		}
+		lastErr = errWalletNoteStatusSnapshotChanged
+	}
+	return store.WalletNoteStatusSnapshot{}, lastErr
+}
+
+func (s *Server) mempoolRefreshStatus() MempoolRefreshStatus {
+	if s.mempoolRefresh == nil {
+		return MempoolRefreshStatus{}
+	}
+	return s.mempoolRefresh()
+}
+
+func refreshMatches(refresh MempoolRefreshStatus, eventEpoch string, tip store.BlockTip) bool {
+	return refresh.Ready && refresh.EventEpoch == eventEpoch && refresh.Height == tip.Height && refresh.Hash == tip.Hash
+}
+
+func snapshotBlockTip(snapshot store.WalletNoteStatusSnapshot) (store.BlockTip, bool) {
+	return store.BlockTip{Height: snapshot.AsOfScannerHeight, Hash: snapshot.AsOfScannerHash}, snapshot.TipFound
+}
+
+func sameBlockTip(left store.BlockTip, leftFound bool, right store.BlockTip, rightFound bool) bool {
+	return leftFound == rightFound && (!leftFound || left == right)
+}
+
+func walletNoteStatusFromStore(requested parsedWalletNoteStatusID, walletID string, asOfScannerHeight int64, note store.Note) (apiWalletNoteStatus, error) {
+	if note.WalletID != walletID || note.TxID != requested.Ref.TxID || note.ActionIndex < 0 || uint32(note.ActionIndex) != requested.Ref.ActionIndex ||
+		note.Height < 0 || note.Height > asOfScannerHeight || note.ValueZat < 0 ||
+		(note.ConfirmedHeight != nil && (*note.ConfirmedHeight < note.Height || *note.ConfirmedHeight > asOfScannerHeight)) {
+		return apiWalletNoteStatus{}, store.ErrInvalidWalletNoteState
+	}
+	height := note.Height
+	value := note.ValueZat
+	status := apiWalletNoteStatus{NoteID: requested.ID, SourceHeight: &height, ValueZat: &value}
+
+	anyPending := note.PendingSpentTxID != nil || note.PendingSpentAt != nil || note.PendingSpentExpiryHeight != nil
+	anySpent := note.SpentTxID != nil || note.SpentHeight != nil || note.SpentConfirmedHeight != nil
+	if anyPending && anySpent {
+		return apiWalletNoteStatus{}, store.ErrInvalidWalletNoteState
+	}
+	if anySpent {
+		if note.SpentTxID == nil || note.SpentHeight == nil || len(*note.SpentTxID) != 64 || !isLowerHex(*note.SpentTxID) || *note.SpentHeight < note.Height || *note.SpentHeight > asOfScannerHeight ||
+			(note.SpentConfirmedHeight != nil && (*note.SpentConfirmedHeight < *note.SpentHeight || *note.SpentConfirmedHeight > asOfScannerHeight)) {
+			return apiWalletNoteStatus{}, store.ErrInvalidWalletNoteState
+		}
+		status.State = "spent"
+		status.SpentTxID = note.SpentTxID
+		status.SpentHeight = note.SpentHeight
+		status.SpentConfirmedHeight = note.SpentConfirmedHeight
+		return status, nil
+	}
+	if anyPending {
+		if note.PendingSpentTxID == nil || note.PendingSpentAt == nil || len(*note.PendingSpentTxID) != 64 || !isLowerHex(*note.PendingSpentTxID) || note.PendingSpentAt.IsZero() ||
+			(note.PendingSpentExpiryHeight != nil && *note.PendingSpentExpiryHeight < asOfScannerHeight) {
+			return apiWalletNoteStatus{}, store.ErrInvalidWalletNoteState
+		}
+		status.State = "pending"
+		status.PendingSpentTxID = note.PendingSpentTxID
+		status.PendingSpentAt = note.PendingSpentAt
+		status.PendingSpentExpiryHeight = note.PendingSpentExpiryHeight
+		return status, nil
+	}
+	status.State = "unspent"
+	return status, nil
 }
 
 func (s *Server) handleAddressBalance(w http.ResponseWriter, r *http.Request, walletID, recipientAddress string) {

@@ -139,6 +139,15 @@ func run(ctx context.Context, cfg config.Config) error {
 			status := sc.Status()
 			return status.NodeHeight, status.NodeHeightKnown
 		}),
+		api.WithMempoolRefreshStatus(func() api.MempoolRefreshStatus {
+			refresh := sc.Status().MempoolRefresh
+			return api.MempoolRefreshStatus{
+				Ready:      refresh.Ready,
+				EventEpoch: refresh.EventEpoch,
+				Height:     refresh.Height,
+				Hash:       refresh.Hash,
+			}
+		}),
 		api.WithShardCacheService(shardCache),
 		api.WithWitnessMode(cfg.WitnessMode),
 	)
@@ -146,11 +155,7 @@ func run(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 
-	srv := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           apiServer.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+	srv := newHTTPServer(cfg.ListenAddr, apiServer.Handler())
 
 	go func() {
 		<-groupCtx.Done()
@@ -171,6 +176,15 @@ func run(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	return nil
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+	}
 }
 
 type startupStore interface {
