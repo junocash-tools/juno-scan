@@ -299,6 +299,7 @@ func TestScanner_DepositMemoExtracted(t *testing.T) {
 	defer func() { _ = jd.Stop(context.Background()) }()
 
 	addr, ufvk := mustCreateWalletAndUFVK(t, ctx, jd)
+	sourceAddr, sourceUFVK := mustCreateWalletAndUFVK(t, ctx, jd)
 	uaHRP := strings.SplitN(addr, "1", 2)[0]
 
 	if err := st.Migrate(ctx); err != nil {
@@ -328,15 +329,16 @@ func TestScanner_DepositMemoExtracted(t *testing.T) {
 	mustRun(t, jd.CLICommand(ctx, "generate", "101"))
 	fromAddr := mustCoinbaseAddress(t, ctx, jd)
 
-	// Fund the wallet first (coinbase spends cannot make change).
-	opidFund := mustShieldCoinbase(t, ctx, jd, fromAddr, addr)
+	// Fund an unregistered source wallet first so the memo-bearing receipt is
+	// an external deposit rather than an internal transfer.
+	opidFund := mustShieldCoinbase(t, ctx, jd, fromAddr, sourceAddr)
 	mustWaitOpSuccess(t, ctx, jd, opidFund)
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
-	mustWaitOrchardBalanceForViewingKey(t, ctx, jd, ufvk, 2)
+	mustWaitOrchardBalanceForViewingKey(t, ctx, jd, sourceUFVK, 2)
 
 	// A memo of "00" (padded by the node) should be detectable (not the "no memo" marker 0xF6).
-	opid := mustSendManyWithMemo(t, ctx, jd, addr, addr, "0.01", "00")
+	opid := mustSendManyWithMemo(t, ctx, jd, sourceAddr, addr, "0.01", "00")
 	mustWaitOpSuccess(t, ctx, jd, opid)
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 

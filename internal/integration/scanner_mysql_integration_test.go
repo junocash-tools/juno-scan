@@ -22,6 +22,37 @@ import (
 	sdkjunocashd "github.com/Abdullah1738/juno-sdk-go/junocashd"
 )
 
+func TestMySQLWalletNoteSummary(t *testing.T) {
+	rootDSN := strings.TrimSpace(os.Getenv("JUNO_TEST_MYSQL_ROOT_DSN"))
+	if rootDSN == "" {
+		t.Skip("JUNO_TEST_MYSQL_ROOT_DSN not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	st, admin, dbName, cleanup := openMySQLTestStoreWithAdmin(t, ctx, rootDSN)
+	defer cleanup()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	exerciseWalletNoteSummary(t, ctx, st)
+	if _, err := admin.ExecContext(ctx, "UPDATE `"+dbName+"`.wallets SET disabled_at=NOW() WHERE wallet_id=?", "summary-wallet"); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := st.WalletNoteSummary(ctx, "summary-wallet", 10, 100, 100)
+	if err != nil || disabled != (store.WalletNoteSummary{}) {
+		t.Fatalf("disabled summary=%+v err=%v", disabled, err)
+	}
+	if _, err := admin.ExecContext(ctx, "UPDATE `"+dbName+"`.wallets SET disabled_at=NULL WHERE wallet_id=?", "summary-wallet"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.ExecContext(ctx, "UPDATE `"+dbName+"`.notes SET spent_confirmed_height=? WHERE wallet_id=? AND txid=? AND action_index=?", 100, "summary-wallet", summaryBackendID('a'), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.WalletNoteSummary(ctx, "summary-wallet", 10, 100, 100); !errors.Is(err, store.ErrInvalidWalletNoteState) {
+		t.Fatalf("confirmed spend without mined spend error=%v want ErrInvalidWalletNoteState", err)
+	}
+}
+
 func TestMySQLRollbackConcurrencyExpiryAndShardParity(t *testing.T) {
 	rootDSN := strings.TrimSpace(os.Getenv("JUNO_TEST_MYSQL_ROOT_DSN"))
 	if rootDSN == "" {

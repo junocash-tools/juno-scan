@@ -25,6 +25,9 @@ func TestListWalletNotes_PaginationAndMinValue(t *testing.T) {
 	if err := st.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
+	if err := st.UpsertWallet(ctx, "hot", "ufvk"); err != nil {
+		t.Fatalf("Upsert wallet: %v", err)
+	}
 	if err := st.WithTx(ctx, func(tx store.Tx) error {
 		if _, err := tx.InsertNote(ctx, store.Note{
 			WalletID:         "hot",
@@ -167,6 +170,9 @@ func TestListWalletNotes_IncludesMemoHexField(t *testing.T) {
 	if err := st.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
+	if err := st.UpsertWallet(ctx, "hot", "ufvk"); err != nil {
+		t.Fatalf("Upsert wallet: %v", err)
+	}
 
 	memoHex := "00"
 	if err := st.WithTx(ctx, func(tx store.Tx) error {
@@ -256,6 +262,9 @@ func TestListWalletNotes_MergesOutgoingNotesAndDirectionPagination(t *testing.T)
 
 	if err := st.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)
+	}
+	if err := st.UpsertWallet(ctx, "hot", "ufvk"); err != nil {
+		t.Fatalf("Upsert wallet: %v", err)
 	}
 
 	height10 := int64(10)

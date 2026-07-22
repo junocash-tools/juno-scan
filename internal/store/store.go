@@ -13,6 +13,8 @@ var (
 	ErrBirthdayIncrease         = errors.New("birthday_height_increase_forbidden")
 	ErrBackfillProgressConflict = errors.New("backfill_progress_conflict")
 	ErrCanonicalBlockChanged    = errors.New("canonical_block_changed")
+	ErrWalletNoteSummaryLimit   = errors.New("wallet_note_summary_limit_exceeded")
+	ErrInvalidWalletNoteState   = errors.New("invalid_wallet_note_state")
 )
 
 type Store interface {
@@ -37,6 +39,7 @@ type Store interface {
 
 	ListWalletEvents(ctx context.Context, walletID string, afterID int64, limit int, filter EventFilter) (events []Event, nextCursor int64, err error)
 	ListWalletNotesPage(ctx context.Context, walletID string, query NotesQuery) (notes []Note, nextCursor *NotesCursor, err error)
+	WalletNoteSummary(ctx context.Context, walletID string, minConfirmations, minNoteZat int64, maxNotes int) (WalletNoteSummary, error)
 	AddressBalance(ctx context.Context, walletID, recipientAddress string, minConfirmations, scannerHeight int64) (AddressBalance, error)
 	ListWalletNotes(ctx context.Context, walletID string, onlyUnspent bool, limit int) ([]Note, error)
 	ListWalletOutgoingOutputsPage(ctx context.Context, walletID string, query OutgoingOutputsQuery) (outputs []OutgoingOutput, nextCursor *NotesCursor, err error)
@@ -206,6 +209,37 @@ type AddressBalance struct {
 	PendingIncomingZat int64
 	PendingOutgoingZat int64
 	TotalUnspentZat    int64
+}
+
+type NoteValueSummary struct {
+	NoteCount int64 `json:"note_count"`
+	ValueZat  int64 `json:"value_zat"`
+}
+
+type SpendableNoteSummary struct {
+	NoteValueSummary
+	SmallestNoteZat *int64 `json:"smallest_note_zat"`
+	LargestNoteZat  *int64 `json:"largest_note_zat"`
+}
+
+type PendingSpendNoteSummary struct {
+	NoteValueSummary
+	KnownExpiryCount int64  `json:"known_expiry_count"`
+	NextExpiryHeight *int64 `json:"next_expiry_height"`
+	LastExpiryHeight *int64 `json:"last_expiry_height"`
+}
+
+type WalletNoteSummary struct {
+	WalletFound        bool
+	TipFound           bool
+	AsOfScannerHeight  int64
+	AsOfScannerHash    string
+	TotalUnspent       NoteValueSummary
+	Spendable          SpendableNoteSummary
+	Immature           NoteValueSummary
+	PendingSpend       PendingSpendNoteSummary
+	BelowMinNote       NoteValueSummary
+	WitnessUnavailable NoteValueSummary
 }
 
 type OutgoingOutputsQuery struct {

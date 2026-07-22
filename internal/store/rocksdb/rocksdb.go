@@ -60,10 +60,18 @@ func (s *Store) Migrate(ctx context.Context) error {
 		version := string(v)
 		_ = closer.Close()
 		switch version {
+		case "5":
+			return s.ensureV4IdentityAndProgress()
 		case "4":
+			if err := s.migrateV4ToV5(verKey); err != nil {
+				return err
+			}
 			return s.ensureV4IdentityAndProgress()
 		case "3":
 			if err := s.migrateV3ToV4(verKey); err != nil {
+				return err
+			}
+			if err := s.migrateV4ToV5(verKey); err != nil {
 				return err
 			}
 			return s.ensureV4IdentityAndProgress()
@@ -72,6 +80,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 				return err
 			}
 			if err := s.migrateV3ToV4(verKey); err != nil {
+				return err
+			}
+			if err := s.migrateV4ToV5(verKey); err != nil {
 				return err
 			}
 			return s.ensureV4IdentityAndProgress()
@@ -85,6 +96,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 			if err := s.migrateV3ToV4(verKey); err != nil {
 				return err
 			}
+			if err := s.migrateV4ToV5(verKey); err != nil {
+				return err
+			}
 			return s.ensureV4IdentityAndProgress()
 		default:
 			return fmt.Errorf("rocksdb: unsupported schema_version %q", version)
@@ -96,7 +110,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 
 	b := s.db.NewBatch()
 	defer b.Close()
-	if err := b.Set(verKey, []byte("4"), pebble.NoSync); err != nil {
+	if err := b.Set(verKey, []byte("5"), pebble.NoSync); err != nil {
 		return fmt.Errorf("rocksdb: set schema_version: %w", err)
 	}
 	epoch, err := store.NewEventEpoch()
@@ -140,6 +154,20 @@ func (s *Store) ensureV4IdentityAndProgress() error {
 			return fmt.Errorf("rocksdb: duplicate ufvk for %q and %q: %w", owner, walletID, store.ErrUFVKAlreadyRegistered)
 		}
 		owners[ufvk] = walletID
+		stateBytes, stateCloser, stateErr := s.db.Get(keyWalletUnspentState(walletID))
+		if stateErr != nil {
+			_ = iter.Close()
+			if errors.Is(stateErr, pebble.ErrNotFound) {
+				return store.ErrInvalidWalletNoteState
+			}
+			return fmt.Errorf("rocksdb: audit wallet unspent state %q: %w", walletID, stateErr)
+		}
+		if len(stateBytes) != 8 || binary.BigEndian.Uint64(stateBytes) > uint64(^uint64(0)>>1) {
+			_ = stateCloser.Close()
+			_ = iter.Close()
+			return store.ErrInvalidWalletNoteState
+		}
+		_ = stateCloser.Close()
 
 		progressKey := keyWalletBackfill(walletID)
 		progress := walletBackfillRecord{BirthdayHeight: wallet.BirthdayHeight, NextHeight: wallet.BirthdayHeight, State: "pending", Generation: 1, UpdatedAtUnix: time.Now().UTC().Unix()}
@@ -274,6 +302,137 @@ func (s *Store) repairLegacyOutgoingExpiryObservations(batch *pebble.Batch) erro
 	_ = outputs.Close()
 	if err := batch.Set(marker, []byte("1"), pebble.NoSync); err != nil {
 		return fmt.Errorf("rocksdb: set outgoing expiry repair marker: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) migrateV4ToV5(verKey []byte) error {
+	b := s.db.NewBatch()
+	defer b.Close()
+
+	if err := b.DeleteRange(walletUnspentNotePrefix, prefixUpperBound(walletUnspentNotePrefix), pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: migrate v5 clear unspent note index: %w", err)
+	}
+	if err := b.DeleteRange(walletUnspentStatePrefix, prefixUpperBound(walletUnspentStatePrefix), pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: migrate v5 clear unspent state: %w", err)
+	}
+
+	counts := make(map[string]int64)
+	wallets, err := s.db.NewIter(&pebble.IterOptions{LowerBound: walletPrefix, UpperBound: prefixUpperBound(walletPrefix)})
+	if err != nil {
+		return fmt.Errorf("rocksdb: migrate v5 wallets: %w", err)
+	}
+	for wallets.First(); wallets.Valid(); wallets.Next() {
+		walletID := strings.TrimPrefix(string(wallets.Key()), string(walletPrefix))
+		if walletID == "" {
+			_ = wallets.Close()
+			return store.ErrInvalidWalletNoteState
+		}
+		counts[walletID] = 0
+	}
+	if err := wallets.Error(); err != nil {
+		_ = wallets.Close()
+		return fmt.Errorf("rocksdb: migrate v5 wallets: %w", err)
+	}
+	_ = wallets.Close()
+
+	notes, err := s.db.NewIter(&pebble.IterOptions{LowerBound: notePrefix, UpperBound: prefixUpperBound(notePrefix)})
+	if err != nil {
+		return fmt.Errorf("rocksdb: migrate v5 notes: %w", err)
+	}
+	for notes.First(); notes.Valid(); notes.Next() {
+		var rec noteRecord
+		if err := json.Unmarshal(notes.Value(), &rec); err != nil {
+			_ = notes.Close()
+			return fmt.Errorf("rocksdb: migrate v5 decode note: %w", err)
+		}
+		if _, ok := counts[rec.WalletID]; !ok || rec.Height < 0 || rec.ActionIndex < 0 || !bytes.Equal(notes.Key(), keyNote(rec.WalletID, rec.TxID, rec.ActionIndex)) {
+			_ = notes.Close()
+			return store.ErrInvalidWalletNoteState
+		}
+		_, closer, err := s.db.Get(keyWalletNoteIndex(uint64(rec.Height), rec.WalletID, rec.TxID, rec.ActionIndex))
+		if err != nil {
+			_ = notes.Close()
+			if errors.Is(err, pebble.ErrNotFound) {
+				return store.ErrInvalidWalletNoteState
+			}
+			return fmt.Errorf("rocksdb: migrate v5 wallet note index: %w", err)
+		}
+		_ = closer.Close()
+		if strings.TrimSpace(rec.NoteNullifier) == "" || rec.ValueZat < 0 ||
+			(rec.Position != nil && *rec.Position > uint64(^uint32(0))) ||
+			(rec.PendingSpentExpiryHeight != nil && *rec.PendingSpentExpiryHeight < 0) ||
+			(rec.PendingSpentTxID == nil && (rec.PendingSpentAtUnix != nil || rec.PendingSpentExpiryHeight != nil)) ||
+			(rec.PendingSpentTxID != nil && rec.PendingSpentAtUnix == nil) {
+			_ = notes.Close()
+			return store.ErrInvalidWalletNoteState
+		}
+		heightIndexValue, heightCloser, err := s.db.Get(keyNoteHeightIndex(uint64(rec.Height), rec.WalletID, rec.TxID, rec.ActionIndex))
+		if err != nil {
+			_ = notes.Close()
+			if errors.Is(err, pebble.ErrNotFound) {
+				return store.ErrInvalidWalletNoteState
+			}
+			return fmt.Errorf("rocksdb: migrate v5 note height index: %w", err)
+		}
+		if string(heightIndexValue) != rec.NoteNullifier {
+			_ = heightCloser.Close()
+			_ = notes.Close()
+			return store.ErrInvalidWalletNoteState
+		}
+		_ = heightCloser.Close()
+		nullifierValue, nullifierCloser, err := s.db.Get(keyNullifier(rec.NoteNullifier))
+		if err != nil {
+			_ = notes.Close()
+			if errors.Is(err, pebble.ErrNotFound) {
+				return store.ErrInvalidWalletNoteState
+			}
+			return fmt.Errorf("rocksdb: migrate v5 nullifier index: %w", err)
+		}
+		if !bytes.Equal(nullifierValue, notes.Key()) {
+			_ = nullifierCloser.Close()
+			_ = notes.Close()
+			return store.ErrInvalidWalletNoteState
+		}
+		_ = nullifierCloser.Close()
+		if rec.SpentHeight != nil {
+			if *rec.SpentHeight < 0 || rec.SpentTxID == nil || rec.PendingSpentTxID != nil || rec.PendingSpentAtUnix != nil || rec.PendingSpentExpiryHeight != nil {
+				_ = notes.Close()
+				return store.ErrInvalidWalletNoteState
+			}
+			continue
+		}
+		if rec.SpentTxID != nil || rec.SpentConfirmedHeight != nil {
+			_ = notes.Close()
+			return store.ErrInvalidWalletNoteState
+		}
+		if counts[rec.WalletID] == int64(^uint64(0)>>1) {
+			_ = notes.Close()
+			return store.ErrInvalidWalletNoteState
+		}
+		counts[rec.WalletID]++
+		noteKey := append([]byte{}, notes.Key()...)
+		if err := b.Set(keyWalletUnspentNote(rec.WalletID, rec.TxID, rec.ActionIndex), noteKey, pebble.NoSync); err != nil {
+			_ = notes.Close()
+			return fmt.Errorf("rocksdb: migrate v5 unspent note index: %w", err)
+		}
+	}
+	if err := notes.Error(); err != nil {
+		_ = notes.Close()
+		return fmt.Errorf("rocksdb: migrate v5 notes: %w", err)
+	}
+	_ = notes.Close()
+
+	for walletID, count := range counts {
+		if err := b.Set(keyWalletUnspentState(walletID), uint64To8(uint64(count)), pebble.NoSync); err != nil {
+			return fmt.Errorf("rocksdb: migrate v5 unspent state: %w", err)
+		}
+	}
+	if err := b.Set(verKey, []byte("5"), pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: migrate v5 version: %w", err)
+	}
+	if err := b.Commit(pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: migrate v5 commit: %w", err)
 	}
 	return nil
 }
@@ -582,6 +741,7 @@ func (s *Store) UpsertWallet(ctx context.Context, walletID, ufvk string) error {
 
 	var rec walletRecord
 	v, closer, err := s.db.Get(key)
+	walletExists := err == nil
 	if err == nil {
 		if err := json.Unmarshal(v, &rec); err != nil {
 			_ = closer.Close()
@@ -612,6 +772,17 @@ func (s *Store) UpsertWallet(ctx context.Context, walletID, ufvk string) error {
 	defer batch.Close()
 	if err := batch.Set(key, b, pebble.NoSync); err != nil {
 		return fmt.Errorf("rocksdb: upsert wallet: %w", err)
+	}
+	if walletExists {
+		if _, closer, err := s.db.Get(keyWalletUnspentState(walletID)); err == nil {
+			_ = closer.Close()
+		} else if errors.Is(err, pebble.ErrNotFound) {
+			return store.ErrInvalidWalletNoteState
+		} else {
+			return fmt.Errorf("rocksdb: get wallet unspent state: %w", err)
+		}
+	} else if err := batch.Set(keyWalletUnspentState(walletID), uint64To8(0), pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: initialize wallet unspent state: %w", err)
 	}
 	progressKey := keyWalletBackfill(walletID)
 	if value, closer, err := s.db.Get(progressKey); errors.Is(err, pebble.ErrNotFound) {
@@ -670,6 +841,7 @@ func (s *Store) UpsertWalletBirthday(ctx context.Context, walletID, ufvk string,
 	now := time.Now().UTC()
 	var rec walletRecord
 	v, closer, err := s.db.Get(key)
+	walletExists := err == nil
 	if err == nil {
 		if err := json.Unmarshal(v, &rec); err != nil {
 			_ = closer.Close()
@@ -725,6 +897,17 @@ func (s *Store) UpsertWalletBirthday(ctx context.Context, walletID, ufvk string,
 	defer batch.Close()
 	if err := batch.Set(key, walletBytes, pebble.NoSync); err != nil {
 		return err
+	}
+	if walletExists {
+		if _, closer, err := s.db.Get(keyWalletUnspentState(walletID)); err == nil {
+			_ = closer.Close()
+		} else if errors.Is(err, pebble.ErrNotFound) {
+			return store.ErrInvalidWalletNoteState
+		} else {
+			return fmt.Errorf("rocksdb: get wallet unspent state: %w", err)
+		}
+	} else if err := batch.Set(keyWalletUnspentState(walletID), uint64To8(0), pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: initialize wallet unspent state: %w", err)
 	}
 	if err := batch.Set(keyWalletBackfill(walletID), progressBytes, pebble.NoSync); err != nil {
 		return err
@@ -963,6 +1146,7 @@ func (s *Store) RollbackToHeight(ctx context.Context, height int64) error {
 				return fmt.Errorf("rocksdb: rollback decode wallet %q: %w", walletID, err)
 			}
 			preserved = append(preserved, preservedKV{append([]byte{}, wallets.Key()...), append([]byte{}, wallets.Value()...)})
+			preserved = append(preserved, preservedKV{keyWalletUnspentState(walletID), uint64To8(0)})
 			generation := int64(1)
 			if v, closer, err := s.db.Get(keyWalletBackfill(walletID)); err == nil {
 				var progress walletBackfillRecord
@@ -2145,6 +2329,252 @@ func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query 
 		ActionIndex: last.ActionIndex,
 	}
 	return out[:query.Limit], next, nil
+}
+
+func (s *Store) WalletNoteSummary(ctx context.Context, walletID string, minConfirmations, minNoteZat int64, maxNotes int) (store.WalletNoteSummary, error) {
+	var out store.WalletNoteSummary
+	if minConfirmations < 0 || minNoteZat < 0 || maxNotes < 1 || maxNotes > 1_000_000 {
+		return out, fmt.Errorf("rocksdb: invalid wallet note summary query")
+	}
+	if err := ctx.Err(); err != nil {
+		return out, err
+	}
+
+	snapshot := s.db.NewSnapshot()
+	defer func() { _ = snapshot.Close() }()
+
+	walletBytes, closer, err := snapshot.Get(keyWallet(walletID))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return out, nil
+		}
+		return out, fmt.Errorf("rocksdb: wallet note summary wallet: %w", err)
+	}
+	var wallet walletRecord
+	if err := json.Unmarshal(walletBytes, &wallet); err != nil {
+		_ = closer.Close()
+		return out, fmt.Errorf("rocksdb: wallet note summary wallet decode: %w", err)
+	}
+	_ = closer.Close()
+	if wallet.DisabledAtUnix != nil {
+		return out, nil
+	}
+	out.WalletFound = true
+
+	tipIter, err := snapshot.NewIter(&pebble.IterOptions{
+		LowerBound: blockPrefix,
+		UpperBound: prefixUpperBound(blockPrefix),
+	})
+	if err != nil {
+		return out, fmt.Errorf("rocksdb: wallet note summary tip iter: %w", err)
+	}
+	if !tipIter.Last() {
+		iterErr := tipIter.Error()
+		_ = tipIter.Close()
+		if iterErr != nil {
+			return out, fmt.Errorf("rocksdb: wallet note summary tip: %w", iterErr)
+		}
+		return out, nil
+	}
+	tipHeight, err := parseFixed20Int64(bytes.TrimPrefix(tipIter.Key(), blockPrefix))
+	if err != nil {
+		_ = tipIter.Close()
+		return out, fmt.Errorf("rocksdb: wallet note summary tip key: %w", err)
+	}
+	if tipHeight < 0 {
+		_ = tipIter.Close()
+		return out, store.ErrInvalidWalletNoteState
+	}
+	var tipRecord blockRecord
+	if err := json.Unmarshal(tipIter.Value(), &tipRecord); err != nil || strings.TrimSpace(tipRecord.Hash) == "" {
+		_ = tipIter.Close()
+		return out, store.ErrInvalidWalletNoteState
+	}
+	if err := tipIter.Close(); err != nil {
+		return out, fmt.Errorf("rocksdb: wallet note summary tip close: %w", err)
+	}
+	out.TipFound = true
+	out.AsOfScannerHeight = tipHeight
+	out.AsOfScannerHash = tipRecord.Hash
+
+	stateBytes, stateCloser, err := snapshot.Get(keyWalletUnspentState(walletID))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return out, store.ErrInvalidWalletNoteState
+		}
+		return out, fmt.Errorf("rocksdb: wallet note summary state: %w", err)
+	}
+	if len(stateBytes) != 8 {
+		_ = stateCloser.Close()
+		return out, store.ErrInvalidWalletNoteState
+	}
+	expectedCountRaw := binary.BigEndian.Uint64(stateBytes)
+	_ = stateCloser.Close()
+	if expectedCountRaw > uint64(^uint64(0)>>1) {
+		return out, store.ErrInvalidWalletNoteState
+	}
+	expectedCount := int64(expectedCountRaw)
+
+	unspentPrefix := keyWalletUnspentNotePrefix(walletID)
+	iter, err := snapshot.NewIter(&pebble.IterOptions{
+		LowerBound: unspentPrefix,
+		UpperBound: prefixUpperBound(unspentPrefix),
+	})
+	if err != nil {
+		return out, fmt.Errorf("rocksdb: wallet note summary unspent iter: %w", err)
+	}
+	defer iter.Close()
+
+	var indexCount int64
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		if indexCount >= expectedCount {
+			return out, store.ErrInvalidWalletNoteState
+		}
+		if indexCount >= int64(maxNotes) {
+			return out, store.ErrWalletNoteSummaryLimit
+		}
+		noteKey := append([]byte{}, iter.Value()...)
+		if len(noteKey) == 0 {
+			return out, store.ErrInvalidWalletNoteState
+		}
+		noteBytes, noteCloser, err := snapshot.Get(noteKey)
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				return out, store.ErrInvalidWalletNoteState
+			}
+			return out, fmt.Errorf("rocksdb: wallet note summary note: %w", err)
+		}
+		var rec noteRecord
+		if err := json.Unmarshal(noteBytes, &rec); err != nil {
+			_ = noteCloser.Close()
+			return out, fmt.Errorf("rocksdb: wallet note summary note decode: %w", err)
+		}
+		_ = noteCloser.Close()
+		if rec.WalletID != walletID || rec.Height < 0 || rec.ActionIndex < 0 || rec.SpentHeight != nil ||
+			!bytes.Equal(noteKey, keyNote(walletID, rec.TxID, rec.ActionIndex)) ||
+			!bytes.Equal(iter.Key(), keyWalletUnspentNote(walletID, rec.TxID, rec.ActionIndex)) {
+			return out, store.ErrInvalidWalletNoteState
+		}
+		_, indexCloser, err := snapshot.Get(keyWalletNoteIndex(uint64(rec.Height), walletID, rec.TxID, rec.ActionIndex))
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				return out, store.ErrInvalidWalletNoteState
+			}
+			return out, fmt.Errorf("rocksdb: wallet note summary index: %w", err)
+		}
+		_ = indexCloser.Close()
+		if strings.TrimSpace(rec.NoteNullifier) == "" {
+			return out, store.ErrInvalidWalletNoteState
+		}
+		heightIndexValue, heightIndexCloser, err := snapshot.Get(keyNoteHeightIndex(uint64(rec.Height), walletID, rec.TxID, rec.ActionIndex))
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				return out, store.ErrInvalidWalletNoteState
+			}
+			return out, fmt.Errorf("rocksdb: wallet note summary height index: %w", err)
+		}
+		if string(heightIndexValue) != rec.NoteNullifier {
+			_ = heightIndexCloser.Close()
+			return out, store.ErrInvalidWalletNoteState
+		}
+		_ = heightIndexCloser.Close()
+		nullifierNoteKey, nullifierCloser, err := snapshot.Get(keyNullifier(rec.NoteNullifier))
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				return out, store.ErrInvalidWalletNoteState
+			}
+			return out, fmt.Errorf("rocksdb: wallet note summary nullifier index: %w", err)
+		}
+		if !bytes.Equal(nullifierNoteKey, noteKey) {
+			_ = nullifierCloser.Close()
+			return out, store.ErrInvalidWalletNoteState
+		}
+		_ = nullifierCloser.Close()
+		if err := addNoteToSummary(&out, rec, tipHeight, minConfirmations, minNoteZat); err != nil {
+			return out, err
+		}
+		indexCount++
+	}
+	if err := iter.Error(); err != nil {
+		return out, fmt.Errorf("rocksdb: wallet note summary unspent iter: %w", err)
+	}
+	if indexCount != expectedCount || out.TotalUnspent.NoteCount != expectedCount {
+		return out, store.ErrInvalidWalletNoteState
+	}
+	return out, nil
+}
+
+func addNoteToSummary(out *store.WalletNoteSummary, rec noteRecord, tipHeight, minConfirmations, minNoteZat int64) error {
+	if rec.ActionIndex < 0 || rec.Height < 0 || rec.Height > tipHeight || rec.ValueZat < 0 || rec.SpentTxID != nil || rec.SpentConfirmedHeight != nil ||
+		(rec.Position != nil && *rec.Position > uint64(^uint32(0))) ||
+		(rec.PendingSpentExpiryHeight != nil && *rec.PendingSpentExpiryHeight < 0) ||
+		(rec.PendingSpentTxID == nil && (rec.PendingSpentAtUnix != nil || rec.PendingSpentExpiryHeight != nil)) ||
+		(rec.PendingSpentTxID != nil && rec.PendingSpentAtUnix == nil) {
+		return store.ErrInvalidWalletNoteState
+	}
+	if err := addNoteValue(&out.TotalUnspent, rec.ValueZat); err != nil {
+		return err
+	}
+
+	switch {
+	case rec.PendingSpentTxID != nil:
+		if err := addNoteValue(&out.PendingSpend.NoteValueSummary, rec.ValueZat); err != nil {
+			return err
+		}
+		if rec.PendingSpentExpiryHeight != nil {
+			expiry := *rec.PendingSpentExpiryHeight
+			out.PendingSpend.KnownExpiryCount++
+			if out.PendingSpend.NextExpiryHeight == nil || expiry < *out.PendingSpend.NextExpiryHeight {
+				out.PendingSpend.NextExpiryHeight = int64Pointer(expiry)
+			}
+			if out.PendingSpend.LastExpiryHeight == nil || expiry > *out.PendingSpend.LastExpiryHeight {
+				out.PendingSpend.LastExpiryHeight = int64Pointer(expiry)
+			}
+		}
+	case noteIsImmature(rec.Height, tipHeight, minConfirmations):
+		return addNoteValue(&out.Immature, rec.ValueZat)
+	case rec.Position == nil:
+		return addNoteValue(&out.WitnessUnavailable, rec.ValueZat)
+	case rec.ValueZat == 0 || rec.ValueZat < minNoteZat:
+		return addNoteValue(&out.BelowMinNote, rec.ValueZat)
+	default:
+		if err := addNoteValue(&out.Spendable.NoteValueSummary, rec.ValueZat); err != nil {
+			return err
+		}
+		if out.Spendable.SmallestNoteZat == nil || rec.ValueZat < *out.Spendable.SmallestNoteZat {
+			out.Spendable.SmallestNoteZat = int64Pointer(rec.ValueZat)
+		}
+		if out.Spendable.LargestNoteZat == nil || rec.ValueZat > *out.Spendable.LargestNoteZat {
+			out.Spendable.LargestNoteZat = int64Pointer(rec.ValueZat)
+		}
+	}
+	return nil
+}
+
+func noteIsImmature(noteHeight, tipHeight, minConfirmations int64) bool {
+	if minConfirmations == 0 {
+		return false
+	}
+	if noteHeight > tipHeight {
+		return true
+	}
+	return tipHeight-noteHeight < minConfirmations-1
+}
+
+func addNoteValue(bucket *store.NoteValueSummary, valueZat int64) error {
+	if valueZat < 0 || bucket.ValueZat > int64(^uint64(0)>>1)-valueZat {
+		return store.ErrInvalidWalletNoteState
+	}
+	bucket.NoteCount++
+	bucket.ValueZat += valueZat
+	return nil
+}
+
+func int64Pointer(value int64) *int64 {
+	return &value
 }
 
 func (s *Store) AddressBalance(ctx context.Context, walletID, recipientAddress string, minConfirmations, scannerHeight int64) (store.AddressBalance, error) {
@@ -3392,7 +3822,7 @@ func (t *rocksTx) MarkNotesSpent(ctx context.Context, height int64, txid string,
 	var out []store.Note
 
 	for _, nf := range nullifiers {
-		locBytes, closer, err := t.db.Get(keyNullifier(nf))
+		locBytes, closer, err := t.batch.Get(keyNullifier(nf))
 		if err != nil {
 			if errors.Is(err, pebble.ErrNotFound) {
 				continue
@@ -3402,7 +3832,7 @@ func (t *rocksTx) MarkNotesSpent(ctx context.Context, height int64, txid string,
 		noteKey := append([]byte{}, locBytes...)
 		_ = closer.Close()
 
-		v, closer, err := t.db.Get(noteKey)
+		v, closer, err := t.batch.Get(noteKey)
 		if err != nil {
 			if errors.Is(err, pebble.ErrNotFound) {
 				continue
@@ -3419,6 +3849,22 @@ func (t *rocksTx) MarkNotesSpent(ctx context.Context, height int64, txid string,
 		if rec.SpentHeight != nil {
 			continue
 		}
+		if rec.WalletID == "" || rec.ActionIndex < 0 || rec.NoteNullifier != nf || !bytes.Equal(noteKey, keyNote(rec.WalletID, rec.TxID, rec.ActionIndex)) {
+			return nil, store.ErrInvalidWalletNoteState
+		}
+		unspentIndexKey := keyWalletUnspentNote(rec.WalletID, rec.TxID, rec.ActionIndex)
+		indexedNoteKey, indexCloser, err := t.batch.Get(unspentIndexKey)
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				return nil, store.ErrInvalidWalletNoteState
+			}
+			return nil, fmt.Errorf("rocksdb: read wallet unspent note index: %w", err)
+		}
+		if !bytes.Equal(indexedNoteKey, noteKey) {
+			_ = indexCloser.Close()
+			return nil, store.ErrInvalidWalletNoteState
+		}
+		_ = indexCloser.Close()
 		rec.SpentHeight = &height
 		rec.SpentTxID = &txid
 		rec.SpentConfirmedHeight = nil
@@ -3432,6 +3878,12 @@ func (t *rocksTx) MarkNotesSpent(ctx context.Context, height int64, txid string,
 		}
 		if err := t.batch.Set(noteKey, b, pebble.NoSync); err != nil {
 			return nil, fmt.Errorf("rocksdb: mark spent: %w", err)
+		}
+		if err := t.batch.Delete(unspentIndexKey, pebble.NoSync); err != nil {
+			return nil, fmt.Errorf("rocksdb: delete wallet unspent note index: %w", err)
+		}
+		if err := adjustWalletUnspentCount(t.batch, rec.WalletID, -1); err != nil {
+			return nil, err
 		}
 		if err := t.batch.Delete(keyPendingNullifier(nf), pebble.NoSync); err != nil {
 			return nil, fmt.Errorf("rocksdb: clear pending key: %w", err)
@@ -3929,6 +4381,32 @@ func (t *rocksTx) InsertNote(ctx context.Context, n store.Note) (bool, error) {
 			return false, fmt.Errorf("rocksdb: decode existing note: %w", err)
 		}
 		_ = closer.Close()
+		if rec.WalletID != n.WalletID || rec.TxID != n.TxID || rec.ActionIndex != n.ActionIndex || !bytes.Equal(key, keyNote(rec.WalletID, rec.TxID, rec.ActionIndex)) {
+			return false, store.ErrInvalidWalletNoteState
+		}
+		if _, err := walletUnspentCountFromBatch(t.batch, n.WalletID); err != nil {
+			return false, err
+		}
+		unspentKey := keyWalletUnspentNote(n.WalletID, n.TxID, n.ActionIndex)
+		indexedNoteKey, indexCloser, indexErr := t.batch.Get(unspentKey)
+		if rec.SpentHeight == nil {
+			if indexErr != nil {
+				if errors.Is(indexErr, pebble.ErrNotFound) {
+					return false, store.ErrInvalidWalletNoteState
+				}
+				return false, fmt.Errorf("rocksdb: read existing wallet unspent note index: %w", indexErr)
+			}
+			if !bytes.Equal(indexedNoteKey, key) {
+				_ = indexCloser.Close()
+				return false, store.ErrInvalidWalletNoteState
+			}
+			_ = indexCloser.Close()
+		} else if indexErr == nil {
+			_ = indexCloser.Close()
+			return false, store.ErrInvalidWalletNoteState
+		} else if !errors.Is(indexErr, pebble.ErrNotFound) {
+			return false, fmt.Errorf("rocksdb: read existing wallet unspent note index: %w", indexErr)
+		}
 		wantEligible := !n.IsInternal
 		if rec.DepositEligible != nil && *rec.DepositEligible == wantEligible {
 			return false, nil
@@ -3979,6 +4457,12 @@ func (t *rocksTx) InsertNote(ctx context.Context, n store.Note) (bool, error) {
 	}
 	if err := t.batch.Set(keyWalletNoteIndex(uint64(n.Height), n.WalletID, n.TxID, n.ActionIndex), nil, pebble.NoSync); err != nil {
 		return false, fmt.Errorf("rocksdb: insert wallet note index: %w", err)
+	}
+	if err := t.batch.Set(keyWalletUnspentNote(n.WalletID, n.TxID, n.ActionIndex), key, pebble.NoSync); err != nil {
+		return false, fmt.Errorf("rocksdb: insert wallet unspent note index: %w", err)
+	}
+	if err := adjustWalletUnspentCount(t.batch, n.WalletID, 1); err != nil {
+		return false, err
 	}
 	if err := t.batch.Set(keyWalletAddressNoteIndex(uint64(n.Height), n.WalletID, n.RecipientAddress, n.TxID, n.ActionIndex), key, pebble.NoSync); err != nil {
 		return false, fmt.Errorf("rocksdb: insert address note index: %w", err)
@@ -4404,6 +4888,8 @@ var (
 	noteHeightPrefix               = []byte("nh/")
 	walletNotePrefix               = []byte("nwh/")
 	walletAddressNotePrefix        = []byte("nwa/")
+	walletUnspentNotePrefix        = []byte("nuw/")
+	walletUnspentStatePrefix       = []byte("nus/")
 	nullifierPrefix                = []byte("nn/")
 	pendingNullifierPrefix         = []byte("np/")
 	noteSpentHeightPrefix          = []byte("nsh/")
@@ -4596,6 +5082,29 @@ func keyWalletNoteIndex(height uint64, walletID, txid string, actionIndex int32)
 	return b
 }
 
+func keyWalletUnspentNotePrefix(walletID string) []byte {
+	b := make([]byte, 0, len(walletUnspentNotePrefix)+len(walletID)+1)
+	b = append(b, walletUnspentNotePrefix...)
+	b = append(b, walletID...)
+	b = append(b, '/')
+	return b
+}
+
+func keyWalletUnspentNote(walletID, txid string, actionIndex int32) []byte {
+	b := keyWalletUnspentNotePrefix(walletID)
+	b = append(b, txid...)
+	b = append(b, '/')
+	b = strconv.AppendInt(b, int64(actionIndex), 10)
+	return b
+}
+
+func keyWalletUnspentState(walletID string) []byte {
+	b := make([]byte, 0, len(walletUnspentStatePrefix)+len(walletID))
+	b = append(b, walletUnspentStatePrefix...)
+	b = append(b, walletID...)
+	return b
+}
+
 func keyWalletAddressNotePrefix(walletID, recipientAddress string) []byte {
 	b := make([]byte, 0, len(walletAddressNotePrefix)+len(walletID)+1+len(recipientAddress)+1)
 	b = append(b, walletAddressNotePrefix...)
@@ -4756,6 +5265,46 @@ func uint64To8(n uint64) []byte {
 	return b[:]
 }
 
+func walletUnspentCountFromBatch(batch *pebble.Batch, walletID string) (int64, error) {
+	v, closer, err := batch.Get(keyWalletUnspentState(walletID))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return 0, store.ErrInvalidWalletNoteState
+		}
+		return 0, fmt.Errorf("rocksdb: read wallet unspent state: %w", err)
+	}
+	defer closer.Close()
+	if len(v) != 8 {
+		return 0, store.ErrInvalidWalletNoteState
+	}
+	count := binary.BigEndian.Uint64(v)
+	if count > uint64(^uint64(0)>>1) {
+		return 0, store.ErrInvalidWalletNoteState
+	}
+	return int64(count), nil
+}
+
+func adjustWalletUnspentCount(batch *pebble.Batch, walletID string, delta int64) error {
+	if delta != -1 && delta != 1 {
+		return store.ErrInvalidWalletNoteState
+	}
+	count, err := walletUnspentCountFromBatch(batch, walletID)
+	if err != nil {
+		return err
+	}
+	if delta > 0 && count > int64(^uint64(0)>>1)-delta {
+		return store.ErrInvalidWalletNoteState
+	}
+	if delta < 0 && count < -delta {
+		return store.ErrInvalidWalletNoteState
+	}
+	count += delta
+	if err := batch.Set(keyWalletUnspentState(walletID), uint64To8(uint64(count)), pebble.NoSync); err != nil {
+		return fmt.Errorf("rocksdb: update wallet unspent state: %w", err)
+	}
+	return nil
+}
+
 func deleteRangeByFixed20(batch *pebble.Batch, prefix []byte, start uint64) error {
 	lower := make([]byte, 0, len(prefix)+20)
 	lower = append(lower, prefix...)
@@ -4821,17 +5370,23 @@ func deleteNotesAboveHeight(batch *pebble.Batch, db *pebble.DB, startHeight uint
 			return err
 		}
 		noteKey := keyNote(walletID, txid, actionIndex)
-		var recipientAddress string
+		var rec noteRecord
 		if v, closer, getErr := batch.Get(noteKey); getErr == nil {
-			var rec noteRecord
 			if unmarshalErr := json.Unmarshal(v, &rec); unmarshalErr != nil {
 				_ = closer.Close()
 				return fmt.Errorf("rocksdb: delete note decode: %w", unmarshalErr)
 			}
-			recipientAddress = rec.RecipientAddress
 			_ = closer.Close()
+		} else if errors.Is(getErr, pebble.ErrNotFound) {
+			return store.ErrInvalidWalletNoteState
 		} else if !errors.Is(getErr, pebble.ErrNotFound) {
 			return fmt.Errorf("rocksdb: delete note get: %w", getErr)
+		}
+		if rec.WalletID != walletID || rec.TxID != txid || rec.ActionIndex != actionIndex || rec.Height != height {
+			return store.ErrInvalidWalletNoteState
+		}
+		if nullifier == "" || rec.NoteNullifier != nullifier {
+			return store.ErrInvalidWalletNoteState
 		}
 
 		if err := batch.Delete(k, pebble.NoSync); err != nil {
@@ -4840,9 +5395,40 @@ func deleteNotesAboveHeight(batch *pebble.Batch, db *pebble.DB, startHeight uint
 		if err := batch.Delete(keyWalletNoteIndex(uint64(height), walletID, txid, actionIndex), pebble.NoSync); err != nil {
 			return fmt.Errorf("rocksdb: delete wallet note index: %w", err)
 		}
-		if recipientAddress != "" {
-			if err := batch.Delete(keyWalletAddressNoteIndex(uint64(height), walletID, recipientAddress, txid, actionIndex), pebble.NoSync); err != nil {
+		if rec.RecipientAddress != "" {
+			if err := batch.Delete(keyWalletAddressNoteIndex(uint64(height), walletID, rec.RecipientAddress, txid, actionIndex), pebble.NoSync); err != nil {
 				return fmt.Errorf("rocksdb: delete address note index: %w", err)
+			}
+		}
+		unspentKey := keyWalletUnspentNote(walletID, txid, actionIndex)
+		if rec.SpentHeight == nil {
+			indexedNoteKey, closer, err := batch.Get(unspentKey)
+			if err != nil {
+				if errors.Is(err, pebble.ErrNotFound) {
+					return store.ErrInvalidWalletNoteState
+				}
+				return fmt.Errorf("rocksdb: delete note read unspent index: %w", err)
+			}
+			if !bytes.Equal(indexedNoteKey, noteKey) {
+				_ = closer.Close()
+				return store.ErrInvalidWalletNoteState
+			}
+			_ = closer.Close()
+			if err := batch.Delete(unspentKey, pebble.NoSync); err != nil {
+				return fmt.Errorf("rocksdb: delete wallet unspent note index: %w", err)
+			}
+			if err := adjustWalletUnspentCount(batch, walletID, -1); err != nil {
+				return err
+			}
+		} else {
+			if _, closer, err := batch.Get(unspentKey); err == nil {
+				_ = closer.Close()
+				return store.ErrInvalidWalletNoteState
+			} else if !errors.Is(err, pebble.ErrNotFound) {
+				return fmt.Errorf("rocksdb: delete note read unspent index: %w", err)
+			}
+			if _, err := walletUnspentCountFromBatch(batch, walletID); err != nil {
+				return err
 			}
 		}
 		if err := batch.Delete(noteKey, pebble.NoSync); err != nil {
@@ -4879,13 +5465,43 @@ func unspendNotesAboveHeight(batch *pebble.Batch, db *pebble.DB, height uint64) 
 
 		parts := bytes.Split(k, []byte("/"))
 		if len(parts) != 3 {
-			continue
+			return store.ErrInvalidWalletNoteState
+		}
+		spentHeight, err := parseFixed20Int64(parts[1])
+		if err != nil || spentHeight <= int64(height) {
+			return store.ErrInvalidWalletNoteState
 		}
 		nullifier := string(parts[2])
+		if nullifier == "" {
+			return store.ErrInvalidWalletNoteState
+		}
 
 		locBytes, closer, err := batch.Get(keyNullifier(nullifier))
 		if err != nil {
 			if errors.Is(err, pebble.ErrNotFound) {
+				oldLocBytes, oldCloser, oldErr := db.Get(keyNullifier(nullifier))
+				if oldErr != nil {
+					if errors.Is(oldErr, pebble.ErrNotFound) {
+						return store.ErrInvalidWalletNoteState
+					}
+					return fmt.Errorf("rocksdb: unspend verify deleted nullifier: %w", oldErr)
+				}
+				oldNoteKey := append([]byte{}, oldLocBytes...)
+				_ = oldCloser.Close()
+				if _, oldNoteCloser, oldErr := db.Get(oldNoteKey); oldErr != nil {
+					if errors.Is(oldErr, pebble.ErrNotFound) {
+						return store.ErrInvalidWalletNoteState
+					}
+					return fmt.Errorf("rocksdb: unspend verify deleted note: %w", oldErr)
+				} else {
+					_ = oldNoteCloser.Close()
+				}
+				if _, batchNoteCloser, batchErr := batch.Get(oldNoteKey); batchErr == nil {
+					_ = batchNoteCloser.Close()
+					return store.ErrInvalidWalletNoteState
+				} else if !errors.Is(batchErr, pebble.ErrNotFound) {
+					return fmt.Errorf("rocksdb: unspend verify batch note deletion: %w", batchErr)
+				}
 				_ = batch.Delete(k, pebble.NoSync)
 				continue
 			}
@@ -4896,8 +5512,10 @@ func unspendNotesAboveHeight(batch *pebble.Batch, db *pebble.DB, height uint64) 
 
 		v, closer, err := batch.Get(noteKey)
 		if err != nil {
-			_ = batch.Delete(k, pebble.NoSync)
-			continue
+			if errors.Is(err, pebble.ErrNotFound) {
+				return store.ErrInvalidWalletNoteState
+			}
+			return fmt.Errorf("rocksdb: unspend get note: %w", err)
 		}
 		var rec noteRecord
 		if err := json.Unmarshal(v, &rec); err != nil {
@@ -4905,6 +5523,16 @@ func unspendNotesAboveHeight(batch *pebble.Batch, db *pebble.DB, height uint64) 
 			return fmt.Errorf("rocksdb: unspend decode note: %w", err)
 		}
 		_ = closer.Close()
+		if rec.SpentHeight == nil || *rec.SpentHeight != spentHeight || rec.WalletID == "" || rec.ActionIndex < 0 || rec.NoteNullifier != nullifier || !bytes.Equal(noteKey, keyNote(rec.WalletID, rec.TxID, rec.ActionIndex)) {
+			return store.ErrInvalidWalletNoteState
+		}
+		unspentKey := keyWalletUnspentNote(rec.WalletID, rec.TxID, rec.ActionIndex)
+		if _, closer, err := batch.Get(unspentKey); err == nil {
+			_ = closer.Close()
+			return store.ErrInvalidWalletNoteState
+		} else if !errors.Is(err, pebble.ErrNotFound) {
+			return fmt.Errorf("rocksdb: unspend read unspent index: %w", err)
+		}
 
 		rec.SpentHeight = nil
 		rec.SpentTxID = nil
@@ -4916,6 +5544,12 @@ func unspendNotesAboveHeight(batch *pebble.Batch, db *pebble.DB, height uint64) 
 		}
 		if err := batch.Set(noteKey, b, pebble.NoSync); err != nil {
 			return fmt.Errorf("rocksdb: unspend set note: %w", err)
+		}
+		if err := batch.Set(unspentKey, noteKey, pebble.NoSync); err != nil {
+			return fmt.Errorf("rocksdb: unspend set wallet unspent note index: %w", err)
+		}
+		if err := adjustWalletUnspentCount(batch, rec.WalletID, 1); err != nil {
+			return err
 		}
 		if err := batch.Delete(k, pebble.NoSync); err != nil {
 			return fmt.Errorf("rocksdb: unspend delete index: %w", err)
@@ -5380,20 +6014,32 @@ func parseEventHeightIndexID(key []byte, height uint64, walletID string) (uint64
 }
 
 func noteKeyFromWalletNoteIndex(key []byte, walletID string) ([]byte, error) {
+	_, txid, actionIndex, err := parseWalletNoteIndexKey(key, walletID)
+	if err != nil {
+		return nil, err
+	}
+	return keyNote(walletID, txid, actionIndex), nil
+}
+
+func parseWalletNoteIndexKey(key []byte, walletID string) (int64, string, int32, error) {
 	prefix := keyWalletNotePrefix(walletID)
 	if !bytes.HasPrefix(key, prefix) {
-		return nil, errors.New("rocksdb: wallet note index prefix mismatch")
+		return 0, "", 0, errors.New("rocksdb: wallet note index prefix mismatch")
 	}
 	rest := bytes.TrimPrefix(key, prefix) // <height>/<txid>/<action_index>
 	parts := bytes.Split(rest, []byte("/"))
 	if len(parts) != 3 {
-		return nil, errors.New("rocksdb: wallet note index malformed")
+		return 0, "", 0, errors.New("rocksdb: wallet note index malformed")
+	}
+	height, err := parseFixed20Int64(parts[0])
+	if err != nil {
+		return 0, "", 0, errors.New("rocksdb: wallet note height invalid")
 	}
 	actionIndex, err := strconv.ParseInt(string(parts[2]), 10, 32)
 	if err != nil {
-		return nil, errors.New("rocksdb: wallet note action_index invalid")
+		return 0, "", 0, errors.New("rocksdb: wallet note action_index invalid")
 	}
-	return keyNote(walletID, string(parts[1]), int32(actionIndex)), nil
+	return height, string(parts[1]), int32(actionIndex), nil
 }
 
 func parseNoteHeightIndexKey(key []byte) (walletID string, height int64, txid string, actionIndex int32, err error) {

@@ -274,7 +274,14 @@ func (s *Server) handleWalletSubroutes(w http.ResponseWriter, r *http.Request) {
 	case "events":
 		s.handleListWalletEvents(w, r, walletID)
 	case "notes":
-		s.handleListWalletNotes(w, r, walletID)
+		switch {
+		case len(parts) == 2:
+			s.handleListWalletNotes(w, r, walletID)
+		case len(parts) == 3 && parts[2] == "summary":
+			s.handleWalletNoteSummary(w, r, walletID)
+		default:
+			http.NotFound(w, r)
+		}
 	case "backfill":
 		s.handleBackfillWallet(w, r, walletID)
 	case "addresses":
@@ -286,6 +293,93 @@ func (s *Server) handleWalletSubroutes(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+type apiWalletNoteSummary struct {
+	WalletID           string                        `json:"wallet_id"`
+	MinConfirmations   int64                         `json:"min_confirmations"`
+	MinNoteZat         int64                         `json:"min_note_zat"`
+	AsOfScannerHeight  int64                         `json:"as_of_scanner_height"`
+	AsOfScannerHash    string                        `json:"as_of_scanner_hash"`
+	TotalUnspent       store.NoteValueSummary        `json:"total_unspent"`
+	Spendable          store.SpendableNoteSummary    `json:"spendable"`
+	Immature           store.NoteValueSummary        `json:"immature"`
+	PendingSpend       store.PendingSpendNoteSummary `json:"pending_spend"`
+	BelowMinNote       store.NoteValueSummary        `json:"below_min_note"`
+	WitnessUnavailable store.NoteValueSummary        `json:"witness_unavailable"`
+}
+
+func (s *Server) handleWalletNoteSummary(w http.ResponseWriter, r *http.Request, walletID string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if walletID == "" || !isSafeWalletID(walletID) {
+		http.Error(w, "invalid wallet_id", http.StatusBadRequest)
+		return
+	}
+
+	minConfirmations := s.defaultConfirmations
+	if raw := strings.TrimSpace(r.URL.Query().Get("min_confirmations")); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value < 0 || value > 1_000_000 {
+			http.Error(w, "invalid min_confirmations", http.StatusBadRequest)
+			return
+		}
+		minConfirmations = value
+	}
+	minNoteZat := int64(0)
+	if raw := strings.TrimSpace(r.URL.Query().Get("min_note_zat")); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value < 0 {
+			http.Error(w, "invalid min_note_zat", http.StatusBadRequest)
+			return
+		}
+		minNoteZat = value
+	}
+	maxNotes := int64(100_000)
+	if raw := strings.TrimSpace(r.URL.Query().Get("max_notes")); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value < 1 || value > 1_000_000 {
+			http.Error(w, "invalid max_notes", http.StatusBadRequest)
+			return
+		}
+		maxNotes = value
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	summary, err := s.st.WalletNoteSummary(ctx, walletID, minConfirmations, minNoteZat, int(maxNotes))
+	if errors.Is(err, store.ErrWalletNoteSummaryLimit) {
+		http.Error(w, "wallet note inventory exceeds max_notes", http.StatusUnprocessableEntity)
+		return
+	}
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	if !summary.WalletFound {
+		http.Error(w, "wallet not found", http.StatusNotFound)
+		return
+	}
+	if !summary.TipFound {
+		http.Error(w, "scanner not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	writeJSON(w, apiWalletNoteSummary{
+		WalletID:           walletID,
+		MinConfirmations:   minConfirmations,
+		MinNoteZat:         minNoteZat,
+		AsOfScannerHeight:  summary.AsOfScannerHeight,
+		AsOfScannerHash:    summary.AsOfScannerHash,
+		TotalUnspent:       summary.TotalUnspent,
+		Spendable:          summary.Spendable,
+		Immature:           summary.Immature,
+		PendingSpend:       summary.PendingSpend,
+		BelowMinNote:       summary.BelowMinNote,
+		WitnessUnavailable: summary.WitnessUnavailable,
+	})
 }
 
 func (s *Server) handleAddressBalance(w http.ResponseWriter, r *http.Request, walletID, recipientAddress string) {

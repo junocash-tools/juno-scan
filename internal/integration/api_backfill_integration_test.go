@@ -294,13 +294,24 @@ func TestIntegration_BackfillCrossWalletTransferOrderIndependent(t *testing.T) {
 				t.Fatal(err)
 			}
 			outgoingEvents := 0
+			outgoingScopes := map[string]int{}
+			actionIndexes := map[uint32]struct{}{}
 			for _, event := range eventsA {
 				if event.Kind == "OutgoingOutputEvent" {
 					outgoingEvents++
+					var payload struct {
+						ActionIndex uint32 `json:"action_index"`
+						OVKScope    string `json:"ovk_scope"`
+					}
+					if err := json.Unmarshal(event.Payload, &payload); err != nil {
+						t.Fatalf("decode outgoing event: %v", err)
+					}
+					outgoingScopes[payload.OVKScope]++
+					actionIndexes[payload.ActionIndex] = struct{}{}
 				}
 			}
-			if outgoingEvents != 1 {
-				t.Fatalf("order %v outgoing recovery events=%d want 1: %+v", order, outgoingEvents, eventsA)
+			if outgoingEvents != 2 || outgoingScopes["external"] != 1 || outgoingScopes["internal"] != 1 || len(actionIndexes) != 2 {
+				t.Fatalf("order %v outgoing recovery events=%d scopes=%v actions=%v want one external destination and one internal change: %+v", order, outgoingEvents, outgoingScopes, actionIndexes, eventsA)
 			}
 		})
 	}

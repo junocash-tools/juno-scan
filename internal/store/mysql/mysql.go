@@ -1058,6 +1058,135 @@ func (s *Store) ListWalletNotesPage(ctx context.Context, walletID string, query 
 	return out[:query.Limit], next, nil
 }
 
+func (s *Store) WalletNoteSummary(ctx context.Context, walletID string, minConfirmations, minNoteZat int64, maxNotes int) (store.WalletNoteSummary, error) {
+	var out store.WalletNoteSummary
+	if minConfirmations < 0 || minNoteZat < 0 || maxNotes < 1 || maxNotes > 1_000_000 {
+		return out, fmt.Errorf("mysql: invalid wallet note summary query")
+	}
+
+	var tipHeight sql.NullInt64
+	var tipHash sql.NullString
+	var smallestNoteZat sql.NullInt64
+	var largestNoteZat sql.NullInt64
+	var nextExpiryHeight sql.NullInt64
+	var lastExpiryHeight sql.NullInt64
+	var invalidCount int64
+	err := s.db.QueryRowContext(ctx, `
+WITH wallet_state AS (
+  SELECT EXISTS(SELECT 1 FROM wallets WHERE wallet_id = ? AND disabled_at IS NULL) AS found
+),
+tip AS (
+  SELECT height, hash FROM blocks ORDER BY height DESC LIMIT 1
+),
+bounded AS (
+  SELECT n.action_index, n.height, n.position, n.value_zat, n.pending_spent_txid, n.pending_spent_at, n.pending_spent_expiry_height, n.spent_txid, n.spent_confirmed_height, tip.height AS tip_height
+  FROM notes n
+  CROSS JOIN wallet_state
+  CROSS JOIN tip
+  WHERE wallet_state.found
+    AND tip.height IS NOT NULL
+    AND n.wallet_id = ?
+    AND n.spent_height IS NULL
+  ORDER BY n.height, n.txid, n.action_index
+  LIMIT ?
+),
+classified AS (
+  SELECT bounded.*, CASE
+    WHEN pending_spent_txid IS NOT NULL THEN 'pending_spend'
+    WHEN ? > 0 AND (height > tip_height OR tip_height - height < ? - 1) THEN 'immature'
+    WHEN position IS NULL THEN 'witness_unavailable'
+    WHEN value_zat = 0 OR value_zat < ? THEN 'below_min_note'
+    ELSE 'spendable'
+  END AS bucket
+  FROM bounded
+)
+SELECT
+  (SELECT found FROM wallet_state),
+  (SELECT height FROM tip),
+  (SELECT hash FROM tip),
+  COUNT(*),
+  COALESCE(SUM(value_zat), 0),
+  COALESCE(SUM(CASE WHEN bucket = 'spendable' THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN bucket = 'spendable' THEN value_zat ELSE 0 END), 0),
+  MIN(CASE WHEN bucket = 'spendable' THEN value_zat END),
+  MAX(CASE WHEN bucket = 'spendable' THEN value_zat END),
+  COALESCE(SUM(CASE WHEN bucket = 'immature' THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN bucket = 'immature' THEN value_zat ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN bucket = 'pending_spend' THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN bucket = 'pending_spend' THEN value_zat ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN bucket = 'pending_spend' AND pending_spent_expiry_height IS NOT NULL THEN 1 ELSE 0 END), 0),
+  MIN(CASE WHEN bucket = 'pending_spend' THEN pending_spent_expiry_height END),
+  MAX(CASE WHEN bucket = 'pending_spend' THEN pending_spent_expiry_height END),
+  COALESCE(SUM(CASE WHEN bucket = 'below_min_note' THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN bucket = 'below_min_note' THEN value_zat ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN bucket = 'witness_unavailable' THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN bucket = 'witness_unavailable' THEN value_zat ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN action_index < 0 OR height < 0 OR height > tip_height OR value_zat < 0 OR position < 0 OR position > 4294967295 OR pending_spent_expiry_height < 0
+    OR (pending_spent_txid IS NULL AND (pending_spent_at IS NOT NULL OR pending_spent_expiry_height IS NOT NULL))
+    OR (pending_spent_txid IS NOT NULL AND pending_spent_at IS NULL)
+    OR spent_txid IS NOT NULL OR spent_confirmed_height IS NOT NULL THEN 1 ELSE 0 END), 0)
+FROM classified
+`, walletID, walletID, maxNotes+1, minConfirmations, minConfirmations, minNoteZat).Scan(
+		&out.WalletFound,
+		&tipHeight,
+		&tipHash,
+		&out.TotalUnspent.NoteCount,
+		&out.TotalUnspent.ValueZat,
+		&out.Spendable.NoteCount,
+		&out.Spendable.ValueZat,
+		&smallestNoteZat,
+		&largestNoteZat,
+		&out.Immature.NoteCount,
+		&out.Immature.ValueZat,
+		&out.PendingSpend.NoteCount,
+		&out.PendingSpend.ValueZat,
+		&out.PendingSpend.KnownExpiryCount,
+		&nextExpiryHeight,
+		&lastExpiryHeight,
+		&out.BelowMinNote.NoteCount,
+		&out.BelowMinNote.ValueZat,
+		&out.WitnessUnavailable.NoteCount,
+		&out.WitnessUnavailable.ValueZat,
+		&invalidCount,
+	)
+	if err != nil {
+		return out, fmt.Errorf("mysql: wallet note summary: %w", err)
+	}
+	if !out.WalletFound {
+		return store.WalletNoteSummary{}, nil
+	}
+	if tipHeight.Valid != tipHash.Valid {
+		return out, store.ErrInvalidWalletNoteState
+	}
+	if tipHeight.Valid {
+		if tipHeight.Int64 < 0 || strings.TrimSpace(tipHash.String) == "" {
+			return out, store.ErrInvalidWalletNoteState
+		}
+		out.TipFound = true
+		out.AsOfScannerHeight = tipHeight.Int64
+		out.AsOfScannerHash = tipHash.String
+	}
+	if smallestNoteZat.Valid {
+		out.Spendable.SmallestNoteZat = &smallestNoteZat.Int64
+	}
+	if largestNoteZat.Valid {
+		out.Spendable.LargestNoteZat = &largestNoteZat.Int64
+	}
+	if nextExpiryHeight.Valid {
+		out.PendingSpend.NextExpiryHeight = &nextExpiryHeight.Int64
+	}
+	if lastExpiryHeight.Valid {
+		out.PendingSpend.LastExpiryHeight = &lastExpiryHeight.Int64
+	}
+	if out.TotalUnspent.NoteCount > int64(maxNotes) {
+		return out, store.ErrWalletNoteSummaryLimit
+	}
+	if invalidCount != 0 {
+		return out, store.ErrInvalidWalletNoteState
+	}
+	return out, nil
+}
+
 func (s *Store) AddressBalance(ctx context.Context, walletID, recipientAddress string, minConfirmations, scannerHeight int64) (store.AddressBalance, error) {
 	var out store.AddressBalance
 	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM wallets WHERE wallet_id = ? AND disabled_at IS NULL)`, walletID).Scan(&out.WalletFound); err != nil {

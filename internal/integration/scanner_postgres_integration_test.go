@@ -20,6 +20,50 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+func TestPostgresWalletNoteSummary(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("JUNO_TEST_POSTGRES_DSN"))
+	if dsn == "" {
+		t.Skip("JUNO_TEST_POSTGRES_DSN not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	schema := fmt.Sprintf("junoscan_summary_%d", time.Now().UnixNano())
+	st, err := postgres.Open(ctx, dsn, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	defer dropPostgresSchema(t, ctx, dsn, schema)
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	exerciseWalletNoteSummary(t, ctx, st)
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, `SET search_path TO `+pgx.Identifier{schema}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE wallets SET disabled_at=NOW() WHERE wallet_id=$1`, "summary-wallet"); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := st.WalletNoteSummary(ctx, "summary-wallet", 10, 100, 100)
+	if err != nil || disabled != (store.WalletNoteSummary{}) {
+		t.Fatalf("disabled summary=%+v err=%v", disabled, err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE wallets SET disabled_at=NULL WHERE wallet_id=$1`, "summary-wallet"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE notes SET spent_confirmed_height=$1 WHERE wallet_id=$2 AND txid=$3 AND action_index=$4`, 100, "summary-wallet", summaryBackendID('a'), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.WalletNoteSummary(ctx, "summary-wallet", 10, 100, 100); !errors.Is(err, store.ErrInvalidWalletNoteState) {
+		t.Fatalf("confirmed spend without mined spend error=%v want ErrInvalidWalletNoteState", err)
+	}
+}
+
 func TestPostgresRollbackConcurrencyExpiryAndShardParity(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv("JUNO_TEST_POSTGRES_DSN"))
 	if dsn == "" {

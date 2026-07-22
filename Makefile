@@ -17,7 +17,7 @@ GO_TEST_TIMEOUT ?= 20m
 JUNOCASHD_TEST_IMAGE ?= juno-scan-junocashd-test:0.9.12
 build: rust-build
 	@mkdir -p $(BIN_DIR)
-	GOCACHE=$(GOCACHE) go build -o $(BIN) ./cmd/juno-scan
+	GOWORK=off GOCACHE=$(GOCACHE) go build -o $(BIN) ./cmd/juno-scan
 
 rust-build:
 	cargo build --release --manifest-path $(RUST_MANIFEST)
@@ -26,22 +26,22 @@ rust-test:
 	cargo test --manifest-path $(RUST_MANIFEST)
 
 test-unit:
-	GOCACHE=$(GOCACHE) CGO_ENABLED=0 go test $(TESTFLAGS) ./...
+	GOWORK=off GOCACHE=$(GOCACHE) CGO_ENABLED=0 go test $(TESTFLAGS) ./...
 
 test-integration: rust-build
-	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=integration ./...
+	GOWORK=off GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=integration ./...
 
 test-junocashd-image:
 	docker build --platform=linux/amd64 -t $(JUNOCASHD_TEST_IMAGE) -f docker/junocashd/Dockerfile .
 
 test-integration-docker: rust-build test-junocashd-image
-	JUNO_TEST_JUNOCASHD_IMAGE=$(JUNOCASHD_TEST_IMAGE) GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -timeout=$(GO_TEST_TIMEOUT) -tags=integration,docker,kafka,nats,rabbitmq,mysql ./...
+	JUNO_TEST_JUNOCASHD_IMAGE=$(JUNOCASHD_TEST_IMAGE) GOWORK=off GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -timeout=$(GO_TEST_TIMEOUT) -tags=integration,docker,kafka,nats,rabbitmq,mysql ./...
 
 test-e2e: build
-	GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=e2e ./...
+	GOWORK=off GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -tags=e2e ./...
 
 test-e2e-docker: build test-junocashd-image
-	JUNO_TEST_JUNOCASHD_IMAGE=$(JUNOCASHD_TEST_IMAGE) GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -timeout=$(GO_TEST_TIMEOUT) -tags=e2e,docker ./...
+	JUNO_TEST_JUNOCASHD_IMAGE=$(JUNOCASHD_TEST_IMAGE) GOWORK=off GOCACHE=$(GOCACHE) go test $(TESTFLAGS) -timeout=$(GO_TEST_TIMEOUT) -tags=e2e,docker ./...
 
 test: rust-test test-unit test-integration test-e2e
 
@@ -59,7 +59,7 @@ fmt:
 	gofmt -w .
 
 tidy:
-	GOCACHE=$(GOCACHE) go mod tidy
+	GOWORK=off GOCACHE=$(GOCACHE) go mod tidy
 
 clean:
 	rm -rf $(BIN_DIR)

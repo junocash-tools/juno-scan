@@ -53,12 +53,16 @@ curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/events"
 curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes"           # unspent only (default)
 curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes?spent=true" # include spent
 curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes?min_value_zat=50000&limit=500" # filter + page size
+curl -sS "http://127.0.0.1:8080/v1/wallets/exchange-hot-001/notes/summary?min_confirmations=100&min_note_zat=100001&max_notes=100000"
 ```
 
 Note: when a note’s nullifier is observed in the node mempool, the note will include `pending_spent_txid` / `pending_spent_at` and (when known) `pending_spent_expiry_height`.
 Pending spends are *sticky*: if a spend disappears from the mempool before it is mined, the note remains pending until the spend is mined or the chain height passes `pending_spent_expiry_height`.
 The notes endpoint returns incoming notes plus mined outgoing notes recovered via OVK. Each note object includes `direction` (`incoming` or `outgoing`) and `memo_hex`; when no memo is stored it is returned as `null`. Outgoing notes include `ovk_scope` / `recipient_scope` when available, and `spent` filtering applies only to incoming notes.
 When additional pages exist, the notes response includes `next_cursor`; pass it back as `cursor` to continue.
+
+The note-summary endpoint returns one atomic store aggregate for incoming unspent notes. Buckets are mutually exclusive in this order: pending spend, immature, witness unavailable, below the requested minimum, then spendable. It returns `422` instead of truncating when the inventory exceeds `max_notes`.
+RocksDB schema v5 builds a transactionally maintained wallet-unspent index during migration. The one-time v4 upgrade scans existing notes and fails closed on inconsistent note indexes; normal summary requests examine at most `max_notes + 1` unspent candidates rather than lifetime spent history.
 
 Every health and event-page response includes `event_epoch`, exactly 64 lowercase hexadecimal characters. Bind persisted event cursors to this value. It rotates once on every scanner process start and after a destructive event-journal reset or repair. Discard old cursors and restart consumption whenever it changes.
 The events API rejects a cursor above the wallet's durable event maximum with HTTP `409`; verify `event_epoch` and reset the cursor.
@@ -192,6 +196,7 @@ The broker message key is derived from `payload.txid` when present (falls back t
 - `GET /v1/wallets/{wallet_id}/addresses/{address}/balance?min_confirmations=<n>` → address balance under that registered UFVK (`0` includes every mined unspent note)
 - `POST /v1/wallets/{wallet_id}/backfill` → backfill wallet history (incremental)
 - `GET /v1/wallets/{wallet_id}/notes[?spent=true][&direction=incoming|outgoing|all][&min_value_zat=<zat>][&limit=<n>][&cursor=<c>]` → paged incoming/outgoing note list (default direction: `all`; mined outgoing only; incoming notes are unspent-only by default; limit: 1000, max: 1000)
+- `GET /v1/wallets/{wallet_id}/notes/summary[?min_confirmations=<n>][&min_note_zat=<zat>][&max_notes=<n>]` → atomic aggregate note liquidity bound to `as_of_scanner_height` and `as_of_scanner_hash` (default max: 100000; maximum: 1000000; no partial result)
 - `POST /v1/orchard/witness` → compute Orchard witnesses for commitment positions
 
 HTTP API authentication (optional):

@@ -105,6 +105,11 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	mustWaitForEventKind(t, ctx, baseURL, "hot", "DepositConfirmed")
+	summary := mustGetNoteSummary(t, ctx, baseURL, "hot", 2, 0, 100)
+	if summary.TotalUnspent.NoteCount < 1 || summary.Spendable.NoteCount < 1 {
+		t.Fatalf("confirmed deposit missing from note summary: %+v", summary)
+	}
+	assertNoteSummaryPartition(t, summary)
 
 	notes := mustGetNotes(t, ctx, baseURL, "hot", false, "")
 	if len(notes) == 0 || notes[0].Position == nil {
@@ -135,6 +140,8 @@ func TestE2E_ScannerAPI_DepositEvent(t *testing.T) {
 
 	// Mempool outgoing outputs should be available before mining.
 	mustWaitForOutgoingOutputEventState(t, ctx, baseURL, "hot", spendTxID, "mempool")
+	pendingSummary := mustWaitForPendingNoteSummary(t, ctx, baseURL, "hot", 2, 0, 100)
+	assertNoteSummaryPartition(t, pendingSummary)
 	mustRun(t, jd.CLICommand(ctx, "generate", "1"))
 	mustWaitForEventKind(t, ctx, baseURL, "hot", "SpendEvent")
 	mustWaitForOutgoingOutputEventState(t, ctx, baseURL, "hot", spendTxID, "confirmed")
@@ -413,6 +420,74 @@ type apiNote struct {
 	OvkScope       *string `json:"ovk_scope,omitempty"`
 	RecipientScope *string `json:"recipient_scope,omitempty"`
 	SpentHeight    *int64  `json:"spent_height,omitempty"`
+}
+
+type apiNoteValueSummary struct {
+	NoteCount int64 `json:"note_count"`
+	ValueZat  int64 `json:"value_zat"`
+}
+
+type apiNoteSummary struct {
+	WalletID           string              `json:"wallet_id"`
+	MinConfirmations   int64               `json:"min_confirmations"`
+	MinNoteZat         int64               `json:"min_note_zat"`
+	AsOfScannerHeight  int64               `json:"as_of_scanner_height"`
+	AsOfScannerHash    string              `json:"as_of_scanner_hash"`
+	TotalUnspent       apiNoteValueSummary `json:"total_unspent"`
+	Spendable          apiNoteValueSummary `json:"spendable"`
+	Immature           apiNoteValueSummary `json:"immature"`
+	PendingSpend       apiNoteValueSummary `json:"pending_spend"`
+	BelowMinNote       apiNoteValueSummary `json:"below_min_note"`
+	WitnessUnavailable apiNoteValueSummary `json:"witness_unavailable"`
+}
+
+func mustGetNoteSummary(t *testing.T, ctx context.Context, baseURL, walletID string, minConfirmations, minNoteZat int64, maxNotes int) apiNoteSummary {
+	t.Helper()
+	url := fmt.Sprintf("%s/v1/wallets/%s/notes/summary?min_confirmations=%d&min_note_zat=%d&max_notes=%d", baseURL, walletID, minConfirmations, minNoteZat, maxNotes)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/wallets/%s/notes/summary: %v", walletID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET /v1/wallets/%s/notes/summary status=%d body=%s", walletID, resp.StatusCode, body)
+	}
+	var out apiNoteSummary
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode note summary: %v", err)
+	}
+	return out
+}
+
+func mustWaitForPendingNoteSummary(t *testing.T, ctx context.Context, baseURL, walletID string, minConfirmations, minNoteZat int64, maxNotes int) apiNoteSummary {
+	t.Helper()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+	for time.Now().Before(deadline) {
+		summary := mustGetNoteSummary(t, ctx, baseURL, walletID, minConfirmations, minNoteZat, maxNotes)
+		if summary.PendingSpend.NoteCount > 0 {
+			return summary
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("pending spend not observed in note summary")
+	return apiNoteSummary{}
+}
+
+func assertNoteSummaryPartition(t *testing.T, summary apiNoteSummary) {
+	t.Helper()
+	if summary.AsOfScannerHeight < 0 || strings.TrimSpace(summary.AsOfScannerHash) == "" {
+		t.Fatalf("note summary is missing its scanner snapshot identity: %+v", summary)
+	}
+	count := summary.Spendable.NoteCount + summary.Immature.NoteCount + summary.PendingSpend.NoteCount + summary.BelowMinNote.NoteCount + summary.WitnessUnavailable.NoteCount
+	value := summary.Spendable.ValueZat + summary.Immature.ValueZat + summary.PendingSpend.ValueZat + summary.BelowMinNote.ValueZat + summary.WitnessUnavailable.ValueZat
+	if count != summary.TotalUnspent.NoteCount || value != summary.TotalUnspent.ValueZat {
+		t.Fatalf("note summary buckets do not partition total: %+v", summary)
+	}
 }
 
 func mustGetNotes(t *testing.T, ctx context.Context, baseURL, walletID string, spent bool, direction string) []apiNote {
