@@ -262,6 +262,7 @@ func TestScanner_CrossWalletTransferIsNotDeposit(t *testing.T) {
 	mustWaitOpSuccess(t, ctx, jd, opid)
 	mustRun(t, jd.CLICommand(ctx, "generate", "2"))
 	waitForEventKind(t, ctx, st, "wallet-a", "DepositConfirmed")
+	mustWaitOrchardBalanceForViewingKey(t, ctx, jd, ufvkA, 2)
 	transferOpID := mustSendMany(t, ctx, jd, addrA, addrB, "0.01")
 	mustWaitOpSuccess(t, ctx, jd, transferOpID)
 	transferTxID := mustTxIDForOpID(t, ctx, jd, transferOpID)
