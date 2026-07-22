@@ -78,6 +78,12 @@ func (s *Scanner) recordMempoolRefresh(eventEpoch string, tip store.BlockTip) {
 	s.statusMu.Unlock()
 }
 
+func (s *Scanner) clearMempoolRefresh() {
+	s.statusMu.Lock()
+	s.mempoolRefresh = MempoolRefreshStatus{}
+	s.statusMu.Unlock()
+}
+
 const (
 	orchardSubtreeLeafCount       int64 = 1 << 16
 	orchardSubtreeRootChunkSize         = 2048
@@ -258,11 +264,17 @@ func (s *Scanner) reconcileCanonicalTip(ctx context.Context, tip store.BlockTip,
 func (s *Scanner) updatePendingSpends(ctx context.Context, chainHeight int64) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	refreshSucceeded := false
+	defer func() {
+		if !refreshSucceeded {
+			s.clearMempoolRefresh()
+		}
+	}()
 
 	seenAt := time.Now().UTC()
 
-	var txids []string
-	if err := s.rpc.Call(ctx, "getrawmempool", nil, &txids); err != nil {
+	var mempoolSnapshot []string
+	if err := s.rpc.Call(ctx, "getrawmempool", nil, &mempoolSnapshot); err != nil {
 		return fmt.Errorf("scanner: getrawmempool: %w", err)
 	}
 
@@ -283,67 +295,118 @@ func (s *Scanner) updatePendingSpends(ctx context.Context, chainHeight int64) er
 		s.mempoolTxExpiryHeightByTxID = make(map[string]*int64)
 	}
 
-	newTxHex := make(map[string]string)
-	newTxExpiryHeight := make(map[string]*int64)
-
-	inMempool := make(map[string]struct{}, len(txids))
-	for _, txid := range txids {
-		txid = strings.ToLower(strings.TrimSpace(txid))
-		if txid == "" {
-			continue
-		}
-		inMempool[txid] = struct{}{}
-	}
-
-	for txid := range s.mempoolOrchardNullifiersByTxID {
-		if _, ok := inMempool[txid]; !ok {
-			delete(s.mempoolOrchardNullifiersByTxID, txid)
-			delete(s.mempoolTxExpiryHeightByTxID, txid)
-		}
-	}
-	for txid := range s.mempoolTxExpiryHeightByTxID {
-		if _, ok := inMempool[txid]; !ok {
-			delete(s.mempoolTxExpiryHeightByTxID, txid)
-		}
-	}
-
-	for txid := range inMempool {
-		if _, ok := s.mempoolOrchardNullifiersByTxID[txid]; ok {
-			continue
+	var newTxHex map[string]string
+	var newTxExpiryHeight map[string]*int64
+	decodedSnapshot := false
+	const maxMempoolSnapshotAttempts = 3
+	for attempt := 0; attempt < maxMempoolSnapshotAttempts; attempt++ {
+		orderedTxIDs, _, err := validateMempoolTxIDs(mempoolSnapshot)
+		if err != nil {
+			return err
 		}
 
-		var tx rawTx
-		if err := s.rpc.Call(ctx, "getrawtransaction", []any{txid, 1}, &tx); err != nil {
-			var rpcErr *sdkjunocashd.RPCError
-			if errors.As(err, &rpcErr) && rpcErr.Code == -5 {
+		nullifiersByTxID := make(map[string][]string, len(orderedTxIDs))
+		expiryHeightByTxID := make(map[string]*int64, len(orderedTxIDs))
+		decodedHex := make(map[string]string)
+		decodedExpiry := make(map[string]*int64)
+		retrySnapshot := false
+
+		for _, txid := range orderedTxIDs {
+			cachedNullifiers, nullifiersCached := s.mempoolOrchardNullifiersByTxID[txid]
+			cachedExpiry, expiryCached := s.mempoolTxExpiryHeightByTxID[txid]
+			if nullifiersCached && expiryCached {
+				nullifiersByTxID[txid] = cachedNullifiers
+				expiryHeightByTxID[txid] = cachedExpiry
 				continue
 			}
-			log.Printf("mempool: getrawtransaction(%s) failed: %v", txid, err)
+
+			// An older marker for the same chain tip cannot attest a newly observed
+			// transaction until its complete nullifier set has been decoded.
+			s.clearMempoolRefresh()
+			var tx rawTx
+			if err := s.rpc.Call(ctx, "getrawtransaction", []any{txid, 1}, &tx); err != nil {
+				var rpcErr *sdkjunocashd.RPCError
+				if errors.As(err, &rpcErr) && rpcErr.Code == -5 {
+					var revalidatedSnapshot []string
+					if revalidateErr := s.rpc.Call(ctx, "getrawmempool", nil, &revalidatedSnapshot); revalidateErr != nil {
+						return fmt.Errorf("scanner: revalidate mempool after getrawtransaction(%s) -5: %w", txid, revalidateErr)
+					}
+					_, revalidatedMempool, validateErr := validateMempoolTxIDs(revalidatedSnapshot)
+					if validateErr != nil {
+						return fmt.Errorf("scanner: revalidate mempool after getrawtransaction(%s) -5: %w", txid, validateErr)
+					}
+					if _, stillPresent := revalidatedMempool[txid]; stillPresent {
+						return fmt.Errorf("scanner: getrawtransaction(%s) returned -5 but transaction remains in mempool", txid)
+					}
+					mempoolSnapshot = revalidatedSnapshot
+					retrySnapshot = true
+					break
+				}
+				return fmt.Errorf("scanner: getrawtransaction(%s): %w", txid, err)
+			}
+
+			nfs := make([]string, 0, len(tx.Orchard.Actions))
+			seenNullifiers := make(map[string]struct{}, len(tx.Orchard.Actions))
+			for _, action := range tx.Orchard.Actions {
+				nf := action.Nullifier
+				if !isCanonicalLowerHex64(nf) {
+					return fmt.Errorf("scanner: getrawtransaction(%s) returned non-canonical Orchard nullifier", txid)
+				}
+				if _, duplicate := seenNullifiers[nf]; duplicate {
+					return fmt.Errorf("scanner: getrawtransaction(%s) returned duplicate Orchard nullifier %s", txid, nf)
+				}
+				seenNullifiers[nf] = struct{}{}
+				nfs = append(nfs, nf)
+			}
+			nullifiersByTxID[txid] = nfs
+
+			var expPtr *int64
+			if tx.ExpiryHeight > 0 {
+				exp := tx.ExpiryHeight
+				expPtr = &exp
+			}
+			expiryHeightByTxID[txid] = expPtr
+			decodedExpiry[txid] = expPtr
+
+			if txHex := strings.TrimSpace(tx.Hex); txHex != "" {
+				decodedHex[txid] = txHex
+			}
+		}
+		if retrySnapshot {
 			continue
 		}
 
-		nfs := make([]string, 0, len(tx.Orchard.Actions))
-		for _, a := range tx.Orchard.Actions {
-			nf := strings.ToLower(strings.TrimSpace(a.Nullifier))
-			if nf == "" {
-				continue
+		nullifierOwners := make(map[string]string)
+		for _, txid := range orderedTxIDs {
+			nfs, ok := nullifiersByTxID[txid]
+			if !ok {
+				return fmt.Errorf("scanner: incomplete mempool cache for transaction %s", txid)
 			}
-			nfs = append(nfs, nf)
+			if _, ok := expiryHeightByTxID[txid]; !ok {
+				return fmt.Errorf("scanner: incomplete mempool expiry cache for transaction %s", txid)
+			}
+			for _, nf := range nfs {
+				if !isCanonicalLowerHex64(nf) {
+					return fmt.Errorf("scanner: cached non-canonical Orchard nullifier for transaction %s", txid)
+				}
+				if owner, duplicate := nullifierOwners[nf]; duplicate {
+					return fmt.Errorf("scanner: mempool transactions %s and %s claim Orchard nullifier %s", owner, txid, nf)
+				}
+				nullifierOwners[nf] = txid
+			}
 		}
 
-		s.mempoolOrchardNullifiersByTxID[txid] = nfs
-
-		var expPtr *int64
-		if tx.ExpiryHeight > 0 {
-			exp := tx.ExpiryHeight
-			expPtr = &exp
-		}
-		s.mempoolTxExpiryHeightByTxID[txid] = expPtr
-		newTxExpiryHeight[txid] = expPtr
-
-		if txHex := strings.TrimSpace(tx.Hex); txHex != "" {
-			newTxHex[txid] = txHex
-		}
+		// Replace the cache only after every transaction in one validated snapshot
+		// has a complete decode and the snapshot has no nullifier collisions.
+		s.mempoolOrchardNullifiersByTxID = nullifiersByTxID
+		s.mempoolTxExpiryHeightByTxID = expiryHeightByTxID
+		newTxHex = decodedHex
+		newTxExpiryHeight = decodedExpiry
+		decodedSnapshot = true
+		break
+	}
+	if !decodedSnapshot {
+		return errors.New("scanner: mempool changed repeatedly while decoding transactions")
 	}
 
 	pending := make(map[string]store.PendingSpend)
@@ -569,8 +632,37 @@ func (s *Scanner) updatePendingSpends(ctx context.Context, chainHeight int64) er
 		return fmt.Errorf("scanner: mempool refresh tip mismatch: found=%t height=%d chain_height=%d", ok, tip.Height, chainHeight)
 	}
 	s.recordMempoolRefresh(eventEpoch, tip)
+	refreshSucceeded = true
 
 	return nil
+}
+
+func validateMempoolTxIDs(txids []string) ([]string, map[string]struct{}, error) {
+	ordered := make([]string, 0, len(txids))
+	unique := make(map[string]struct{}, len(txids))
+	for _, txid := range txids {
+		if !isCanonicalLowerHex64(txid) {
+			return nil, nil, fmt.Errorf("scanner: getrawmempool returned non-canonical transaction id")
+		}
+		if _, duplicate := unique[txid]; duplicate {
+			return nil, nil, fmt.Errorf("scanner: getrawmempool returned duplicate transaction id %s", txid)
+		}
+		unique[txid] = struct{}{}
+		ordered = append(ordered, txid)
+	}
+	return ordered, unique, nil
+}
+
+func isCanonicalLowerHex64(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for i := range value {
+		if (value[i] < '0' || value[i] > '9') && (value[i] < 'a' || value[i] > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Scanner) findCommonAncestor(ctx context.Context, fromHeight int64) (int64, error) {
