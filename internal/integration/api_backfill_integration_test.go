@@ -74,6 +74,7 @@ func TestIntegration_API_BackfillWallet(t *testing.T) {
 	opid := mustShieldCoinbase(t, ctx, jd, fromAddr, addr)
 	mustWaitOpSuccess(t, ctx, jd, opid)
 	mustRun(t, jd.CLICommand(ctx, "generate", "2"))
+	mustWaitOrchardBalanceForViewingKey(t, ctx, jd, ufvk, 2)
 	toAddr := mustCreateUnifiedAddress(t, ctx, jd)
 	withdrawOpID := mustSendMany(t, ctx, jd, addr, toAddr, "0.01")
 	mustWaitOpSuccess(t, ctx, jd, withdrawOpID)
